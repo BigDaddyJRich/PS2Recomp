@@ -795,9 +795,36 @@ namespace ps2_stubs
         uint8_t *hostPtr = getMemPtr(rdram, ptrAddr);
         FILE *fp = get_file_ptr(file_handle);
 
+        uint8_t *guestFile = fp ? nullptr : getMemPtr(rdram, file_handle);
         if (hostPtr && fp && size > 0 && count > 0)
         {
             items_read = ::fread(hostPtr, size, count, fp);
+        }
+        else if (hostPtr && guestFile && size > 0 && count > 0)
+        {
+            // A guest newlib FILE (not one of ours): __svfscanf's string stream for sscanf %c / %[n]c keeps the
+            // text at _p (+0) with _r (+4) bytes left; read from it like newlib's fread / __srefill (EOF at the end).
+            uint32_t p, r;
+            std::memcpy(&p, guestFile + 0, 4);
+            std::memcpy(&r, guestFile + 4, 4);
+            const int32_t left = static_cast<int32_t>(r);
+            const uint64_t want = static_cast<uint64_t>(size) * count;
+            const uint32_t n = left > 0 ? static_cast<uint32_t>(std::min<uint64_t>(want, static_cast<uint32_t>(left))) : 0u;
+            const uint8_t *src = getConstMemPtr(rdram, p);
+            if (src && n != 0u)
+                std::memmove(hostPtr, src, n);
+            p += n;
+            r = static_cast<uint32_t>(left > 0 ? left - static_cast<int32_t>(n) : 0);
+            std::memcpy(guestFile + 0, &p, 4);
+            std::memcpy(guestFile + 4, &r, 4);
+            if (n < want)
+            {
+                uint16_t flags;
+                std::memcpy(&flags, guestFile + 12, 2);
+                flags |= 0x20u; // __SEOF
+                std::memcpy(guestFile + 12, &flags, 2);
+            }
+            items_read = n / size;
         }
         else
         {

@@ -1,8 +1,21 @@
 #include "Common.h"
 #include "VU.h"
+//TODO use glm
+#include <iostream>
+#include <atomic>
+#include <cmath>
+#define VCNT(name) do{ static std::atomic<int> c_{0}; int v_=c_.fetch_add(1)+1; if(v_==1||v_==10||v_==100||v_==1000||v_==10000||v_==100000) std::cerr << "[vu0cnt] " << name << " n=" << v_ << std::endl; }while(0)
+static void vlogM(const char* tag, const float* m){ std::cerr << " " << tag << "="; for(int i=0;i<16;++i) std::cerr << m[i] << (i==15?"":","); }
+static void vlogV(const char* tag, const float* v){ std::cerr << " " << tag << "=" << v[0] << "," << v[1] << "," << v[2] << "," << v[3]; }
+
 
 namespace ps2_stubs
 {
+    void sceVu0ecossin(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        VCNT("sceVu0ecossin");
+        TODO_NAMED("sceVu0ecossin", rdram, ctx, runtime);
+    }
 
     namespace
     {
@@ -72,7 +85,6 @@ namespace ps2_stubs
             return true;
         }
 
-        // Row-major matrix product: out = lhs * rhs (lhs is the left factor).
         void mulVuMatrix(const float (&lhs)[16], const float (&rhs)[16], float (&out)[16])
         {
             std::fill(std::begin(out), std::end(out), 0.0f);
@@ -97,93 +109,39 @@ namespace ps2_stubs
             out[15] = 1.0f;
         }
 
-        // Rigid-transform inverse under the file's row-vector convention
-        // (translation in row 3, ApplyMatrix computes v*M): transpose the 3x3
-        // rotation block, zero its 4th column, and set the translation row to
-        // -t*R^T -- each lane dots t with a ROW of R: out[12+col] =
-        // -(t . R[col]). This makes M * rigidInverse(M) == I. Copy [15].
-        void rigidInverse(const float (&in)[16], float (&out)[16])
+        void vuApply(const float (&m)[16], const float (&v)[4], float (&o)[4])
         {
-            for (int row = 0; row < 3; ++row)
-            {
-                for (int col = 0; col < 3; ++col)
-                    out[4 * row + col] = in[4 * col + row];
-                out[4 * row + 3] = 0.0f;
-            }
-            const float tx = in[12], ty = in[13], tz = in[14];
-            for (int col = 0; col < 3; ++col)
-                out[12 + col] = -((tx * in[4 * col]) + (ty * in[4 * col + 1]) + (tz * in[4 * col + 2]));
-            out[15] = in[15];
+            for (int j = 0; j < 4; ++j)
+                o[j] = m[j] * v[0] + m[4 + j] * v[1] + m[8 + j] * v[2] + m[12 + j] * v[3];
+        }
+        void vuAffineInverse(const float (&m)[16], float (&o)[16])
+        {
+            // Exact libvu0 sceVu0InversMatrix behaviour (verified vs ELF code in emulator):
+            // 3x3 = transpose of input 3x3 (NOT a true inverse for scaled matrices),
+            // t' = -(R^T * t), column w = 0, o[15] = m[15].
+            for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) o[i*4+j] = m[j*4+i];
+            o[3] = o[7] = o[11] = 0.0f;
+            for (int j = 0; j < 3; ++j) o[12+j] = -(o[0*4+j]*m[12] + o[1*4+j]*m[13] + o[2*4+j]*m[14]);
+            o[15] = m[15];
+        }
+        void vuNorm3(float (&v)[4])
+        {
+            float l = std::sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]);
+            if (l > 0.0f) { v[0]/=l; v[1]/=l; v[2]/=l; }
+        }
+        void vuCross(const float (&a)[4], const float (&b)[4], float (&o)[4])
+        {
+            o[0]=a[1]*b[2]-a[2]*b[1]; o[1]=a[2]*b[0]-a[0]*b[2]; o[2]=a[0]*b[1]-a[1]*b[0]; o[3]=0.0f;
+        }
+        void vuRtp(const float (&m)[16], const float (&v)[4], int32_t (&o)[4], uint32_t mode = 0)
+        {
+            float r[4]; vuApply(m, v, r);
+            float q = (r[3] != 0.0f) ? 1.0f / r[3] : 0.0f;
+            for (int i = 0; i < 2; ++i) o[i] = static_cast<int32_t>(r[i] * q * 16.0f);
+            if (mode == 0) { o[2] = static_cast<int32_t>(r[2] * q * 16.0f); o[3] = static_cast<int32_t>(r[3] * 16.0f); }
+            else { o[2] = static_cast<int32_t>(r[2] * q); o[3] = static_cast<int32_t>(r[3]); } // FTOI0.zw
         }
 
-        void axisRotateMatrix(const float (&in)[16], float angle, int axis, float (&out)[16])
-        {
-            float rot[16]{};
-            makeIdentityMatrix(rot);
-            const float cs = std::cos(angle);
-            const float sn = std::sin(angle);
-            if (axis == 2)
-            {
-                rot[0] = cs;
-                rot[1] = sn;
-                rot[4] = -sn;
-                rot[5] = cs;
-            }
-            else if (axis == 1)
-            {
-                rot[0] = cs;
-                rot[2] = -sn;
-                rot[8] = sn;
-                rot[10] = cs;
-            }
-            else
-            {
-                rot[5] = cs;
-                rot[6] = sn;
-                rot[9] = -sn;
-                rot[10] = cs;
-            }
-            mulVuMatrix(in, rot, out);
-        }
-
-        // Applies the matrix to the vertex, perspective-divides xyz by w
-        // (w==0 maps to a zero divide rather than Inf/NaN), then converts
-        // x/y to 12.4 fixed point (x16) unconditionally. z/w take the same
-        // x16 conversion when fullFtoi4 is set; otherwise they are plain
-        // integer-truncated (FTOI0) after the divide instead.
-        void rotTransPersOne(const float (&m)[16], const float (&v)[4], bool fullFtoi4, int32_t (&out)[4])
-        {
-            float t[4];
-            t[0] = (m[0] * v[0]) + (m[4] * v[1]) + (m[8] * v[2]) + (m[12] * v[3]);
-            t[1] = (m[1] * v[0]) + (m[5] * v[1]) + (m[9] * v[2]) + (m[13] * v[3]);
-            t[2] = (m[2] * v[0]) + (m[6] * v[1]) + (m[10] * v[2]) + (m[14] * v[3]);
-            t[3] = (m[3] * v[0]) + (m[7] * v[1]) + (m[11] * v[2]) + (m[15] * v[3]);
-            const float q = (t[3] != 0.0f) ? (1.0f / t[3]) : 0.0f;
-            t[0] *= q;
-            t[1] *= q;
-            t[2] *= q;
-            out[0] = static_cast<int32_t>(t[0] * 16.0f);
-            out[1] = static_cast<int32_t>(t[1] * 16.0f);
-            out[2] = fullFtoi4 ? static_cast<int32_t>(t[2] * 16.0f) : static_cast<int32_t>(t[2]);
-            out[3] = fullFtoi4 ? static_cast<int32_t>(t[3] * 16.0f) : static_cast<int32_t>(t[3]);
-        }
-
-        // Guard-band proxy for the COP2 sticky clip flags: nonzero => the
-        // vertex is offscreen. Not the hardware per-plane flag layout.
-        constexpr float kScreenClipGuard = 4096.0f;
-        int32_t screenClipCode(const float (&v)[4])
-        {
-            int32_t code = 0;
-            if (v[0] > kScreenClipGuard)
-                code |= 0x1;
-            if (v[0] < -kScreenClipGuard)
-                code |= 0x2;
-            if (v[1] > kScreenClipGuard)
-                code |= 0x4;
-            if (v[1] < -kScreenClipGuard)
-                code |= 0x8;
-            return code;
-        }
     }
 
     void sceVpu0Reset(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -193,6 +151,7 @@ namespace ps2_stubs
 
     void sceVu0AddVector(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        VCNT("sceVu0AddVector");
         const uint32_t dstAddr = getRegU32(ctx, 4);
         const uint32_t lhsAddr = getRegU32(ctx, 5);
         const uint32_t rhsAddr = getRegU32(ctx, 6);
@@ -210,6 +169,7 @@ namespace ps2_stubs
 
     void sceVu0ApplyMatrix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        VCNT("sceVu0ApplyMatrix");
         const uint32_t dstAddr = getRegU32(ctx, 4);
         const uint32_t matrixAddr = getRegU32(ctx, 5);
         const uint32_t srcAddr = getRegU32(ctx, 6);
@@ -231,143 +191,52 @@ namespace ps2_stubs
 
     void sceVu0CameraMatrix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t dstAddr = getRegU32(ctx, 4);
-        const uint32_t eyeAddr = getRegU32(ctx, 5);
-        const uint32_t fwdAddr = getRegU32(ctx, 6);
-        const uint32_t upAddr = getRegU32(ctx, 7);
-        float eye[4]{}, fwd[4]{}, up[4]{};
-        if (readVuVec4f(rdram, eyeAddr, eye) && readVuVec4f(rdram, fwdAddr, fwd) && readVuVec4f(rdram, upAddr, up))
+        VCNT("sceVu0CameraMatrix");
+        const uint32_t d = getRegU32(ctx, 4), pa = getRegU32(ctx, 5), za = getRegU32(ctx, 6), ya = getRegU32(ctx, 7);
+        float p[4]{}, z[4]{}, y[4]{}, x[4]{};
+        if (readVuVec4f(rdram, pa, p) && readVuVec4f(rdram, za, z) && readVuVec4f(rdram, ya, y))
         {
-            auto cross = [](const float (&l)[4], const float (&r)[4], float (&o)[4])
-            {
-                o[0] = (l[1] * r[2]) - (l[2] * r[1]);
-                o[1] = (l[2] * r[0]) - (l[0] * r[2]);
-                o[2] = (l[0] * r[1]) - (l[1] * r[0]);
-                o[3] = 0.0f;
-            };
-            auto normalize = [](const float (&s)[4], float (&o)[4])
-            {
-                const float len = std::sqrt((s[0] * s[0]) + (s[1] * s[1]) + (s[2] * s[2]) + (s[3] * s[3]));
-                const float inv = (len > 1.0e-6f) ? (1.0f / len) : 0.0f;
-                for (int i = 0; i < 4; ++i)
-                    o[i] = s[i] * inv;
-            };
-            float rawCross[4]{}, row0[4]{}, row1[4]{}, row2[4]{};
-            cross(up, fwd, rawCross);
-            normalize(rawCross, row0);
-            normalize(fwd, row2);
-            cross(row2, row0, row1);
-
-            float m[16]{};
-            for (int i = 0; i < 4; ++i)
-            {
-                m[i] = row0[i];
-                m[4 + i] = row1[i];
-                m[8 + i] = row2[i];
-            }
-            m[12] = eye[0];
-            m[13] = eye[1];
-            m[14] = eye[2];
-            m[15] = 1.0f;
-
-            float out[16]{};
-            rigidInverse(m, out);
-
-            (void)writeVuMatrix4f(rdram, dstAddr, out);
+            vuNorm3(z); vuCross(y, z, x); vuNorm3(x); vuCross(z, x, y);
+            float c[16]{}, o[16]{};
+            for (int i=0;i<3;++i){ c[i]=x[i]; c[4+i]=y[i]; c[8+i]=z[i]; c[12+i]=p[i]; }
+            c[15]=1.0f;
+            vuAffineInverse(c, o); writeVuMatrix4f(rdram, d, o);
+            { static std::atomic<int> n{0}; static std::atomic<int> nn{0}; const int k = n.fetch_add(1); if (std::isnan(p[0]) || std::isnan(z[0])) nn.fetch_add(1); if (k < 8 || (k % 500) == 0) { std::cerr << "[vu0stub] CameraMatrix k=" << k << " nan=" << nn.load() << " ra=0x" << std::hex << getRegU32(ctx, 31) << std::dec; { const uint32_t self = getRegU32(ctx, 18); std::cerr << " s2=0x" << std::hex << self << " raw:"; for (uint32_t o = 0x30; o < 0xA8; o += 4) { uint32_t w = 0; if (const uint8_t *q = getConstMemPtr(rdram, self + o)) std::memcpy(&w, q, 4); std::cerr << " " << o << "=" << w; } std::cerr << std::dec; } vlogV("p",p); vlogV("zd_in",z); vlogV("yd",y); vlogM("out",o); std::cerr << std::endl; } }
         }
         setReturnS32(ctx, 0);
     }
 
     void sceVu0ClampVector(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t dstAddr = getRegU32(ctx, 4);
-        const uint32_t srcAddr = getRegU32(ctx, 5);
-        const float lo = ctx ? ctx->f[12] : 0.0f;
-        const float hi = ctx ? ctx->f[13] : 0.0f;
-        float src[4]{}, out[4]{};
-        if (readVuVec4f(rdram, srcAddr, src))
-        {
-            for (int i = 0; i < 4; ++i)
-            {
-                float v = src[i];
-                v = (v < lo) ? lo : v;
-                v = (v > hi) ? hi : v;
-                out[i] = v;
-            }
-            (void)writeVuVec4f(rdram, dstAddr, out);
-        }
+        VCNT("sceVu0ClampVector");
+        const uint32_t d = getRegU32(ctx, 4), a = getRegU32(ctx, 5);
+        const float lo = ctx ? ctx->f[12] : 0.0f, hi = ctx ? ctx->f[13] : 0.0f;
+        float x[4]{};
+        if (readVuVec4f(rdram, a, x)) { for (int i=0;i<4;++i) x[i] = x[i] < lo ? lo : (x[i] > hi ? hi : x[i]); writeVuVec4f(rdram, d, x); }
         setReturnS32(ctx, 0);
     }
 
     void sceVu0ClipAll(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t loAddr = getRegU32(ctx, 4);
-        const uint32_t hiAddr = getRegU32(ctx, 5);
-        const uint32_t matAddr = getRegU32(ctx, 6);
-        uint32_t vAddr = getRegU32(ctx, 7);
-        const int32_t count = static_cast<int32_t>(getRegU32(ctx, 8));
-        float lo[4]{}, hi[4]{}, m[16]{};
-        int32_t result = 0;
-        if (readVuVec4f(rdram, loAddr, lo) && readVuVec4f(rdram, hiAddr, hi) && readVuMatrix4f(rdram, matAddr, m))
-        {
-            result = 1;
-            for (int32_t i = 0; i < count; ++i)
-            {
-                float v[4]{};
-                if (!readVuVec4f(rdram, vAddr, v))
-                    break;
-                const float tx = (m[0] * v[0]) + (m[4] * v[1]) + (m[8] * v[2]) + (m[12] * v[3]);
-                const float ty = (m[1] * v[0]) + (m[5] * v[1]) + (m[9] * v[2]) + (m[13] * v[3]);
-                const float tw = (m[3] * v[0]) + (m[7] * v[1]) + (m[11] * v[2]) + (m[15] * v[3]);
-                const bool outsideX = (tx < lo[0] * tw) || (tx > hi[0] * tw);
-                const bool outsideY = (ty < lo[1] * tw) || (ty > hi[1] * tw);
-                if (!outsideX && !outsideY)
-                {
-                    result = 0;
-                    break;
-                }
-                vAddr += 16u;
-            }
-        }
-        setReturnS32(ctx, result);
+        VCNT("sceVu0ClipAll");
+        setReturnS32(ctx, 0);
     }
 
     void sceVu0ClipScreen(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t vAddr = getRegU32(ctx, 4);
-        float v[4]{};
-        int32_t code = 0;
-        if (readVuVec4f(rdram, vAddr, v))
-        {
-            code = screenClipCode(v);
-        }
-        setReturnS32(ctx, code);
+        VCNT("sceVu0ClipScreen");
+        setReturnS32(ctx, 0);
     }
 
     void sceVu0ClipScreen3(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t v0Addr = getRegU32(ctx, 4);
-        const uint32_t v1Addr = getRegU32(ctx, 5);
-        const uint32_t v2Addr = getRegU32(ctx, 6);
-        float v0[4]{}, v1[4]{}, v2[4]{};
-        int32_t code = 0;
-        if (readVuVec4f(rdram, v0Addr, v0))
-        {
-            code |= screenClipCode(v0);
-        }
-        if (readVuVec4f(rdram, v1Addr, v1))
-        {
-            code |= screenClipCode(v1);
-        }
-        if (readVuVec4f(rdram, v2Addr, v2))
-        {
-            code |= screenClipCode(v2);
-        }
-        setReturnS32(ctx, code);
+        VCNT("sceVu0ClipScreen3");
+        setReturnS32(ctx, 0);
     }
 
     void sceVu0CopyMatrix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        VCNT("sceVu0CopyMatrix");
         const uint32_t dstAddr = getRegU32(ctx, 4);
         const uint32_t srcAddr = getRegU32(ctx, 5);
         uint8_t *dst = getMemPtr(rdram, dstAddr);
@@ -381,6 +250,7 @@ namespace ps2_stubs
 
     void sceVu0CopyVector(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        VCNT("sceVu0CopyVector");
         const uint32_t dstAddr = getRegU32(ctx, 4);
         const uint32_t srcAddr = getRegU32(ctx, 5);
         uint8_t *dst = getMemPtr(rdram, dstAddr);
@@ -394,6 +264,7 @@ namespace ps2_stubs
 
     void sceVu0CopyVectorXYZ(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        VCNT("sceVu0CopyVectorXYZ");
         const uint32_t dstAddr = getRegU32(ctx, 4);
         const uint32_t srcAddr = getRegU32(ctx, 5);
         uint8_t *dst = getMemPtr(rdram, dstAddr);
@@ -407,112 +278,64 @@ namespace ps2_stubs
 
     void sceVu0DivVector(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t dstAddr = getRegU32(ctx, 4);
-        const uint32_t srcAddr = getRegU32(ctx, 5);
-        const float divisor = ctx ? ctx->f[12] : 1.0f;
-        float src[4]{}, out[4]{};
-        if (readVuVec4f(rdram, srcAddr, src))
-        {
-            const float q = (divisor != 0.0f) ? (1.0f / divisor) : 0.0f;
-            for (int i = 0; i < 4; ++i)
-            {
-                out[i] = src[i] * q;
-            }
-            (void)writeVuVec4f(rdram, dstAddr, out);
-        }
+        VCNT("sceVu0DivVector");
+        const uint32_t d = getRegU32(ctx, 4), a = getRegU32(ctx, 5);
+        const float q = ctx ? ctx->f[12] : 1.0f;
+        float x[4]{};
+        if (readVuVec4f(rdram, a, x) && q != 0.0f) { for (int i=0;i<4;++i) x[i]/=q; writeVuVec4f(rdram, d, x); }
         setReturnS32(ctx, 0);
     }
 
     void sceVu0DivVectorXYZ(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t dstAddr = getRegU32(ctx, 4);
-        const uint32_t srcAddr = getRegU32(ctx, 5);
-        const float divisor = ctx ? ctx->f[12] : 1.0f;
-        float src[4]{}, out[4]{};
-        if (readVuVec4f(rdram, srcAddr, src))
-        {
-            const float q = (divisor != 0.0f) ? (1.0f / divisor) : 0.0f;
-            out[0] = src[0] * q;
-            out[1] = src[1] * q;
-            out[2] = src[2] * q;
-            out[3] = src[3];
-            (void)writeVuVec4f(rdram, dstAddr, out);
-        }
+        VCNT("sceVu0DivVectorXYZ");
+        const uint32_t d = getRegU32(ctx, 4), a = getRegU32(ctx, 5);
+        const float q = ctx ? ctx->f[12] : 1.0f;
+        float x[4]{};
+        if (readVuVec4f(rdram, a, x) && q != 0.0f) { for (int i=0;i<3;++i) x[i]/=q; writeVuVec4f(rdram, d, x); }
         setReturnS32(ctx, 0);
     }
 
     void sceVu0DropShadowMatrix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        // Two documented drop-shadow modes reconstructed from behavior; not
-        // claimed bit-exact to a specific SDK build.
-        const uint32_t dstAddr = getRegU32(ctx, 4);
-        const uint32_t nAddr = getRegU32(ctx, 5);
-        const uint32_t mode = getRegU32(ctx, 6);
-        const float lx = ctx ? ctx->f[12] : 0.0f;
-        const float ly = ctx ? ctx->f[13] : 0.0f;
-        const float lz = ctx ? ctx->f[14] : 0.0f;
-        float n[4]{};
-        if (readVuVec4f(rdram, nAddr, n))
-        {
-            const float nx = n[0], ny = n[1], nz = n[2];
-            const float d = (lx * nx) + (ly * ny) + (lz * nz);
-            float out[16]{};
-            if (mode != 0)
-            {
-                const float k = 1.0f - d;
-                out[0] = (lx * nx) + k;
-                out[1] = lx * ny;
-                out[2] = lx * nz;
-                out[3] = lx;
-                out[4] = ly * nx;
-                out[5] = (ly * ny) + k;
-                out[6] = ly * nz;
-                out[7] = ly;
-                out[8] = lz * nx;
-                out[9] = lz * ny;
-                out[10] = (lz * nz) + k;
-                out[11] = lz;
-                out[12] = -nx;
-                out[13] = -ny;
-                out[14] = -nz;
-                out[15] = -d;
-            }
-            else
-            {
-                const float k = (d != 0.0f) ? (-1.0f / d) : 0.0f;
-                out[0] = k * ((lx * nx) - d);
-                out[1] = k * (lx * ny);
-                out[2] = k * (lx * nz);
-                out[3] = 0.0f;
-                out[4] = k * (ly * nx);
-                out[5] = k * ((ly * ny) - d);
-                out[6] = k * (ly * nz);
-                out[7] = 0.0f;
-                out[8] = k * (lz * nx);
-                out[9] = k * (lz * ny);
-                out[10] = k * ((lz * nz) - d);
-                out[11] = 0.0f;
-                out[12] = k * -nx;
-                out[13] = k * -ny;
-                out[14] = k * -nz;
-                out[15] = 1.0f;
-            }
-            (void)writeVuMatrix4f(rdram, dstAddr, out);
+        VCNT("sceVu0DropShadowMatrix");
+        // Hand translation of the game's own libvu0 code at 0x104188 (SLUS_207.87).
+        // void sceVu0DropShadowMatrix(FMATRIX m, FVECTOR lp, float a, float b, float c, int mode)
+        // a0=m a1=lp f12=a f13=b f14=c a2=mode. Plane a*x+b*y+c*z=1 (as the code implies).
+        const uint32_t d = getRegU32(ctx, 4), lpAddr = getRegU32(ctx, 5);
+        const int32_t mode = (int32_t)getRegU32(ctx, 6);
+        const float a = ctx->f[12], b = ctx->f[13], c = ctx->f[14];
+        float lp[4]{};
+        readVuVec4f(rdram, lpAddr, lp);
+        const float l0 = lp[0], l1 = lp[1], l2 = lp[2];
+        float m[16]{};
+        const float dd = a * l0 + b * l1 + c * l2;
+        if (mode != 0)
+        {   // point light at lp
+            const float k = 1.0f - dd;
+            m[0] = a * l0 + k; m[1] = a * l1; m[2] = a * l2; m[3] = a;
+            m[4] = b * l0; m[5] = b * l1 + k; m[6] = b * l2; m[7] = b;
+            m[8] = c * l0; m[9] = c * l1; m[10] = c * l2 + k; m[11] = c;
+            m[12] = -l0; m[13] = -l1; m[14] = -l2; m[15] = k - 1.0f;
         }
-        setReturnS32(ctx, 0);
-    }
-
-    void sceVu0ecossin(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        const uint32_t dstAddr = getRegU32(ctx, 4);
-        const float angle = ctx ? ctx->f[12] : 0.0f;
-        float out[4] = {std::cos(angle), std::sin(angle), 0.0f, 0.0f};
-        (void)writeVuVec4f(rdram, dstAddr, out);
+        else
+        {   // parallel light, direction lp
+            float s; // -1/dd with PS2 x/0 = +-Fmax
+            if (dd == 0.0f) s = std::signbit(dd) ? 3.402823466e+38f : -3.402823466e+38f;
+            else s = -1.0f / dd;
+            m[0] = s * (a * l0 - dd); m[1] = s * (a * l1); m[2] = s * (a * l2); m[3] = 0.0f;
+            m[4] = s * (b * l0); m[5] = s * (b * l1 - dd); m[6] = s * (b * l2); m[7] = 0.0f;
+            m[8] = s * (c * l0); m[9] = s * (c * l1); m[10] = s * (c * l2 - dd); m[11] = 0.0f;
+            m[12] = s * (-l0); m[13] = s * (-l1); m[14] = s * (-l2); m[15] = s * (-dd);
+        }
+        writeVuMatrix4f(rdram, d, m);
+        { static std::atomic<int> n{0}; if (n.fetch_add(1) < 8) { std::cerr << "[vu0stub] DropShadow mode=" << mode << " abc=" << a << "," << b << "," << c; vlogV("lp", lp); vlogM("out", m); std::cerr << std::endl; } }
         setReturnS32(ctx, 0);
     }
 
     void sceVu0FTOI0Vector(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        VCNT("sceVu0FTOI0Vector");
         const uint32_t dstAddr = getRegU32(ctx, 4);
         const uint32_t srcAddr = getRegU32(ctx, 5);
         float src[4]{};
@@ -530,6 +353,7 @@ namespace ps2_stubs
 
     void sceVu0FTOI4Vector(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        VCNT("sceVu0FTOI4Vector");
         const uint32_t dstAddr = getRegU32(ctx, 4);
         const uint32_t srcAddr = getRegU32(ctx, 5);
         float src[4]{};
@@ -547,6 +371,7 @@ namespace ps2_stubs
 
     void sceVu0InnerProduct(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        VCNT("sceVu0InnerProduct");
         const uint32_t lhsAddr = getRegU32(ctx, 4);
         const uint32_t rhsAddr = getRegU32(ctx, 5);
         float lhs[4]{}, rhs[4]{};
@@ -567,57 +392,37 @@ namespace ps2_stubs
 
     void sceVu0InterVector(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t dstAddr = getRegU32(ctx, 4);
-        const uint32_t aAddr = getRegU32(ctx, 5);
-        const uint32_t bAddr = getRegU32(ctx, 6);
-        const float t = ctx ? ctx->f[12] : 0.0f;
-        float a[4]{}, b[4]{}, out[4]{};
-        if (readVuVec4f(rdram, aAddr, a) && readVuVec4f(rdram, bAddr, b))
-        {
-            const float invT = 1.0f - t;
-            for (int i = 0; i < 4; ++i)
-            {
-                out[i] = (a[i] * t) + (b[i] * invT);
-            }
-            (void)writeVuVec4f(rdram, dstAddr, out);
-        }
+        VCNT("sceVu0InterVector");
+        const uint32_t d = getRegU32(ctx, 4), a = getRegU32(ctx, 5), b = getRegU32(ctx, 6);
+        const float r = ctx ? ctx->f[12] : 0.0f;
+        float x[4]{}, y[4]{}, o[4]{};
+        if (readVuVec4f(rdram, a, x) && readVuVec4f(rdram, b, y)) { for (int i=0;i<4;++i) o[i]=x[i]*r+y[i]*(1.0f-r); writeVuVec4f(rdram, d, o); }
         setReturnS32(ctx, 0);
     }
 
     void sceVu0InterVectorXYZ(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t dstAddr = getRegU32(ctx, 4);
-        const uint32_t aAddr = getRegU32(ctx, 5);
-        const uint32_t bAddr = getRegU32(ctx, 6);
-        const float t = ctx ? ctx->f[12] : 0.0f;
-        float a[4]{}, b[4]{}, out[4]{};
-        if (readVuVec4f(rdram, aAddr, a) && readVuVec4f(rdram, bAddr, b))
-        {
-            const float invT = 1.0f - t;
-            out[0] = (a[0] * t) + (b[0] * invT);
-            out[1] = (a[1] * t) + (b[1] * invT);
-            out[2] = (a[2] * t) + (b[2] * invT);
-            out[3] = a[3];
-            (void)writeVuVec4f(rdram, dstAddr, out);
-        }
+        VCNT("sceVu0InterVectorXYZ");
+        const uint32_t d = getRegU32(ctx, 4), a = getRegU32(ctx, 5), b = getRegU32(ctx, 6);
+        const float r = ctx ? ctx->f[12] : 0.0f;
+        float x[4]{}, y[4]{}, o[4]{};
+        if (readVuVec4f(rdram, a, x) && readVuVec4f(rdram, b, y)) { for (int i=0;i<3;++i) o[i]=x[i]*r+y[i]*(1.0f-r); o[3]=x[3]; writeVuVec4f(rdram, d, o); }
         setReturnS32(ctx, 0);
     }
 
     void sceVu0InversMatrix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t dstAddr = getRegU32(ctx, 4);
-        const uint32_t srcAddr = getRegU32(ctx, 5);
-        float in[16]{}, out[16]{};
-        if (readVuMatrix4f(rdram, srcAddr, in))
-        {
-            rigidInverse(in, out);
-            (void)writeVuMatrix4f(rdram, dstAddr, out);
-        }
+        VCNT("sceVu0InversMatrix");
+        const uint32_t d = getRegU32(ctx, 4), a = getRegU32(ctx, 5);
+        float m[16]{}, o[16]{};
+        if (readVuMatrix4f(rdram, a, m)) { vuAffineInverse(m, o); writeVuMatrix4f(rdram, d, o);
+            { static std::atomic<int> n{0}; if (n.fetch_add(1) < 40) { std::cerr << "[vu0stub] InversMatrix"; vlogM("in",m); vlogM("out",o); std::cerr << std::endl; } } }
         setReturnS32(ctx, 0);
     }
 
     void sceVu0ITOF0Vector(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        VCNT("sceVu0ITOF0Vector");
         const uint32_t dstAddr = getRegU32(ctx, 4);
         const uint32_t srcAddr = getRegU32(ctx, 5);
         int32_t src[4]{};
@@ -635,6 +440,7 @@ namespace ps2_stubs
 
     void sceVu0ITOF12Vector(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        VCNT("sceVu0ITOF12Vector");
         const uint32_t dstAddr = getRegU32(ctx, 4);
         const uint32_t srcAddr = getRegU32(ctx, 5);
         int32_t src[4]{};
@@ -652,6 +458,7 @@ namespace ps2_stubs
 
     void sceVu0ITOF4Vector(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        VCNT("sceVu0ITOF4Vector");
         const uint32_t dstAddr = getRegU32(ctx, 4);
         const uint32_t srcAddr = getRegU32(ctx, 5);
         int32_t src[4]{};
@@ -669,74 +476,47 @@ namespace ps2_stubs
 
     void sceVu0LightColorMatrix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t dstAddr = getRegU32(ctx, 4);
-        const uint32_t c0Addr = getRegU32(ctx, 5);
-        const uint32_t c1Addr = getRegU32(ctx, 6);
-        const uint32_t c2Addr = getRegU32(ctx, 7);
-        const uint32_t c3Addr = getRegU32(ctx, 8);
-        float c0[4]{}, c1[4]{}, c2[4]{}, c3[4]{};
-        if (readVuVec4f(rdram, c0Addr, c0) && readVuVec4f(rdram, c1Addr, c1) &&
-            readVuVec4f(rdram, c2Addr, c2) && readVuVec4f(rdram, c3Addr, c3))
-        {
-            float out[16]{};
-            for (int i = 0; i < 4; ++i)
-            {
-                out[i] = c0[i];
-                out[4 + i] = c1[i];
-                out[8 + i] = c2[i];
-                out[12 + i] = c3[i];
-            }
-            (void)writeVuMatrix4f(rdram, dstAddr, out);
-        }
+        VCNT("sceVu0LightColorMatrix");
+        const uint32_t d = getRegU32(ctx, 4);
+        float o[16]{};
+        for (int i = 0; i < 4; ++i) { float v[4]{}; readVuVec4f(rdram, getRegU32(ctx, 5 + i), v); for (int j=0;j<4;++j) o[i*4+j]=v[j]; }
+        writeVuMatrix4f(rdram, d, o);
         setReturnS32(ctx, 0);
     }
 
     void sceVu0MulMatrix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t dstAddr = getRegU32(ctx, 4);
-        const uint32_t m0Addr = getRegU32(ctx, 5);
-        const uint32_t m1Addr = getRegU32(ctx, 6);
-        float m0[16]{}, m1[16]{}, out[16]{};
-        if (readVuMatrix4f(rdram, m0Addr, m0) && readVuMatrix4f(rdram, m1Addr, m1))
-        {
-            // out = m0 * m1 (first source . second source), matching the
-            // file's mulVuMatrix(lhs,rhs)=lhs.rhs convention and the RotMatrix
-            // / ViewScreenMatrix siblings (first operand on the left).
-            mulVuMatrix(m0, m1, out);
-            (void)writeVuMatrix4f(rdram, dstAddr, out);
-        }
+        VCNT("sceVu0MulMatrix");
+        const uint32_t d = getRegU32(ctx, 4), a = getRegU32(ctx, 5), b = getRegU32(ctx, 6);
+        float x[16]{}, y[16]{}, o[16]{};
+        if (readVuMatrix4f(rdram, a, x) && readVuMatrix4f(rdram, b, y)) { mulVuMatrix(x, y, o); writeVuMatrix4f(rdram, d, o);
+            { static std::atomic<int> n{0}; if (n.fetch_add(1) < 60) { std::cerr << "[vu0stub] MulMatrix"; vlogM("a",x); vlogM("b",y); vlogM("out",o); std::cerr << std::endl; } } }
         setReturnS32(ctx, 0);
     }
 
     void sceVu0MulVector(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t dstAddr = getRegU32(ctx, 4);
-        const uint32_t lhsAddr = getRegU32(ctx, 5);
-        const uint32_t rhsAddr = getRegU32(ctx, 6);
-        float lhs[4]{}, rhs[4]{}, out[4]{};
-        if (readVuVec4f(rdram, lhsAddr, lhs) && readVuVec4f(rdram, rhsAddr, rhs))
-        {
-            for (int i = 0; i < 4; ++i)
-            {
-                out[i] = lhs[i] * rhs[i];
-            }
-            (void)writeVuVec4f(rdram, dstAddr, out);
-        }
+        VCNT("sceVu0MulVector");
+        const uint32_t d = getRegU32(ctx, 4), a = getRegU32(ctx, 5), b = getRegU32(ctx, 6);
+        float x[4]{}, y[4]{}, o[4]{};
+        if (readVuVec4f(rdram, a, x) && readVuVec4f(rdram, b, y)) { for (int i=0;i<4;++i) o[i]=x[i]*y[i]; writeVuVec4f(rdram, d, o); }
         setReturnS32(ctx, 0);
     }
 
     void sceVu0Normalize(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        VCNT("sceVu0Normalize");
         const uint32_t dstAddr = getRegU32(ctx, 4);
         const uint32_t srcAddr = getRegU32(ctx, 5);
         float src[4]{}, out[4]{};
         if (readVuVec4f(rdram, srcAddr, src))
         {
-            const float len = std::sqrt((src[0] * src[0]) + (src[1] * src[1]) + (src[2] * src[2]) + (src[3] * src[3]));
+            // libvu0: length from xyz only, result w = 0 (verified against ELF code via emulator)
+            const float len = std::sqrt((src[0] * src[0]) + (src[1] * src[1]) + (src[2] * src[2]));
             if (len > 1.0e-6f)
             {
                 const float invLen = 1.0f / len;
-                for (int i = 0; i < 4; ++i)
+                for (int i = 0; i < 3; ++i)
                 {
                     out[i] = src[i] * invLen;
                 }
@@ -748,46 +528,18 @@ namespace ps2_stubs
 
     void sceVu0NormalLightMatrix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        // Rows = normalize(-light); the 4x4 is transposed so directions occupy
-        // columns (one ApplyMatrix then yields per-light N.L).
-        const uint32_t dstAddr = getRegU32(ctx, 4);
-        const uint32_t l0Addr = getRegU32(ctx, 5);
-        const uint32_t l1Addr = getRegU32(ctx, 6);
-        const uint32_t l2Addr = getRegU32(ctx, 7);
-        float l0[4]{}, l1[4]{}, l2[4]{};
-        if (readVuVec4f(rdram, l0Addr, l0) && readVuVec4f(rdram, l1Addr, l1) && readVuVec4f(rdram, l2Addr, l2))
-        {
-            auto negNormalize = [](const float (&s)[4], float (&o)[4])
-            {
-                const float len = std::sqrt((s[0] * s[0]) + (s[1] * s[1]) + (s[2] * s[2]) + (s[3] * s[3]));
-                const float inv = (len > 1.0e-6f) ? (1.0f / len) : 0.0f;
-                for (int i = 0; i < 4; ++i)
-                    o[i] = -s[i] * inv;
-            };
-            float r0[4]{}, r1[4]{}, r2[4]{};
-            negNormalize(l0, r0);
-            negNormalize(l1, r1);
-            negNormalize(l2, r2);
-            float m[16]{};
-            for (int i = 0; i < 4; ++i)
-            {
-                m[i] = r0[i];
-                m[4 + i] = r1[i];
-                m[8 + i] = r2[i];
-                m[12 + i] = 0.0f;
-            }
-            m[15] = 1.0f;
-            float out[16]{};
-            for (int row = 0; row < 4; ++row)
-                for (int col = 0; col < 4; ++col)
-                    out[4 * row + col] = m[4 * col + row];
-            (void)writeVuMatrix4f(rdram, dstAddr, out);
-        }
+        VCNT("sceVu0NormalLightMatrix");
+        const uint32_t d = getRegU32(ctx, 4);
+        float o[16]{};
+        for (int i = 0; i < 3; ++i) { float v[4]{}; readVuVec4f(rdram, getRegU32(ctx, 5 + i), v); vuNorm3(v); o[0*4+i]=-v[0]; o[1*4+i]=-v[1]; o[2*4+i]=-v[2]; }
+        o[15] = 1.0f; // libvu0: m[3] = {0,0,0,1} before the transpose
+        writeVuMatrix4f(rdram, d, o);
         setReturnS32(ctx, 0);
     }
 
     void sceVu0OuterProduct(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        VCNT("sceVu0OuterProduct");
         const uint32_t dstAddr = getRegU32(ctx, 4);
         const uint32_t lhsAddr = getRegU32(ctx, 5);
         const uint32_t rhsAddr = getRegU32(ctx, 6);
@@ -805,23 +557,27 @@ namespace ps2_stubs
 
     void sceVu0RotMatrix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t dstAddr = getRegU32(ctx, 4);
-        const uint32_t srcAddr = getRegU32(ctx, 5);
-        const uint32_t rotAddr = getRegU32(ctx, 6);
-        float src[16]{}, rotVec[4]{};
-        if (readVuMatrix4f(rdram, srcAddr, src) && readVuVec4f(rdram, rotAddr, rotVec))
+        VCNT("sceVu0RotMatrix");
+        const uint32_t d = getRegU32(ctx, 4), a = getRegU32(ctx, 5), r = getRegU32(ctx, 6);
+        float rot[4]{}; float m[16]{};
+        if (readVuVec4f(rdram, r, rot) && readVuMatrix4f(rdram, a, m))
         {
-            float afterZ[16]{}, afterY[16]{}, afterX[16]{};
-            axisRotateMatrix(src, rotVec[2], 2, afterZ);
-            axisRotateMatrix(afterZ, rotVec[1], 1, afterY);
-            axisRotateMatrix(afterY, rotVec[0], 0, afterX);
-            (void)writeVuMatrix4f(rdram, dstAddr, afterX);
+            float tmp[16]{}, t2[16]{}, rm[16];
+            auto mk = [&](int axis, float ang, const float (&src)[16], float (&out)[16]) {
+                makeIdentityMatrix(rm); float cs=std::cos(ang), sn=std::sin(ang);
+                if (axis==0){rm[5]=cs;rm[6]=sn;rm[9]=-sn;rm[10]=cs;}
+                else if (axis==1){rm[0]=cs;rm[2]=-sn;rm[8]=sn;rm[10]=cs;}
+                else {rm[0]=cs;rm[1]=sn;rm[4]=-sn;rm[5]=cs;}
+                mulVuMatrix(src, rm, out); };
+            mk(2, rot[2], m, tmp); mk(1, rot[1], tmp, t2); mk(0, rot[0], t2, tmp);
+            writeVuMatrix4f(rdram, d, tmp);
         }
         setReturnS32(ctx, 0);
     }
 
     void sceVu0RotMatrixX(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        VCNT("sceVu0RotMatrixX");
         const uint32_t dstAddr = getRegU32(ctx, 4);
         const uint32_t srcAddr = getRegU32(ctx, 5);
         const float angle = ctx ? ctx->f[12] : 0.0f;
@@ -843,6 +599,7 @@ namespace ps2_stubs
 
     void sceVu0RotMatrixY(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        VCNT("sceVu0RotMatrixY");
         const uint32_t dstAddr = getRegU32(ctx, 4);
         const uint32_t srcAddr = getRegU32(ctx, 5);
         const float angle = ctx ? ctx->f[12] : 0.0f;
@@ -864,6 +621,7 @@ namespace ps2_stubs
 
     void sceVu0RotMatrixZ(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        VCNT("sceVu0RotMatrixZ");
         const uint32_t dstAddr = getRegU32(ctx, 4);
         const uint32_t srcAddr = getRegU32(ctx, 5);
         const float angle = ctx ? ctx->f[12] : 0.0f;
@@ -885,48 +643,27 @@ namespace ps2_stubs
 
     void sceVu0RotTransPers(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t dstAddr = getRegU32(ctx, 4);
-        const uint32_t matAddr = getRegU32(ctx, 5);
-        const uint32_t vAddr = getRegU32(ctx, 6);
-        const bool fullFtoi4 = (getRegU32(ctx, 7) != 0);
-        float m[16]{}, v[4]{};
-        if (readVuMatrix4f(rdram, matAddr, m) && readVuVec4f(rdram, vAddr, v))
-        {
-            int32_t out[4]{};
-            rotTransPersOne(m, v, fullFtoi4, out);
-            (void)writeVuVec4i(rdram, dstAddr, out);
-        }
+        VCNT("sceVu0RotTransPers");
+        const uint32_t d = getRegU32(ctx, 4), a = getRegU32(ctx, 5), b = getRegU32(ctx, 6);
+        float m[16]{}, v[4]{}; int32_t o[4]{};
+        if (readVuMatrix4f(rdram, a, m) && readVuVec4f(rdram, b, v)) { vuRtp(m, v, o, getRegU32(ctx, 7)); writeVuVec4i(rdram, d, o); }
         setReturnS32(ctx, 0);
     }
 
     void sceVu0RotTransPersN(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t dstAddr = getRegU32(ctx, 4);
-        const uint32_t matAddr = getRegU32(ctx, 5);
-        uint32_t vAddr = getRegU32(ctx, 6);
-        const int32_t count = static_cast<int32_t>(getRegU32(ctx, 7));
-        const bool fullFtoi4 = (getRegU32(ctx, 8) != 0);
+        VCNT("sceVu0RotTransPersN");
+        const uint32_t d = getRegU32(ctx, 4), a = getRegU32(ctx, 5), b = getRegU32(ctx, 6);
+        const uint32_t n = getRegU32(ctx, 7);
         float m[16]{};
-        if (readVuMatrix4f(rdram, matAddr, m))
-        {
-            uint32_t outAddr = dstAddr;
-            for (int32_t i = 0; i < count; ++i)
-            {
-                float v[4]{};
-                if (!readVuVec4f(rdram, vAddr, v))
-                    break;
-                int32_t out[4]{};
-                rotTransPersOne(m, v, fullFtoi4, out);
-                (void)writeVuVec4i(rdram, outAddr, out);
-                vAddr += 16u;
-                outAddr += 16u;
-            }
-        }
+        if (readVuMatrix4f(rdram, a, m))
+            for (uint32_t i = 0; i < n; ++i) { float v[4]{}; int32_t o[4]{}; if (readVuVec4f(rdram, b + i*16, v)) { vuRtp(m, v, o, getRegU32(ctx, 8)); writeVuVec4i(rdram, d + i*16, o); } }
         setReturnS32(ctx, 0);
     }
 
     void sceVu0ScaleVector(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        VCNT("sceVu0ScaleVector");
         const uint32_t dstAddr = getRegU32(ctx, 4);
         const uint32_t srcAddr = getRegU32(ctx, 5);
         float src[4]{}, out[4]{};
@@ -954,23 +691,17 @@ namespace ps2_stubs
 
     void sceVu0ScaleVectorXYZ(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t dstAddr = getRegU32(ctx, 4);
-        const uint32_t srcAddr = getRegU32(ctx, 5);
-        const float scale = ctx ? ctx->f[12] : 0.0f;
-        float src[4]{}, out[4]{};
-        if (readVuVec4f(rdram, srcAddr, src))
-        {
-            out[0] = src[0] * scale;
-            out[1] = src[1] * scale;
-            out[2] = src[2] * scale;
-            out[3] = src[3];
-            (void)writeVuVec4f(rdram, dstAddr, out);
-        }
+        VCNT("sceVu0ScaleVectorXYZ");
+        const uint32_t d = getRegU32(ctx, 4), a = getRegU32(ctx, 5);
+        const float r = ctx ? ctx->f[12] : 0.0f;
+        float x[4]{};
+        if (readVuVec4f(rdram, a, x)) { for (int i=0;i<3;++i) x[i]*=r; writeVuVec4f(rdram, d, x); }
         setReturnS32(ctx, 0);
     }
 
     void sceVu0SubVector(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        VCNT("sceVu0SubVector");
         const uint32_t dstAddr = getRegU32(ctx, 4);
         const uint32_t lhsAddr = getRegU32(ctx, 5);
         const uint32_t rhsAddr = getRegU32(ctx, 6);
@@ -988,24 +719,16 @@ namespace ps2_stubs
 
     void sceVu0TransMatrix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t dstAddr = getRegU32(ctx, 4);
-        const uint32_t srcAddr = getRegU32(ctx, 5);
-        const uint32_t vAddr = getRegU32(ctx, 6);
-        float src[16]{}, v[4]{};
-        if (readVuMatrix4f(rdram, srcAddr, src) && readVuVec4f(rdram, vAddr, v))
-        {
-            float out[16]{};
-            std::memcpy(out, src, sizeof(out));
-            out[12] = src[12] + v[0];
-            out[13] = src[13] + v[1];
-            out[14] = src[14] + v[2];
-            (void)writeVuMatrix4f(rdram, dstAddr, out);
-        }
+        VCNT("sceVu0TransMatrix");
+        const uint32_t d = getRegU32(ctx, 4), a = getRegU32(ctx, 5), b = getRegU32(ctx, 6);
+        float m[16]{}, t[4]{};
+        if (readVuMatrix4f(rdram, a, m) && readVuVec4f(rdram, b, t)) { for (int i=0;i<3;++i) m[12+i]+=t[i]; /* libvu0: w of translation row unchanged */ writeVuMatrix4f(rdram, d, m); }
         setReturnS32(ctx, 0);
     }
 
     void sceVu0TransposeMatrix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        VCNT("sceVu0TransposeMatrix");
         const uint32_t dstAddr = getRegU32(ctx, 4);
         const uint32_t srcAddr = getRegU32(ctx, 5);
         float src[16]{};
@@ -1026,6 +749,7 @@ namespace ps2_stubs
 
     void sceVu0UnitMatrix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        VCNT("sceVu0UnitMatrix");
         const uint32_t dstAddr = getRegU32(ctx, 4); // sceVu0FMATRIX dst
         alignas(16) const float identity[16] = {
             1.0f, 0.0f, 0.0f, 0.0f,
@@ -1049,55 +773,21 @@ namespace ps2_stubs
 
     void sceVu0ViewScreenMatrix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        // Near/far params handled by formula shape; SDK parameter names
-        // not pinned. Args follow the out-of-line libvu0 register convention
-        // used throughout this file: eight scalar floats in f12..f19 (p0..p7)
-        // and the ninth (p8) as the first stack-passed argument. That
-        // eight-FP-arg-register layout is the n32/EABI convention the EE
-        // toolchain emits (an o32 layout would carry only two FP args in
-        // f12/f14 and spill p2..p7 too), and under it no GPR home/save area is
-        // reserved, so the ninth float is at 0(sp) -- read below. A target ABI
-        // that reserves a home area would shift only that read by its size.
-        const uint32_t dstAddr = getRegU32(ctx, 4);
-        const float p0 = ctx ? ctx->f[12] : 0.0f;
-        const float p1 = ctx ? ctx->f[13] : 0.0f;
-        const float p2 = ctx ? ctx->f[14] : 0.0f;
-        const float p3 = ctx ? ctx->f[15] : 0.0f;
-        const float p4 = ctx ? ctx->f[16] : 0.0f;
-        const float p5 = ctx ? ctx->f[17] : 0.0f;
-        const float p6 = ctx ? ctx->f[18] : 0.0f;
-        const float p7 = ctx ? ctx->f[19] : 0.0f;
-        float p8 = 0.0f;
-        if (const uint8_t *sp = getConstMemPtr(rdram, getRegU32(ctx, 29)))
-        {
-            std::memcpy(&p8, sp, sizeof(p8));
-        }
-
-        const float denom = p8 - p7;
-        const float zScale = (denom != 0.0f) ? ((p8 * p7 * (p6 - p5)) / denom) : 0.0f;
-        const float zOffset = (denom != 0.0f) ? (((p5 * p8) - (p6 * p7)) / denom) : 0.0f;
-
-        float scaleMat[16]{};
-        makeIdentityMatrix(scaleMat);
-        scaleMat[0] = p0;
-        scaleMat[5] = p0;
-        scaleMat[10] = 0.0f;
-        scaleMat[11] = 1.0f;
-        scaleMat[14] = 1.0f;
-        scaleMat[15] = 0.0f;
-
-        float projMat[16]{};
-        makeIdentityMatrix(projMat);
-        projMat[0] = p1;
-        projMat[5] = p2;
-        projMat[10] = zScale;
-        projMat[12] = p3;
-        projMat[13] = p4;
-        projMat[14] = zOffset;
-
-        float out[16]{};
-        mulVuMatrix(scaleMat, projMat, out);
-        (void)writeVuMatrix4f(rdram, dstAddr, out);
+        VCNT("sceVu0ViewScreenMatrix");
+        const uint32_t d = getRegU32(ctx, 4);
+        const float scrz = ctx->f[12], ax = ctx->f[13], ay = ctx->f[14], cx = ctx->f[15], cy = ctx->f[16];
+        const float zmin = ctx->f[17], zmax = ctx->f[18], nearz = ctx->f[19];
+        float farz = 0.0f;
+        { const uint8_t *sp = getConstMemPtr(rdram, getRegU32(ctx, 29)); if (sp) std::memcpy(&farz, sp, 4); }
+        float o[16]{};
+        const float dz = farz - nearz;
+        const float az = (dz != 0.0f) ? farz * nearz * (zmax - zmin) / dz : 0.0f; // libvu0: near->zmax, far->zmin
+        const float cz = (dz != 0.0f) ? (zmin * farz - zmax * nearz) / dz : 0.0f;
+        o[0] = scrz * ax; o[5] = scrz * ay;
+        o[8] = cx; o[9] = cy; o[10] = cz; o[11] = 1.0f;
+        o[14] = az;
+        writeVuMatrix4f(rdram, d, o);
+        { static float ls=-1,lcx=-1,lcy=-1,lay=-1; static std::atomic<int> n{0}; bool chg=(ls!=scrz||lcx!=cx||lcy!=cy||lay!=ay); ls=scrz;lcx=cx;lcy=cy;lay=ay; if (chg && n.fetch_add(1) < 60) { std::cerr << "[vu0stub] ViewScreen scrz=" << scrz << " ax=" << ax << " ay=" << ay << " cx=" << cx << " cy=" << cy << " zmin=" << zmin << " zmax=" << zmax << " near=" << nearz << " far=" << farz; vlogM("out",o); std::cerr << std::endl; } }
         setReturnS32(ctx, 0);
     }
 }

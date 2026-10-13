@@ -2236,6 +2236,42 @@ void VU1Interpreter::runLoop(uint8_t *vuCode, uint32_t codeSize,
     if (previousRoundingMode != -1)
         t_callerRoundingMode = previousRoundingMode;
     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
+    // VENDETTA_VU1_EXACT="0x1d60-0x27b0,...": runs that start in these VU code byte ranges use the exact (queued
+    // register write) model, the rest fast - to bisect which program the fast model gets wrong (HCTP: in-ring gloss
+    // and crowd placement right only with VENDETTA_VU1_FAST=0).
+    static const std::vector<std::pair<uint32_t, uint32_t>> exactRanges = []
+    {
+        std::vector<std::pair<uint32_t, uint32_t>> ranges;
+        if (const char *value = std::getenv("VENDETTA_VU1_EXACT"))
+        {
+            std::string text(value);
+            size_t at = 0u;
+            while (at < text.size())
+            {
+                const size_t comma = text.find(',', at);
+                const std::string item = text.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+                const size_t dash = item.find('-');
+                if (dash != std::string::npos)
+                    ranges.emplace_back(static_cast<uint32_t>(std::stoul(item.substr(0, dash), nullptr, 16)),
+                                        static_cast<uint32_t>(std::stoul(item.substr(dash + 1), nullptr, 16)));
+                if (comma == std::string::npos)
+                    break;
+                at = comma + 1u;
+            }
+            std::fprintf(stderr, "[vu1] exact model for %zu range(s) (VENDETTA_VU1_EXACT)\n", ranges.size());
+        }
+        return ranges;
+    }();
+    // The exact model queues register writes that only its own commit path lands: it stays on until the program
+    // ends (a run can stop at its budget and resume), then the queues drain and the fast model comes back.
+    static bool exactRangeActive = false;
+    if (m_fastMode && !exactRangeActive && !exactRanges.empty() && m_unit == Unit::VU1)
+        for (const auto &[from, to] : exactRanges)
+            if (m_state.pc >= from && m_state.pc < to)
+            {
+                m_fastMode = false;
+                exactRangeActive = true;
+            }
     if (m_fastMode)
         drainRegisterWrites();
     const uint64_t budgetEnd = m_cycle + maxCycles;
@@ -2243,6 +2279,20 @@ void VU1Interpreter::runLoop(uint8_t *vuCode, uint32_t codeSize,
     uint64_t pairsRun = 0u;
     uint64_t compiledPairsRun = 0u;
     bool programEnded = false;
+    struct ExactRangeEnd
+    {
+        VU1Interpreter &vu;
+        const bool &ended;
+        ~ExactRangeEnd()
+        {
+            if (exactRangeActive && ended)
+            {
+                vu.drainRegisterWrites();
+                vu.m_fastMode = true;
+                exactRangeActive = false;
+            }
+        }
+    } exactRangeEnd{*this, programEnded};
     // compiled VU1 code (ps2_vu1_compiled.h): fast mode only, on VU1's own (tracked) 16 KB code / data memory
     const bool compiledAllowed = m_compiledEnabled && m_fastMode && m_unit == Unit::VU1 && memory != nullptr &&
                                  vuCode == memory->getVU1Code() && codeSize == 0x4000u && dataSize == 0x4000u;
