@@ -63,6 +63,126 @@ namespace ps2_stubs
         }
     }
 
+    // Native EE libsdr for a game whose IOP side runs its real sdrdrv IRX (ps2xIOP): sceSdRemote = SIF RPC to sdrdrv
+    // (sid 0x80000701), as the game's own libsdr does - the stand-in below drops every command, so HCTP's sound-effect
+    // kit (sceSkSs*_Control -> sceSdRemote) never reached the IOP. The stub-listed libsdr functions were never
+    // recompiled (their runner files only call these stubs), so this is written from the game's code (HCTP
+    // 0x115188 sceSdRemoteInit, 0x1152c8 sceSdRemote, 0x1152b8 sceSdCallBack). A game override turns it on and gives the
+    // addresses of the game's own client data (cd) and command buffer.
+    namespace
+    {
+        constexpr uint32_t kSdrSid = 0x80000701u;
+        bool g_sdrNative = false;
+        bool g_sdrBound = false;
+        uint32_t g_sdrCd = 0u;     // SifRpcClientData_t (0x28 bytes; +0x24 = the server once bound)
+        uint32_t g_sdrBuf = 0u;    // 64-byte command buffer (+0x40: 4-byte scratch reply)
+        uint32_t g_sdrCallback = 0u;
+        uint32_t g_sdrSaved[3] = {}; // the previous values 0x8160 (two slots) / 0x8170 return
+
+        // sceSifCallRpc(cd, fno, 0 = blocking, send, ssize, recv, rsize, no end function), on a scratch frame;
+        // the caller's registers are restored afterwards. An IOP-served call completes before it returns.
+        void sdrCall(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t fno, uint32_t send,
+                     uint32_t ssize, uint32_t recv, uint32_t rsize)
+        {
+            const R5900Context saved = *ctx;
+            const uint32_t sp = (getRegU32(ctx, 29) - 0x40u) & ~0xFu;
+            FAST_WRITE32(sp, 0u); // end parameter
+            SET_GPR_U32(ctx, 29, sp);
+            SET_GPR_U32(ctx, 4, g_sdrCd);
+            SET_GPR_U32(ctx, 5, fno);
+            SET_GPR_U32(ctx, 6, 0u);
+            SET_GPR_U32(ctx, 7, send);
+            SET_GPR_U32(ctx, 8, ssize);
+            SET_GPR_U32(ctx, 9, recv);
+            SET_GPR_U32(ctx, 10, rsize);
+            SET_GPR_U32(ctx, 11, 0u);
+            ps2_syscalls::sceSifCallRpc(rdram, ctx, runtime);
+            *ctx = saved;
+        }
+
+        bool sdrBind(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            if (g_sdrBound)
+                return true;
+            const R5900Context saved = *ctx;
+            for (int attempt = 0; attempt < 8 && !g_sdrBound; ++attempt)
+            {
+                SET_GPR_U32(ctx, 4, g_sdrCd);
+                SET_GPR_U32(ctx, 5, kSdrSid);
+                SET_GPR_U32(ctx, 6, 0u);
+                ps2_stubs::sceSifBindRpc(rdram, ctx, runtime);
+                g_sdrBound = FAST_READ32(g_sdrCd + 0x24u) != 0u;
+            }
+            *ctx = saved;
+            std::fprintf(stderr, "[libsdr] bind sdrdrv 0x%x: %s\n", kSdrSid, g_sdrBound ? "ok" : "FAILED (stand-in kept)");
+            return g_sdrBound;
+        }
+
+        uint32_t sdrRemote(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            const uint32_t cmd = getRegU32(ctx, 5);
+            const uint32_t buf = g_sdrBuf;
+            uint32_t arg[6] = {buf, getRegU32(ctx, 6), getRegU32(ctx, 7), getRegU32(ctx, 8), getRegU32(ctx, 9),
+                               getRegU32(ctx, 10)};
+            for (uint32_t i = 0; i < 6u; ++i)
+                FAST_WRITE32(buf + i * 4u, arg[i]);
+
+            static uint32_t logged = 0u;
+            if (logged < 24u)
+            {
+                ++logged;
+                std::fprintf(stderr, "[libsdr] cmd 0x%x args 0x%x 0x%x 0x%x 0x%x 0x%x\n", cmd, arg[1], arg[2], arg[3],
+                             arg[4], arg[5]);
+            }
+
+            uint32_t result = 0u;
+            bool haveResult = false;
+            if (cmd == 0x8160u || cmd == 0x8170u)
+            {
+                // set a transfer-end callback: the call returns the previous one
+                const uint32_t slot = cmd == 0x8170u ? 2u : (arg[1] != 0u ? 1u : 0u);
+                result = g_sdrSaved[slot];
+                g_sdrSaved[slot] = cmd == 0x8170u ? arg[1] : arg[2];
+                haveResult = true;
+            }
+
+            if (cmd == 0x8130u || cmd == 0x81A0u || cmd == 0x81B0u)
+                sdrCall(rdram, ctx, runtime, cmd | arg[1], arg[2], 64u, buf, 64u);
+            else if (cmd == 0x8140u)
+            {
+                sdrCall(rdram, ctx, runtime, arg[1] | 0x8140u, buf, 64u, arg[2], 64u);
+                return 0u;
+            }
+            else if (cmd == 0x81C0u || cmd == 0x81D0u)
+            {
+                const uint32_t block = arg[1];
+                FAST_WRITE16(block + 2u, static_cast<uint16_t>(arg[2]));
+                if (cmd == 0x81D0u)
+                    FAST_WRITE32(block + 4u, arg[5]);
+                uint32_t recv = arg[3], rsize = arg[4];
+                if (recv == 0u)
+                {
+                    recv = buf + 0x40u;
+                    rsize = 4u;
+                }
+                sdrCall(rdram, ctx, runtime, cmd, block, (arg[2] + 1u) * 8u, recv, rsize);
+                return FAST_READ32(recv);
+            }
+            else if (cmd >= 0x9000u && cmd - 0x9000u < 241u)
+                sdrCall(rdram, ctx, runtime, cmd, arg[1], arg[2], buf, 16u); // user command (sound kit)
+            else
+                sdrCall(rdram, ctx, runtime, cmd, buf, 64u, buf, 16u);
+            return haveResult ? result : FAST_READ32(buf);
+        }
+    }
+
+    void setLibSdrNative(uint32_t clientData, uint32_t commandBuffer)
+    {
+        g_sdrNative = clientData != 0u && commandBuffer != 0u;
+        g_sdrCd = clientData;
+        g_sdrBuf = commandBuffer;
+    }
+
     void resetAudioStubState()
     {
         std::lock_guard<std::mutex> lock(g_audio_stub_mutex);
@@ -71,11 +191,24 @@ namespace ps2_stubs
 
     void sceSdCallBack(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (g_sdrNative)
+        {
+            // sceSdCallBack(func): set the transfer-end callback, return the previous one (game: 0x1152b8)
+            const uint32_t previous = g_sdrCallback;
+            g_sdrCallback = getRegU32(ctx, 4);
+            setReturnU32(ctx, previous);
+            return;
+        }
         TODO_NAMED("sceSdCallBack", rdram, ctx, runtime);
     }
 
     void sceSdRemote(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (g_sdrNative && sdrBind(rdram, ctx, runtime))
+        {
+            setReturnU32(ctx, sdrRemote(rdram, ctx, runtime));
+            return;
+        }
         (void)runtime;
 
         const uint32_t cmd = getRegU32(ctx, 5);
@@ -196,6 +329,18 @@ namespace ps2_stubs
 
     void sceSdRemoteInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (g_sdrNative)
+        {
+            const R5900Context saved = *ctx;
+            SET_GPR_U32(ctx, 4, 0u);
+            ps2_stubs::sceSifInitRpc(rdram, ctx, runtime);
+            *ctx = saved;
+            if (sdrBind(rdram, ctx, runtime))
+            {
+                setReturnS32(ctx, 0);
+                return;
+            }
+        }
         (void)rdram;
         (void)runtime;
 

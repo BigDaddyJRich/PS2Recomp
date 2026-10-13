@@ -1809,20 +1809,41 @@ namespace
     template <typename Decoded>
     void recomputeProgramMacReads(const void *owner, const Decoded *decoded, uint32_t pairCount)
     {
+        // A program reading the STATUS flags (FSEQ / FSAND / FSOR: sticky bits = the whole history) runs exact
+        // throughout. One reading only the MAC flags (FMEQ / FMAND / FMOR: the flags of the FMAC op ~4 cycles before)
+        // runs exact just over the kMacWindow pairs up to each reader: whole-program exact put HCTP's wrestler-model
+        // programs (one FMAND each) on the slow interpreter - Create-a-Moveset / matches VU1-bound on the chain worker.
+        // VENDETTA_VU1_MAC_WINDOW=0 = whole program exact as before.
+        static const uint32_t kMacWindow = []
+        {
+            const char *value = std::getenv("VENDETTA_VU1_MAC_WINDOW");
+            return value && *value ? static_cast<uint32_t>(std::max(0, std::atoi(value))) : 16u;
+        }();
         auto &table = programMacReadTables()[owner];
         table.fill(0u);
         uint32_t start = 0u;
-        bool reads = false;
+        bool readsStatus = false;
         for (uint32_t i = 0; i < pairCount; ++i)
         {
-            reads = reads || pairReadsMacStatus(decoded[i].lower, decoded[i].iBit);
+            if (pairReadsMacStatus(decoded[i].lower, decoded[i].iBit))
+            {
+                const uint32_t opHi = (decoded[i].lower >> 25) & 0x7Fu;
+                const bool macOnly = opHi == 0x18u || opHi == 0x1Au || opHi == 0x1Bu;
+                if (macOnly && kMacWindow != 0u)
+                {
+                    const uint32_t from = i >= start + kMacWindow ? i - kMacWindow : start;
+                    std::fill(table.begin() + from, table.begin() + i + 1u, uint8_t{1u});
+                }
+                else
+                    readsStatus = true;
+            }
             const bool end = i + 1u == pairCount || (i > 0u && decoded[i - 1u].eBit);
             if (end)
             {
-                if (reads)
+                if (readsStatus)
                     std::fill(table.begin() + start, table.begin() + i + 1u, uint8_t{1u});
                 start = i + 1u;
-                reads = false;
+                readsStatus = false;
             }
         }
     }

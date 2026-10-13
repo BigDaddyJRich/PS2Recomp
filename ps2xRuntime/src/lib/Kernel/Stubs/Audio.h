@@ -9,6 +9,7 @@ namespace ps2_stubs
     void sceSdRemote(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceSdRemoteInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceSdTransToIOP(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void setLibSdrNative(uint32_t clientData, uint32_t commandBuffer); // native libsdr (RPC to the real sdrdrv)
     void sceSSyn_BreakAtick(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceSSyn_ClearBreakAtick(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceSSyn_SendExcMsg(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

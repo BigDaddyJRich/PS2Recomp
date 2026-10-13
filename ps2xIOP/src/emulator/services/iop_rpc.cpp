@@ -375,7 +375,8 @@ namespace ps2x::iop::detail
             const uint32_t src = cpu.gpr[5];
             const uint32_t dest = cpu.gpr[6] & 0x1FFFFFu;
             const int32_t size = static_cast<int32_t>(cpu.gpr[7]);
-            bool ok = size > 0 && m_memory.isRamRange(dest, static_cast<uint32_t>(size));
+            // dest 0 = the caller's buffer allocation failed: copying would overwrite the IOP's low memory
+            bool ok = size > 0 && dest >= 0x1000u && m_memory.isRamRange(dest, static_cast<uint32_t>(size));
             if (ok)
             {
                 std::vector<uint8_t> scratch(static_cast<size_t>(size));
@@ -383,7 +384,7 @@ namespace ps2x::iop::detail
                      m_memory.writeRam(dest, scratch.data(), scratch.size());
             }
             static uint32_t logged = 0u;
-            if (logged++ < 32u)
+            if (logged++ < 32u || !ok)
                 std::fprintf(stderr, "[iop-getother] src=0x%x dest=0x%x size=%d ok=%d\n", src, dest, size, ok ? 1 : 0);
             setV0(ok ? 0u : static_cast<uint32_t>(-1));
             return true;

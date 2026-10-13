@@ -491,8 +491,12 @@ void EeScheduler::postEvent(EeEvent event)
 // stall (> 100 ms) instead of racing through it. When EE time is ahead, the VBlank / timer pacing waits hold it.
 void EeScheduler::catchUpWithHostClock() noexcept
 {
-    constexpr uint32_t kCheckInterval = 1024u;
-    constexpr uint64_t kMaxStepCycles = EeScheduler::kEeClockHz / 1000u;    // 1 ms
+    // Every 16 checkpoints, up to 2 ms (was 1024 / 1 ms): HCTP's CRender::Synch -> y_sceGsSyncPath busy-polls DMA / GS
+    // status, each poll a register access + chain fence (~0.1 ms of real time) charged a few EE cycles, so 1024 polls
+    // (~100 ms) caught EE time up by only 1 ms: vblanks came 100-120 ms apart, matches ran under 10 fps on an idle PC.
+    // A clock read every 16 checkpoints costs nothing next to them; 2 ms stays under one period of a 100 Hz timer.
+    constexpr uint32_t kCheckInterval = 16u;
+    constexpr uint64_t kMaxStepCycles = EeScheduler::kEeClockHz / 500u;     // 2 ms
     constexpr uint64_t kResyncCycles = EeScheduler::kEeClockHz / 10u;       // 100 ms
     if (m_hostClockCheckCountdown != 0u)
     {
@@ -613,8 +617,29 @@ void EeScheduler::catchUpBeforeDeadline() noexcept
     }
 }
 
+// VENDETTA_EE_CYCLE_PCT (default 100): scales the cycles guest code is charged at its checkpoints (32 per loop back
+// edge, 8 per call - flat guesses, not real instruction costs). HCTP's matches are tight EE loops (skinning, crowd,
+// matrices) that cost a few real cycles per iteration: charged 32, EE time ran several times ahead of the work done,
+// the game ran out of frame budget and the host slept ("pace" ~90%) - under 10 fps on an idle PC, audio starved.
+static uint32_t guestCyclePercent() noexcept
+{
+    static const uint32_t percent = []
+    {
+        const char *value = std::getenv("VENDETTA_EE_CYCLE_PCT");
+        const int parsed = (value && *value) ? std::atoi(value) : 100;
+        const uint32_t clamped = static_cast<uint32_t>(std::clamp(parsed, 5, 400));
+        if (clamped != 100u)
+            std::fprintf(stderr, "[ee] guest cycle charge %u%% (VENDETTA_EE_CYCLE_PCT)\n", clamped);
+        return clamped;
+    }();
+    return percent;
+}
+
 bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 {
+    static const uint32_t percent = guestCyclePercent();
+    if (percent != 100u)
+        cycles = std::max<uint32_t>(1u, static_cast<uint32_t>((uint64_t(cycles) * percent) / 100u));
     accountCycles(cycles);
     catchUpWithHostClock();
 

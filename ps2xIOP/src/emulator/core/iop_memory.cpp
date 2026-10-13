@@ -458,9 +458,66 @@ namespace ps2x::iop::detail
         return true;
     }
 
+    // The free gaps of the heap, lowest first (sysmem's free list).
+    static std::vector<IopMemory::Allocation> freeGaps(const std::vector<IopMemory::Allocation> &allocations)
+    {
+        std::vector<IopMemory::Allocation> used = allocations;
+        std::sort(used.begin(), used.end(), [](const auto &a, const auto &b) { return a.address < b.address; });
+        std::vector<IopMemory::Allocation> gaps;
+        uint32_t cursor = IopMemory::HeapBase;
+        for (const auto &block : used)
+        {
+            if (block.address + block.size <= cursor)
+                continue;
+            if (block.address > cursor)
+                gaps.push_back({cursor, std::min(block.address, IopMemory::HeapLimit) - cursor});
+            cursor = std::max(cursor, block.address + block.size);
+            if (cursor >= IopMemory::HeapLimit)
+                break;
+        }
+        if (cursor < IopMemory::HeapLimit)
+            gaps.push_back({cursor, IopMemory::HeapLimit - cursor});
+        return gaps;
+    }
+
+    // ALLOC_LAST: the highest free block that fits (sysmem takes the top of the last fitting gap).
+    uint32_t IopMemory::allocateHigh(uint32_t size, uint32_t alignment)
+    {
+        size = alignUp(std::max(size, 1u), 16u);
+        alignment = std::max<uint32_t>(alignment, 4u);
+        const auto gaps = freeGaps(m_allocations);
+        for (auto gap = gaps.rbegin(); gap != gaps.rend(); ++gap)
+        {
+            if (gap->size < size)
+                continue;
+            const uint32_t address = (gap->address + gap->size - size) & ~(alignment - 1u);
+            if (address < gap->address)
+                continue;
+            m_allocations.push_back({address, size});
+            markOwned(address, size);
+            m_heapCursor = std::max(m_heapCursor, address + size);
+            return address;
+        }
+        return 0u;
+    }
+
+    // QueryMaxFreeMemSize = the largest free block (was "top minus the highest address ever used", which counted none of
+    // the blocks freed below it: after boot -> menus -> loads HCTP's sound driver was told the IOP was full and its bank
+    // buffer came back 0 - the season match load stalled with 32 KB of bank copied to IOP address 0).
     uint32_t IopMemory::maxFreeMemory() const
     {
-        return m_heapCursor < HeapLimit ? HeapLimit - m_heapCursor : 0u;
+        uint32_t best = 0u;
+        for (const auto &gap : freeGaps(m_allocations))
+            best = std::max(best, gap.size);
+        return best;
+    }
+
+    uint32_t IopMemory::totalFreeMemory() const
+    {
+        uint32_t total = 0u;
+        for (const auto &gap : freeGaps(m_allocations))
+            total += gap.size;
+        return total;
     }
 
     std::optional<IopMemory::Allocation> IopMemory::allocationContaining(uint32_t address) const

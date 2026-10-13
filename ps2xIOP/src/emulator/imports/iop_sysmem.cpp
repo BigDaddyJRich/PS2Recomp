@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "iop_sysmem.h"
 
 #include "../core/iop_cpu.h"
@@ -27,9 +28,13 @@ namespace ps2x::iop::detail
         {
         case 4: // AllocSysMemory
         {
-            const uint32_t address = a0 == 2u
-                                         ? m_memory.allocate(a1, 16u, a2)
-                                         : m_memory.allocate(a1, 16u);
+            // a0 = ALLOC_FIRST 0 / ALLOC_LAST 1 / ALLOC_ADDRESS 2
+            const uint32_t address = a0 == 2u   ? m_memory.allocate(a1, 16u, a2)
+                                     : a0 == 1u ? m_memory.allocateHigh(a1, 16u)
+                                                : m_memory.allocate(a1, 16u);
+            if (address == 0u)
+                std::fprintf(stderr, "[iop-alloc] AllocSysMemory(mode %u, size 0x%x) failed: largest free 0x%x, total free 0x%x\n",
+                             a0, a1, m_memory.maxFreeMemory(), m_memory.totalFreeMemory());
             setV0(address);
             return true;
         }
@@ -40,8 +45,10 @@ namespace ps2x::iop::detail
             setV0(IopMemory::RamSize);
             return true;
         case 7: // QueryMaxFreeMemSize
-        case 8: // QueryTotalFreeMemSize
             setV0(m_memory.maxFreeMemory());
+            return true;
+        case 8: // QueryTotalFreeMemSize
+            setV0(m_memory.totalFreeMemory());
             return true;
         case 9: // QueryBlockTopAddress
             if (const auto block = m_memory.allocationContaining(a0))
