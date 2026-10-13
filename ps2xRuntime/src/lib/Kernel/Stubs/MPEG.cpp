@@ -2148,7 +2148,13 @@ namespace ps2_stubs
             const uint32_t owner = ipuRingOwnerLocked(rdram, tadr);
             const uint32_t t = owner != 0u ? owner : g_ipuTargetMpeg;
             const auto it = t != 0u ? g_mpeg_stub_state.playbackByMpeg.find(t) : g_mpeg_stub_state.playbackByMpeg.end();
-            if (it != g_mpeg_stub_state.playbackByMpeg.end() && it->second.decodedFrames.size() >= 4u)
+            // HCTP_IPU_MAXQ: decoded pictures a stream may hold before its IPU feed stops (default 4)
+            static const size_t maxQueued = []
+            {
+                const char *v = std::getenv("HCTP_IPU_MAXQ");
+                return v && *v ? static_cast<size_t>(std::max(1, std::atoi(v))) : size_t{4};
+            }();
+            if (it != g_mpeg_stub_state.playbackByMpeg.end() && it->second.decodedFrames.size() >= maxQueued)
             {
                 chcr &= ~0x100u;
                 static std::atomic<uint32_t> s_full{0};

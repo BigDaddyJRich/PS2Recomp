@@ -98,6 +98,45 @@ namespace ps2_stubs
         uint32_t size = getRegU32(ctx, 6);     // $a2
         size = sanitizeMemTransferSize(size, "memcpy");
 
+        // Overlapping ranges: do exactly what the game's newlib memcpy (SLUS_207.87 0x124d20) does - forward, 16-byte
+        // lq/sq pairs while >= 32 bytes remain and both pointers are 16-aligned, then 8-byte ld/sd, then bytes; else
+        // bytes. Decompressors (HCTP's "BPE " font data) copy overlapping runs and depend on it; host memcpy is
+        // undefined there (in-match HUD names / season dialogue came out as the wrong glyphs).
+        if (size != 0u && destAddr != srcAddr &&
+            ((destAddr > srcAddr && destAddr - srcAddr < size) || (srcAddr > destAddr && srcAddr - destAddr < size)))
+        {
+            uint32_t d = destAddr, src = srcAddr, n = size;
+            auto copyChunk = [&](uint32_t bytes) {
+                uint8_t tmp[16];
+                for (uint32_t k = 0; k < bytes; ++k)
+                {
+                    const uint8_t *from = getConstMemPtr(rdram, src + k);
+                    tmp[k] = from ? *from : 0u;
+                }
+                for (uint32_t k = 0; k < bytes; ++k)
+                    if (uint8_t *to = getMemPtr(rdram, d + k))
+                        *to = tmp[k];
+                d += bytes;
+                src += bytes;
+                n -= bytes;
+            };
+            if (n >= 32u && ((d | src) & 15u) == 0u)
+            {
+                while (n >= 32u)
+                {
+                    copyChunk(16u);
+                    copyChunk(16u);
+                }
+                while (n >= 8u)
+                    copyChunk(8u);
+            }
+            while (n != 0u)
+                copyChunk(1u);
+            ps2TraceGuestRangeWrite(rdram, destAddr, size, "memcpy", ctx);
+            ctx->r[2] = ctx->r[4];
+            return;
+        }
+
         uint32_t copied = 0u;
         uint32_t curDst = destAddr;
         uint32_t curSrc = srcAddr;

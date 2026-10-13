@@ -1,3 +1,4 @@
+#include <set>
 #include "runtime/ps2_host_profile.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
@@ -1949,6 +1950,19 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         m_bitbltbuf.dbp = static_cast<uint32_t>((value >> 32) & 0x3FFF);
         m_bitbltbuf.dbw = static_cast<uint8_t>((value >> 48) & 0x3F);
         m_bitbltbuf.dpsm = static_cast<uint8_t>((value >> 56) & 0x3F);
+        // HCTP diag (HCTP_FONTLOG=1): image transfers into the font sheets' area (dbp 0x2200-0x23ff)
+        {
+            static const bool fontLog = std::getenv("HCTP_FONTLOG") != nullptr;
+            static int logged = 0;
+            static const auto t0 = std::chrono::steady_clock::now();
+            if (fontLog && m_bitbltbuf.dpsm == 0x14u && logged < 400)
+            {
+                ++logged;
+                std::fprintf(stderr, "[fontxfer] t=%.1f dbp=0x%x dbw=%u dpsm=0x%x\n",
+                             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+                             m_bitbltbuf.dbp, m_bitbltbuf.dbw, m_bitbltbuf.dpsm);
+            }
+        }
         break;
     }
     case GS_REG_TRXPOS:
@@ -2111,6 +2125,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     recordRegisterDebugEventUnlocked(regAddr, value);
 }
 
+static const auto s_fontLogT0 = std::chrono::steady_clock::now();
+
 void GS::vertexKick(bool drawing)
 {
     ++m_vtxCount;
@@ -2162,6 +2178,48 @@ void GS::vertexKick(bool drawing)
     if (drawing && m_backend)
     {
         GSPrimitiveBatch batch = buildDrawBatch(needed);
+        // HCTP diag (HCTP_FONTLOG=1): draws whose frame / Z buffer reaches the font sheets (blocks 0x2240-0x233f)
+        {
+            static const bool fontLog = std::getenv("HCTP_FONTLOG") != nullptr;
+            if (fontLog)
+            {
+                const GSContext &c = batch.state.context;
+                const uint32_t lines = static_cast<uint32_t>(c.scissor.y1) + 1u;
+                auto pagesFor = [&](uint8_t psm, uint32_t fbw) {
+                    const bool half = (psm & 0x0Fu) == 0x02u || (psm & 0x0Fu) == 0x0Au; // 16-bit: 64-line pages
+                    return std::max<uint32_t>(fbw, 1u) * ((lines + (half ? 63u : 31u)) / (half ? 64u : 32u));
+                };
+                const uint32_t fb0 = c.frame.fbp * 32u, fb1 = fb0 + pagesFor(c.frame.psm, c.frame.fbw) * 32u;
+                const bool zWrites = (c.test & (1ull << 16)) != 0u && !c.zbuf.zmask;
+                const uint32_t z0 = c.zbuf.zbp * 32u, z1 = z0 + pagesFor(c.zbuf.psm, c.frame.fbw) * 32u;
+                // textured 4-bit sprites (text): which texture / CLUT they sample, per distinct TEX0
+                if (m_prim.tme && (m_prim.type == GS_PRIM_SPRITE || m_prim.type == GS_PRIM_TRISTRIP) && std::chrono::duration<double>(std::chrono::steady_clock::now() - s_fontLogT0).count() > 400.0)
+                {
+                    static std::set<uint64_t> texSeen;
+                    const uint64_t tk = (static_cast<uint64_t>(c.tex0.tbp0) << 32) | (c.tex0.cbp << 8) | (c.tex0.tw << 4) | c.tex0.th;
+                    static const auto tt0 = std::chrono::steady_clock::now();
+                    if (texSeen.size() < 400 && texSeen.insert(tk ^ (static_cast<uint64_t>(std::chrono::duration<double>(std::chrono::steady_clock::now() - tt0).count() / 60.0) << 56)).second)
+                        std::fprintf(stderr, "[fonttex] t=%.1f prim=%u psm=0x%x tbp=0x%x tbw=%u tw=%u th=%u cbp=0x%x cpsm=0x%x csa=%u tcc=%u tfx=%u fst=%d | frame fbp=%u\n",
+                                     std::chrono::duration<double>(std::chrono::steady_clock::now() - tt0).count(),
+                                     static_cast<unsigned>(m_prim.type), c.tex0.psm, c.tex0.tbp0, c.tex0.tbw, c.tex0.tw, c.tex0.th, c.tex0.cbp, c.tex0.cpsm, c.tex0.csa,
+                                     c.tex0.tcc, c.tex0.tfx, m_prim.fst ? 1 : 0, c.frame.fbp);
+                }
+                const bool hitF = c.frame.fbmsk != 0xFFFFFFFFu && fb0 < 0x2340u && fb1 > 0x2240u;
+                const bool hitZ = zWrites && z0 < 0x2340u && z1 > 0x2240u;
+                if (hitF || hitZ)
+                {
+                    static std::set<uint64_t> seen;
+                    const uint64_t key = (static_cast<uint64_t>(c.frame.fbp) << 40) ^ (static_cast<uint64_t>(c.zbuf.zbp) << 20) ^
+                                         (static_cast<uint64_t>(lines) << 4) ^ (hitF ? 1u : 0u) ^ (hitZ ? 2u : 0u) ^
+                                         (static_cast<uint64_t>(c.frame.fbw) << 60);
+                    if (seen.size() < 40 && seen.insert(key).second)
+                        std::fprintf(stderr, "[fontclob] %s%s frame fbp=%u fbw=%u psm=0x%x msk=%08x | zbuf zbp=%u psm=0x%x zte=%d zmsk=%d | scissor %u-%u x %u-%u prim=%u\n",
+                                     hitF ? "FRAME" : "", hitZ ? "ZBUF" : "", c.frame.fbp, c.frame.fbw, c.frame.psm,
+                                     c.frame.fbmsk, c.zbuf.zbp, c.zbuf.psm, zWrites ? 1 : 0, c.zbuf.zmask ? 1 : 0,
+                                     c.scissor.x0, c.scissor.x1, c.scissor.y0, c.scissor.y1, static_cast<unsigned>(m_prim.type));
+                }
+            }
+        }
         if (s_hudLog.phase != HudLog::Off)
             hudLogPrimitive(batch);
         if (m_packetData && m_overlayRule && m_overlayRule(batch.state))
