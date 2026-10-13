@@ -42,7 +42,7 @@ namespace ps2_stubs
             {
                 return (offset < PS2_SCRATCHPAD_SIZE) ? (PS2_SCRATCHPAD_SIZE - offset) : 0u;
             }
-            return (offset < PS2_RAM_SIZE) ? (PS2_RAM_SIZE - offset) : 0u;
+            return (offset < PS2_RAM_BACKING_SIZE) ? (PS2_RAM_BACKING_SIZE - offset) : 0u;
         }
 
     }
@@ -50,7 +50,8 @@ namespace ps2_stubs
     void malloc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t size = getRegU32(ctx, 4); // $a0
-        const uint32_t guestAddr = runtime ? runtime->guestMalloc(size) : 0u;
+        // newlib's malloc(0) returns a valid minimum block, not NULL
+        const uint32_t guestAddr = runtime ? runtime->guestMalloc(size != 0u ? size : 1u) : 0u;
         setReturnU32(ctx, guestAddr);
     }
 
@@ -75,7 +76,10 @@ namespace ps2_stubs
     {
         const uint32_t count = getRegU32(ctx, 4); // $a0
         const uint32_t size = getRegU32(ctx, 5);  // $a1
-        const uint32_t guestAddr = runtime ? runtime->guestCalloc(count, size) : 0u;
+        // as newlib: a zero count or size still gets a valid minimum block
+        const uint32_t guestAddr = runtime ? (count != 0u && size != 0u ? runtime->guestCalloc(count, size)
+                                                                         : runtime->guestCalloc(1u, 1u))
+                                           : 0u;
         setReturnU32(ctx, guestAddr);
     }
 
@@ -347,7 +351,16 @@ namespace ps2_stubs
 
         if (hostStr1 && hostStr2)
         {
-            result = ::strcmp(hostStr1, hostStr2);
+            // newlib's result: the difference of the first differing bytes, as unsigned chars (the host CRT may
+            // return just -1 / 0 / 1)
+            const unsigned char *a = reinterpret_cast<const unsigned char *>(hostStr1);
+            const unsigned char *b = reinterpret_cast<const unsigned char *>(hostStr2);
+            while (*a != 0u && *a == *b)
+            {
+                ++a;
+                ++b;
+            }
+            result = static_cast<int>(*a) - static_cast<int>(*b);
         }
         else
         {
@@ -375,7 +388,17 @@ namespace ps2_stubs
 
         if (hostStr1 && hostStr2)
         {
-            result = ::strncmp(hostStr1, hostStr2, size);
+            // newlib's result: the difference of the first differing bytes within size, as unsigned chars
+            const unsigned char *a = reinterpret_cast<const unsigned char *>(hostStr1);
+            const unsigned char *b = reinterpret_cast<const unsigned char *>(hostStr2);
+            uint32_t left = size;
+            while (left != 0u && *a != 0u && *a == *b)
+            {
+                ++a;
+                ++b;
+                --left;
+            }
+            result = left == 0u ? 0 : static_cast<int>(*a) - static_cast<int>(*b);
         }
         else
         {
@@ -534,6 +557,7 @@ namespace ps2_stubs
             {
                 rendered.resize(2048);
             }
+            printGameText(rendered);
             PS2_IF_AGRESSIVE_LOGS({
                 const std::string logLine = sanitizeForLog(rendered);
                 uint32_t count = 0;
@@ -571,7 +595,10 @@ namespace ps2_stubs
         const std::string formatOwned = readPs2CStringBounded(rdram, runtime, format_addr, 1024);
         int ret = -1;
 
-        if (format_addr != 0)
+        // A NULL format reads as guest address 0, i.e. an empty string: the buffer still gets its terminator.
+        // Games rely on that (Def Jam Vendetta measures / draws an untitled message box with a NULL title);
+        // leaving the buffer unwritten made them read stale stack bytes as text.
+        if (str_addr != 0)
         {
             const uint32_t watchBase = ps2PathWatchPhysAddr();
             const uint32_t watchEnd = watchBase + PS2_PATH_WATCH_BYTES;
@@ -612,9 +639,10 @@ namespace ps2_stubs
         }
         else
         {
-            std::cerr << "sprintf error: Invalid format address provided."
+            std::cerr << "sprintf error: Invalid destination address provided."
                       << " Dest: 0x" << std::hex << str_addr
-                      << ", Format: 0x" << format_addr << std::dec
+                      << ", Format: 0x" << format_addr
+                      << ", ra: 0x" << getRegU32(ctx, 31) << std::dec
                       << std::endl;
         }
 
@@ -1147,7 +1175,8 @@ namespace ps2_stubs
         const std::string formatOwned = readPs2CStringBounded(rdram, runtime, format_addr, 1024);
         int ret = -1;
 
-        if (format_addr != 0)
+        // A NULL format reads as an empty string (see sprintf); the buffer always gets its terminator.
+        if (str_addr != 0)
         {
             std::string rendered = formatPs2StringWithVaList(rdram, runtime, formatOwned.c_str(), va_list_addr);
             if (rendered.size() >= kSafeVsprintfBytes)
@@ -1166,9 +1195,10 @@ namespace ps2_stubs
         }
         else
         {
-            std::cerr << "vsprintf error: Invalid address provided."
+            std::cerr << "vsprintf error: Invalid destination address provided."
                       << " Dest: 0x" << std::hex << str_addr
-                      << ", Format: 0x" << format_addr << std::dec
+                      << ", Format: 0x" << format_addr
+                      << ", ra: 0x" << getRegU32(ctx, 31) << std::dec
                       << std::endl;
         }
 

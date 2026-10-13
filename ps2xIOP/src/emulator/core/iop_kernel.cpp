@@ -32,6 +32,7 @@ namespace ps2x::iop::detail
         m_nextSemaphoreId = 1;
         m_nextEventFlagId = 1;
         m_currentThread = nullptr;
+        m_deadPending = false;
     }
 
     bool IopKernel::dispatchThreadImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle)
@@ -107,6 +108,8 @@ namespace ps2x::iop::detail
             if (m_currentThread != nullptr)
             {
                 m_currentThread->state = ordinal == 9 ? IopThreadState::Dead : IopThreadState::Dormant;
+                if (ordinal == 9)
+                    m_deadPending = true;
                 cpu.stopped = true;
                 cpu.yielded = true;
             }
@@ -652,6 +655,13 @@ namespace ps2x::iop::detail
         }
     }
 
+    void IopKernel::wakeSleeping(int id)
+    {
+        const auto it = m_threads.find(id);
+        if (it != m_threads.end() && it->second.state == IopThreadState::Sleep)
+            it->second.state = IopThreadState::Ready;
+    }
+
     void IopKernel::sleepCurrent(IopCpuState &cpu)
     {
         if (m_currentThread == nullptr)
@@ -669,23 +679,35 @@ namespace ps2x::iop::detail
         cpu.yielded = true;
     }
 
-    IopThread *IopKernel::beginNextReady(uint64_t currentCycle)
+    IopThread *IopKernel::beginNextReady(uint64_t currentCycle, uint64_t *nextDelayWake)
     {
-        for (auto &[id, thread] : m_threads)
-        {
-            if (thread.state == IopThreadState::Delay && thread.wakeCycle <= currentCycle)
-                thread.state = IopThreadState::Ready;
-        }
-
+        // One walk instead of two (wake the due delays, then pick). The pick is the smallest thread by
+        // (priority, id) among those Ready once every due delay has woken; ids are unique, so that order is
+        // strict and the smallest is the same whichever order the threads are looked at in - waking a thread
+        // and considering it in the same step picks exactly the thread the two walks picked.
         IopThread *next = nullptr;
+        uint64_t delayWake = UINT64_MAX;
         for (auto &[id, thread] : m_threads)
         {
+            if (thread.state == IopThreadState::Delay)
+            {
+                if (thread.wakeCycle > currentCycle)
+                {
+                    delayWake = std::min(delayWake, thread.wakeCycle);
+                    continue;
+                }
+                thread.state = IopThreadState::Ready;
+            }
             if (thread.state != IopThreadState::Ready)
                 continue;
             if (next == nullptr || thread.priority < next->priority ||
                 (thread.priority == next->priority && thread.id < next->id))
                 next = &thread;
         }
+        // The threads left in Delay are exactly those whose wake is after currentCycle, so this is what
+        // nextWakeCycle(UINT64_MAX) would find now.
+        if (nextDelayWake != nullptr)
+            *nextDelayWake = delayWake;
         if (next == nullptr)
             return nullptr;
 
@@ -719,6 +741,11 @@ namespace ps2x::iop::detail
 
     void IopKernel::cleanupDeadThreads()
     {
+        // Runs after every timeslice. A thread only becomes Dead where m_deadPending is set, and the walk below
+        // erases every Dead thread, so with the flag clear the walk would erase nothing.
+        if (!m_deadPending)
+            return;
+        m_deadPending = false;
         for (auto thread = m_threads.begin(); thread != m_threads.end();)
         {
             if (thread->second.state != IopThreadState::Dead)
@@ -738,7 +765,10 @@ namespace ps2x::iop::detail
         {
             const uint32_t pc = IopMemory::physicalAddress(thread.cpu.pc);
             if (pc >= base && pc < base + size)
+            {
                 thread.state = IopThreadState::Dead;
+                m_deadPending = true;
+            }
         }
     }
 }

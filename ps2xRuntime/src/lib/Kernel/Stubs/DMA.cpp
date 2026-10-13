@@ -27,6 +27,68 @@ namespace ps2_stubs
         constexpr uint32_t DMA_REG_STADR = 0x1000E060u;
 
         constexpr std::array<uint8_t, 10> kStsTable = {0u, 0u, 0u, 3u, 0u, 1u, 0u, 0u, 2u, 0u};
+        // (ported from the good-base fork) fromSPR = ch8, toSPR = ch9
+        constexpr uint32_t DMA_CH_FROM_SPR = 0x1000D000u;
+        constexpr uint32_t DMA_CH_TO_SPR = 0x1000D400u;
+
+        bool runScratchpadDmaNormal(PS2Runtime *runtime, uint32_t channelBase, uint32_t addrArg, uint32_t qwc)
+        {
+            if (!runtime || (channelBase != DMA_CH_FROM_SPR && channelBase != DMA_CH_TO_SPR))
+            {
+                return false;
+            }
+
+            PS2Memory &mem = runtime->memory();
+            uint8_t *rdram = mem.getRDRAM();
+            uint8_t *spr = mem.getScratchpad();
+            if (!rdram || !spr || qwc == 0u)
+            {
+                return true;
+            }
+
+            const uint32_t sadr = mem.readIORegister(channelBase + 0x80u) & (PS2_SCRATCHPAD_SIZE - 1u) & ~0xFu;
+            uint32_t bytes = qwc * 16u;
+
+            // MADR may itself point into the scratchpad (bit 31 set) or into main RAM.
+            uint32_t ramAddr = addrArg & 0x1FFFFFF0u;
+            if ((addrArg & 0x80000000u) != 0u)
+            {
+                const uint32_t lower = addrArg & 0x7FFFFFFFu;
+                if (lower >= PS2_SCRATCHPAD_BASE && lower < PS2_SCRATCHPAD_BASE + PS2_SCRATCHPAD_SIZE)
+                {
+                    ramAddr = 0xFFFFFFFFu; // scratchpad-to-scratchpad: handled below
+                }
+            }
+
+            bytes = std::min<uint32_t>(bytes, PS2_SCRATCHPAD_SIZE - sadr);
+            if (ramAddr == 0xFFFFFFFFu)
+            {
+                const uint32_t other = (addrArg & 0x7FFFFFFFu) - PS2_SCRATCHPAD_BASE;
+                bytes = std::min<uint32_t>(bytes, PS2_SCRATCHPAD_SIZE - other);
+                if (channelBase == DMA_CH_FROM_SPR)
+                    std::memmove(spr + other, spr + sadr, bytes);
+                else
+                    std::memmove(spr + sadr, spr + other, bytes);
+            }
+            else
+            {
+                if (ramAddr >= PS2_RAM_SIZE)
+                {
+                    return true;
+                }
+                bytes = std::min<uint32_t>(bytes, PS2_RAM_SIZE - ramAddr);
+                if (channelBase == DMA_CH_FROM_SPR)
+                    std::memcpy(rdram + ramAddr, spr + sadr, bytes);
+                else
+                    std::memcpy(spr + sadr, rdram + ramAddr, bytes);
+            }
+
+            // Leave the channel idle (STR cleared) so sceDmaSync sees it as finished.
+            mem.writeIORegister(channelBase + 0x00u, 0u);
+            mem.writeIORegister(channelBase + 0x20u, 0u);
+            return true;
+        }
+
         constexpr std::array<uint8_t, 10> kStdTable = {0u, 1u, 2u, 0u, 0u, 0u, 3u, 0u, 0u, 0u};
         constexpr std::array<uint8_t, 10> kMfdTable = {0u, 2u, 3u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
 
@@ -167,6 +229,15 @@ namespace ps2_stubs
 
     void sceDmaRecvN(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // sceDmaRecvN(channel, addr, qwc): normal-mode transfer from the channel's source into RAM (good-base port).
+        const uint32_t channelBase = resolveDmaChannelBase(rdram, getRegU32(ctx, 4));
+        const uint32_t addrArg = getRegU32(ctx, 5);
+        const uint32_t qwc = normalizeQwcFromArg(getRegU32(ctx, 6));
+        if (runScratchpadDmaNormal(runtime, channelBase, addrArg, qwc))
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
         TODO_NAMED("sceDmaRecvN", rdram, ctx, runtime);
     }
 

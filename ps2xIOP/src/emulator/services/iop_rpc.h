@@ -49,6 +49,7 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool dispatchSifManImport(uint16_t ordinal, IopCpuState &cpu);
         [[nodiscard]] bool dispatchSifCmdImport(uint16_t ordinal, IopCpuState &cpu);
         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request, IopGuestExecutor &executor);
+        [[nodiscard]] bool handleSifCommand(uint32_t commandId, const void *packet, size_t packetSize, IopGuestExecutor &executor);
         void onSifTransfer(const SifTransfer &transfer);
         void removeServersInRange(uint32_t base, uint32_t size);
 
@@ -68,10 +69,21 @@ namespace ps2x::iop::detail
             uint32_t queue = 0;
         };
 
+        struct CmdHandler
+        {
+            uint32_t function = 0;
+            uint32_t argument = 0;
+            uint32_t gp = 0;
+        };
+
         IopHost &m_host;
         IopMemory &m_memory;
         IopKernel &m_kernel;
         std::unordered_map<uint32_t, RpcServer> m_servers;
+        std::unordered_map<uint32_t, CmdHandler> m_cmdHandlers; // by cid (bit 31 = system command)
+        uint32_t m_cmdBuffer = 0u;
+        uint32_t m_sysCmdBuffer = 0u;
+        uint32_t m_cmdPacket = 0u; // IOP RAM the incoming packet is received into, as sifcmd's own buffer
         uint32_t m_nextDmaId = 1u;
         bool m_sifInitialized = false;
     };

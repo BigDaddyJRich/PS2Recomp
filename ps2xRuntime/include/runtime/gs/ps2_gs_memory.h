@@ -585,4 +585,14 @@ namespace GSMem
 	u32 ReadP4HH(u8* data, u32 bp, u32 bw, u32 x, u32 y);
 
 	u32 ReadNull(u8* data, u32 bp, u32 bw, u32 x, u32 y);
+
+	// The page lookup tables those reads and writes use (ps2_gs_memory.cpp), for callers that inline a read: the
+	// rasteriser's per-pixel texture reads call PixelStorageTraits<...>::Read with the same table directly.
+	extern PixelStorageTraits<C32>::PageLookupTableT PageTableC32;
+	extern PixelStorageTraits<C16>::PageLookupTableT PageTableC16;
+	extern PixelStorageTraits<C16S>::PageLookupTableT PageTableC16S;
+	extern PixelStorageTraits<P8>::PageLookupTableT PageTableP8;
+	extern PixelStorageTraits<P4>::PageLookupTableT PageTableP4;
+	extern PixelStorageTraits<Z32>::PageLookupTableT PageTableZ32;
+	extern PixelStorageTraits<Z16>::PageLookupTableT PageTableZ16;
 }

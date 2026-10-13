@@ -28,6 +28,18 @@ public:
                    : ps2x::iop::RpcResult{};
     }
 
+    // EE -> IOP SIF command: runs the handler the IOP registered for commandId.
+    [[nodiscard]] static bool sendSifCommand(
+        PS2Runtime *runtime,
+        uint8_t *rdram,
+        R5900Context *context,
+        uint32_t commandId,
+        const void *packet,
+        size_t packetSize)
+    {
+        return runtime && runtime->sendIopSifCommand(rdram, context, commandId, packet, packetSize);
+    }
+
     [[nodiscard]] static bool canBindRpc(const PS2Runtime *runtime, uint32_t sid)
     {
         return !runtime || runtime->canBindIopRpc(sid);

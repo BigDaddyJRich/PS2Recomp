@@ -383,18 +383,48 @@ add_library(ps2_runtime STATIC
     src/lib/gs/ps2_gs_memory.cpp
     src/lib/gs/gs_frontend.cpp
     src/lib/gs/gs_cpu_backend.cpp
+    src/lib/gs/gs_threaded_backend.cpp
+    src/lib/gs/gs_gpu.cpp
+    src/lib/gs/gs_gpu_backend.cpp
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
+    src/lib/ps2_host_input.cpp
+    src/lib/ps2_pad_rumble.cpp
     src/lib/ps2_rom_device.cpp
     src/lib/ps2_vfs.cpp
     src/lib/ps2_runtime.cpp
+    src/lib/ps2_host_settings.cpp
+    src/lib/ps2_host_update.cpp
+    src/lib/ps2_host_window.cpp
+    src/lib/ps2_chain.cpp
     src/lib/ps2_vif1_interpreter.cpp
     src/lib/vu/ps2_vu1_core.cpp
     src/lib/vu/ps2_vu1_upper.cpp
     src/lib/vu/ps2_vu1_lower.cpp
     src/lib/games_database.cpp
 )
+
+# The GS on the graphics card (paraLLEl-GS, Vulkan compute; optional). Its standalone build needs only Granite's volk
+# and Vulkan headers; the shaders come precompiled. Without PS2X_PARALLEL_GS_DIR the CPU renderer is the only one.
+set(PS2X_PARALLEL_GS_DIR "" CACHE PATH "paraLLEl-GS source tree (optional Vulkan GS renderer)")
+if(PS2X_PARALLEL_GS_DIR)
+    file(TO_CMAKE_PATH "${PS2X_PARALLEL_GS_DIR}" PS2X_PARALLEL_GS_DIR_CM)
+endif()
+if(PS2X_PARALLEL_GS_DIR AND EXISTS "${PS2X_PARALLEL_GS_DIR_CM}/gs/gs_interface.hpp" AND WIN32 AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
+    # paraLLEl-GS picks the static C runtime when none is set; the runtime (and the ffmpeg DLLs) use the DLL one
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+    set(PARALLEL_GS_STANDALONE ON CACHE BOOL "" FORCE)
+    add_subdirectory("${PS2X_PARALLEL_GS_DIR_CM}" "${CMAKE_BINARY_DIR}/parallel-gs" EXCLUDE_FROM_ALL)
+    target_sources(ps2_runtime PRIVATE src/lib/gs/gs_gpu_parallel.cpp src/lib/gs/gs_vulkan_present.cpp)
+    set_source_files_properties(src/lib/gs/gs_gpu_parallel.cpp src/lib/gs/gs_vulkan_present.cpp PROPERTIES
+        COMPILE_DEFINITIONS "NOMINMAX;WIN32_LEAN_AND_MEAN;_SILENCE_CXX20_IS_POD_DEPRECATION_WARNING")
+    target_link_libraries(ps2_runtime PRIVATE parallel-gs)
+    target_compile_definitions(ps2_runtime PRIVATE PS2X_HAS_PARALLEL_GS=1)
+    message(STATUS "paraLLEl-GS: ${PS2X_PARALLEL_GS_DIR_CM}")
+else()
+    target_sources(ps2_runtime PRIVATE src/lib/gs/gs_gpu_none.cpp)
+endif()
 
 if(PS2X_ENABLE_RUNTIME_LOGS)
     target_compile_definitions(ps2_runtime PUBLIC
@@ -429,6 +459,12 @@ target_compile_definitions(ps2_runtime PRIVATE
     PS2X_HAS_FFMPEG=$<BOOL:${PS2X_ENABLE_FFMPEG}>
 )
 
+if(MSVC)
+    # RelWithDebInfo: debug information for the runtime (named functions and source lines in the code-address
+    # profiler) and full inlining (its default /Ob1 keeps the rasteriser's and the VU's small helpers as calls)
+    target_compile_options(ps2_runtime PRIVATE "$<$<CONFIG:RelWithDebInfo>:/Z7;/Ob2>")
+endif()
+
 file(GLOB_RECURSE KERNEL_SRC_FILES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel/*.cpp"
 )
@@ -460,6 +496,17 @@ else()
     add_executable(ps2EntryRunner
         ${RUNNER_SRC_FILES}
     )
+endif()
+
+# The compiled VU1 code (a game's VU1 microprograms as C++, e.g. def-jam-vendetta-recomp's tools/vu1_recomp.py): built on its
+# own with debug information (the code-address profiler names its functions and source lines) and, in RelWithDebInfo,
+# full inlining like the runtime.
+set(PS2X_VU1_COMPILED_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/vu1_compiled.cpp")
+if(MSVC AND EXISTS "${PS2X_VU1_COMPILED_CPP}")
+    set_source_files_properties("${PS2X_VU1_COMPILED_CPP}" PROPERTIES
+        SKIP_UNITY_BUILD_INCLUSION ON
+        SKIP_PRECOMPILE_HEADERS ON
+        COMPILE_OPTIONS "$<$<CONFIG:RelWithDebInfo>:/Z7;/Ob2>")
 endif()
 
 if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
@@ -507,6 +554,19 @@ target_include_directories(ps2_runtime PUBLIC
 )
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+if(WIN32)
+    target_link_libraries(ps2_runtime PRIVATE xinput) # the pads' motors on the PC's controllers (ps2_pad_rumble)
+    target_link_libraries(ps2_runtime PRIVATE winhttp) # the update check at start (ps2_host_update)
+endif()
+
+# The window's exact fullscreen mode (resolution and refresh rate) through GLFW, which raylib builds in on desktops
+if(NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID AND DEFINED raylib_SOURCE_DIR
+   AND EXISTS "${raylib_SOURCE_DIR}/src/external/glfw/include/GLFW/glfw3.h")
+    set_property(SOURCE src/lib/ps2_runtime.cpp src/lib/gs/gs_vulkan_present.cpp src/lib/ps2_host_input.cpp
+        src/lib/ps2_host_window.cpp APPEND PROPERTY INCLUDE_DIRECTORIES "${raylib_SOURCE_DIR}/src/external/glfw/include")
+    set_property(SOURCE src/lib/ps2_runtime.cpp src/lib/ps2_host_input.cpp src/lib/ps2_host_window.cpp APPEND PROPERTY
+        COMPILE_DEFINITIONS PS2X_HAS_GLFW=1)
+endif()
 target_link_libraries(ps2EntryRunner
     PRIVATE
     ps2_runtime
@@ -518,6 +578,18 @@ if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     )
     target_link_libraries(ps2EntryRunner PRIVATE rlImGui imgui)
     target_compile_definitions(ps2EntryRunner PRIVATE PS2X_ENABLE_DEBUG_UI=1)
+    # on the Vulkan window (VENDETTA_PRESENT=vulkan): Dear ImGui's GLFW back end for the panel's input, and the
+    # presenter (in the runtime) draws its frame
+    if(DEFINED raylib_SOURCE_DIR AND EXISTS "${raylib_SOURCE_DIR}/src/external/glfw/include/GLFW/glfw3.h")
+        target_sources(ps2EntryRunner PRIVATE "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_glfw.cpp")
+        set_property(SOURCE src/lib/ps2_debug_panel.cpp "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_glfw.cpp" APPEND PROPERTY
+            INCLUDE_DIRECTORIES "${raylib_SOURCE_DIR}/src/external/glfw/include" "${PS2X_IMGUI_SOURCE_DIR}/backends")
+        set_property(SOURCE src/lib/ps2_debug_panel.cpp APPEND PROPERTY COMPILE_DEFINITIONS PS2X_HAS_GLFW=1)
+    endif()
+    if(TARGET parallel-gs)
+        target_link_libraries(ps2_runtime PRIVATE imgui)
+        set_property(SOURCE src/lib/gs/gs_vulkan_present.cpp APPEND PROPERTY COMPILE_DEFINITIONS PS2X_PRESENT_UI=1)
+    endif()
 endif()
 
 ps2x_stage_ffmpeg_runtime_dlls(ps2EntryRunner)

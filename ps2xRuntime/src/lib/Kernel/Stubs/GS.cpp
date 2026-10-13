@@ -596,11 +596,12 @@ namespace ps2_stubs
         uint32_t srcAddr = getRegU32(ctx, 5);
 
         GsImageMem img{};
-        if (!runtime || !runtime->syncCoreSubsystems() || !readGsImage(rdram, imgAddr, img))
+        if (!runtime || !runtime->syncCoreSubsystems() || !readGsLoadImage(rdram, imgAddr, img))
         {
             setReturnS32(ctx, -1);
             return;
         }
+        { static int n = 0; if (n++ < 40) std::cerr << "[gsimg] ExecLoadImage img=0x" << std::hex << imgAddr << " src=0x" << srcAddr << " ra=0x" << getRegU32(ctx, 31) << " dbp=0x" << img.vram_addr << std::dec << " dbw=" << (int)img.vram_width << " psm=0x" << std::hex << (int)img.psm << std::dec << " x=" << img.x << " y=" << img.y << " w=" << img.width << " h=" << img.height << std::endl; }
 
         const uint32_t rowBytes = bytesForPixels(img.psm, static_cast<uint32_t>(img.width));
         if (rowBytes == 0)
@@ -611,58 +612,69 @@ namespace ps2_stubs
 
         uint32_t fbw = img.vram_width ? img.vram_width : std::max<uint32_t>(1, (img.width + 63) / 64);
         const uint32_t totalImageBytes = rowBytes * static_cast<uint32_t>(img.height);
-        const uint32_t headerQwc = 6u;
-        const uint32_t imageQwc = (totalImageBytes + 15u) / 16u;
-        const uint32_t totalQwc = headerQwc + imageQwc;
-
-        uint32_t pktAddr = runtime->guestMalloc(totalQwc * 16u, 16u);
-        if (pktAddr == 0)
-        {
-            setReturnS32(ctx, -1);
-            return;
-        }
-
-        uint8_t *pkt = getMemPtr(rdram, pktAddr);
         const uint8_t *src = getConstMemPtr(rdram, srcAddr);
-        if (!pkt || !src)
+        if (!src)
         {
-            runtime->guestFree(pktAddr);
             setReturnS32(ctx, -1);
             return;
         }
 
-        uint32_t dbp = (static_cast<uint32_t>(img.vram_addr) * 2048u) / 256u;
-        uint32_t dsax = static_cast<uint32_t>(img.x);
-        uint32_t dsay = static_cast<uint32_t>(img.y);
+        const uint32_t dbp = static_cast<uint32_t>(img.vram_addr); // already BITBLTBUF block units (64 words)
+        const uint32_t dsax = static_cast<uint32_t>(img.x);
+        const uint32_t headerQwc = 6u;
 
-        // Full messy
-        uint64_t *q = reinterpret_cast<uint64_t *>(pkt);
-        q[0] = makeGiftagAplusD(4u);
-        q[1] = 0xEULL;
-        q[2] = (static_cast<uint64_t>(img.psm & 0x3Fu) << 24) | (static_cast<uint64_t>(1u) << 16) |
-               (static_cast<uint64_t>(dbp & 0x3FFFu) << 32) | (static_cast<uint64_t>(fbw & 0x3Fu) << 48) |
-               (static_cast<uint64_t>(img.psm & 0x3Fu) << 56);
-        q[3] = 0x50ULL;
-        q[4] = (static_cast<uint64_t>(dsay & 0x7FFu) << 48) | (static_cast<uint64_t>(dsax & 0x7FFu) << 32);
-        q[5] = 0x51ULL;
-        q[6] = (static_cast<uint64_t>(img.height) << 32) | static_cast<uint64_t>(img.width);
-        q[7] = 0x52ULL;
-        q[8] = 0ULL;
-        q[9] = 0x53ULL;
-        q[10] = (static_cast<uint64_t>(2) << 58) | (static_cast<uint64_t>(imageQwc) & 0x7FFF) |
-                (1ULL << 15);
-        q[11] = 0ULL;
-
-        std::memcpy(pkt + headerQwc * 16u, src, totalImageBytes);
+        // The packet lives in the kernel arena (28 KB); a bigger one spilled into the guest heap and never reached
+        // the GS (HCTP's 64 KB caution-screen font at 0x2240). Send the image in bands of rows of at most 16 KB,
+        // each a whole number of qwords so no padding pixels land in GS memory.
+        uint32_t bandRows = std::max<uint32_t>(1u, 16384u / rowBytes);
+        while (bandRows > 1u && ((rowBytes * bandRows) & 15u) != 0u)
+            --bandRows;
+        if (bandRows >= img.height)
+            bandRows = img.height;
 
         constexpr uint32_t GIF_CHANNEL = 0x1000A000;
         constexpr uint32_t CHCR_STR_MODE0 = 0x101u;
         auto &mem = runtime->memory();
-        mem.writeIORegister(GIF_CHANNEL + 0x10u, pktAddr);
-        mem.writeIORegister(GIF_CHANNEL + 0x20u, totalQwc & 0xFFFFu);
-        mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
-        mem.processPendingTransfers();
-        runtime->guestFree(pktAddr);
+        for (uint32_t row = 0; row < img.height; row += bandRows)
+        {
+            const uint32_t rows = std::min<uint32_t>(bandRows, img.height - row);
+            const uint32_t bandBytes = rowBytes * rows;
+            const uint32_t imageQwc = (bandBytes + 15u) / 16u;
+            const uint32_t totalQwc = headerQwc + imageQwc;
+            const uint32_t pktAddr = runtime->kernelMalloc(totalQwc * 16u, 16u);
+            uint8_t *pkt = pktAddr ? getMemPtr(rdram, pktAddr) : nullptr;
+            if (!pkt)
+            {
+                if (pktAddr)
+                    runtime->guestFree(pktAddr);
+                setReturnS32(ctx, -1);
+                return;
+            }
+            const uint32_t dsay = static_cast<uint32_t>(img.y) + row;
+            uint64_t *q = reinterpret_cast<uint64_t *>(pkt);
+            q[0] = makeGiftagAplusD(4u);
+            q[1] = 0xEULL;
+            q[2] = (static_cast<uint64_t>(img.psm & 0x3Fu) << 24) | (static_cast<uint64_t>(1u) << 16) |
+                   (static_cast<uint64_t>(dbp & 0x3FFFu) << 32) | (static_cast<uint64_t>(fbw & 0x3Fu) << 48) |
+                   (static_cast<uint64_t>(img.psm & 0x3Fu) << 56);
+            q[3] = 0x50ULL;
+            q[4] = (static_cast<uint64_t>(dsay & 0x7FFu) << 48) | (static_cast<uint64_t>(dsax & 0x7FFu) << 32);
+            q[5] = 0x51ULL;
+            q[6] = (static_cast<uint64_t>(rows) << 32) | static_cast<uint64_t>(img.width);
+            q[7] = 0x52ULL;
+            q[8] = 0ULL;
+            q[9] = 0x53ULL;
+            q[10] = (static_cast<uint64_t>(2) << 58) | (static_cast<uint64_t>(imageQwc) & 0x7FFF) | (1ULL << 15);
+            q[11] = 0ULL;
+            std::memset(pkt + headerQwc * 16u, 0, imageQwc * 16u);
+            std::memcpy(pkt + headerQwc * 16u, src + static_cast<size_t>(row) * rowBytes, bandBytes);
+
+            mem.writeIORegister(GIF_CHANNEL + 0x10u, pktAddr);
+            mem.writeIORegister(GIF_CHANNEL + 0x20u, totalQwc & 0xFFFFu);
+            mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
+            mem.processPendingTransfers();
+            runtime->guestFree(pktAddr);
+        }
 
         setReturnS32(ctx, 0);
     }
@@ -696,7 +708,7 @@ namespace ps2_stubs
             return;
         }
 
-        uint32_t sbp = (static_cast<uint32_t>(img.vram_addr) * 2048u) / 256u;
+        uint32_t sbp = static_cast<uint32_t>(img.vram_addr); // block units, as sceGsSetDefStoreImage got them
         uint64_t bitbltbuf = (static_cast<uint64_t>(sbp & 0x3FFFu) << 0) |
                              (static_cast<uint64_t>(fbw & 0x3Fu) << 16) |
                              (static_cast<uint64_t>(img.psm & 0x3Fu) << 24) |
@@ -709,7 +721,7 @@ namespace ps2_stubs
                           (static_cast<uint64_t>(0u) << 48);
         uint64_t trxreg = static_cast<uint64_t>(img.height) << 32 | static_cast<uint64_t>(img.width);
 
-        uint32_t pktAddr = runtime->guestMalloc(80u, 16u);
+        uint32_t pktAddr = runtime->kernelMalloc(80u, 16u);
         if (pktAddr == 0)
         {
             setReturnS32(ctx, -1);
@@ -802,42 +814,50 @@ namespace ps2_stubs
             g_gparam.omode = static_cast<uint8_t>(omode & 0xFF);
             g_gparam.ffmode = static_cast<uint8_t>(ffmode & 0x1);
             writeGsGParamToScratch(runtime);
-            uint64_t pmode = makePmode(1, 0, 0, 0, 0, 0x80);
-            uint64_t smode2 = (interlace & 0x1) | ((ffmode & 0x1) << 1);
+            // The display mode itself goes to SMODE2 as the real library does it (the SetGsCrt syscall). It used
+            // to ride in the GIF packet below as A+D registers 0x41 / 0x42 — those are SCISSOR_2 / ALPHA_1, so the
+            // mode never changed (Def Jam Vendetta's movies, FIELD mode, were shown with the menus' FRAME-mode
+            // half-height read) and two drawing registers were clobbered. PMODE is left to the game's display env.
+            const uint64_t smode2 = (interlace & 0x1) | ((ffmode & 0x1) << 1);
+            if (runtime)
+            {
+                auto &gsRegs = runtime->memory().gs();
+                gsRegs.smode2 = smode2;
+                if (omode == 2u) // SMODE1 as SetGsCrt programs it: NTSC / PAL
+                    gsRegs.smode1 = 0x740834504ull;
+                else if (omode == 3u)
+                    gsRegs.smode1 = 0x740836504ull;
+            }
             uint64_t dispfb = makeDispFb(0, 10, 0, 0, 0);
             uint64_t display = makeDisplay(0, 0, 0, 0, 639, 447);
             uint64_t bgcolor = 0ULL;
 
             if (runtime)
             {
-                uint32_t pktAddr = runtime->guestMalloc(128u, 16u);
+                uint32_t pktAddr = runtime->kernelMalloc(128u, 16u);
                 if (pktAddr != 0u)
                 {
                     uint8_t *pkt = getMemPtr(rdram, pktAddr);
                     if (pkt)
                     {
                         uint64_t *q = reinterpret_cast<uint64_t *>(pkt);
-                        q[0] = makeGiftagAplusD(7u);
+                        q[0] = makeGiftagAplusD(5u);
                         q[1] = 0xEULL;
-                        q[2] = pmode;
-                        q[3] = 0x41ULL;
-                        q[4] = smode2;
-                        q[5] = 0x42ULL;
+                        q[2] = dispfb;
+                        q[3] = 0x59ULL;
+                        q[4] = display;
+                        q[5] = 0x5aULL;
                         q[6] = dispfb;
-                        q[7] = 0x59ULL;
+                        q[7] = 0x5bULL;
                         q[8] = display;
-                        q[9] = 0x5aULL;
-                        q[10] = dispfb;
-                        q[11] = 0x5bULL;
-                        q[12] = display;
-                        q[13] = 0x5cULL;
-                        q[14] = bgcolor;
-                        q[15] = 0x5fULL;
+                        q[9] = 0x5cULL;
+                        q[10] = bgcolor;
+                        q[11] = 0x5fULL;
                         constexpr uint32_t GIF_CHANNEL = 0x1000A000;
                         constexpr uint32_t CHCR_STR_MODE0 = 0x101u;
                         auto &mem = runtime->memory();
                         mem.writeIORegister(GIF_CHANNEL + 0x10u, pktAddr);
-                        mem.writeIORegister(GIF_CHANNEL + 0x20u, 8u);
+                        mem.writeIORegister(GIF_CHANNEL + 0x20u, 6u);
                         mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
                         mem.processPendingTransfers();
                         runtime->guestFree(pktAddr);
@@ -866,6 +886,17 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 
+    // DISPLAY as libgraph writes it (PCSX2 dumps of NTSC games: 0x1BF9FF0183227C): MAGH spreads the buffer over the
+    // 2560-VCK line (DW = 2559 for 640 px) and, in FIELD mode (INT=1, FFMD=1), DH counts frame lines = 2 x the
+    // field buffer's height. MAGH=0/DW=639 squeezed HCTP's picture into a quarter of the paraLLEl-GS scanout.
+    static uint64_t makeLibgraphDisplay(uint32_t w, uint32_t h)
+    {
+        const uint32_t magh = std::max<uint32_t>(1u, 2560u / std::max<uint32_t>(1u, w)) - 1u;
+        const bool fieldMode = (g_gparam.interlace & 1u) != 0u && (g_gparam.ffmode & 1u) != 0u;
+        const uint32_t dh = std::min<uint32_t>(fieldMode ? h * 2u : h, 2048u) - 1u;
+        return makeDisplay(636u, 50u, magh, 0u, w * (magh + 1u) - 1u, dh);
+    }
+
     void sceGsSetDefDBuffDc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t envAddr = getRegU32(ctx, 4);
@@ -891,7 +922,7 @@ namespace ps2_stubs
         const uint64_t smode2 =
             (static_cast<uint64_t>(g_gparam.interlace & 0x1u) << 0) |
             (static_cast<uint64_t>(g_gparam.ffmode & 0x1u) << 1);
-        const uint64_t display = makeDisplay(636u, 32u, 0u, 0u, w - 1u, h - 1u);
+        const uint64_t display = makeLibgraphDisplay(w, h);
 
         const int32_t drawWidth = static_cast<int32_t>(w);
         const int32_t drawHeight = static_cast<int32_t>(h);
@@ -903,7 +934,10 @@ namespace ps2_stubs
             zbufAddr = getRegU32(&temp, 2);
         }
 
-        const uint32_t fbp1 = zbufAddr;
+        // libgraph: buffer 1 right after buffer 0 (pages of one w x h buffer), the Z buffer after both. fbp1 = zbufAddr
+        // put HCTP's second field buffer ON its Z buffer -> Z writes garbled every other field (paraLLEl-GS).
+        const uint32_t pageH = (psm == 0x2u || psm == 0xAu || psm == 0x30u || psm == 0x32u || psm == 0x3Au) ? 64u : 32u;
+        const uint32_t fbp1 = fbw * ((h + pageH - 1u) / pageH);
         const uint64_t dispfb0 = makeDispFb(fbp1, fbw, psm, 0u, 0u);
         const uint64_t dispfb1 = makeDispFb(0u, fbw, psm, 0u, 0u);
 
@@ -963,7 +997,7 @@ namespace ps2_stubs
             (static_cast<uint64_t>(g_gparam.interlace & 0x1u) << 0) |
             (static_cast<uint64_t>(g_gparam.ffmode & 0x1u) << 1);
         const uint64_t dispfb = makeDispFb(0u, fbw, psm, 0u, 0u);
-        const uint64_t display = makeDisplay(636u, 32u, 0u, 0u, w - 1u, h - 1u);
+        const uint64_t display = makeLibgraphDisplay(w, h);
 
         const int32_t drawWidth = static_cast<int32_t>(w);
         const int32_t drawHeight = static_cast<int32_t>(h);
@@ -1119,13 +1153,28 @@ namespace ps2_stubs
         img.vram_width = static_cast<uint8_t>(args.vramWidth);
         img.psm = static_cast<uint8_t>(args.psm);
 
-        writeGsImage(rdram, imgAddr, img);
+        // Real libgraph sceGsLoadImage layout: HCTP memcpy's these qwords straight into its own DMA packets.
+        writeGsLoadImage(rdram, imgAddr, img, bytesForPixels(img.psm, img.width) * img.height);
+        { static int n = 0; if (n++ < 40) std::cerr << "[gsimg] SetDefLoadImage at=0x" << std::hex << imgAddr << " ra=0x" << getRegU32(ctx, 31) << " dbp=0x" << img.vram_addr << std::dec << " dbw=" << (int)img.vram_width << " psm=0x" << std::hex << (int)img.psm << std::dec << " x=" << img.x << " y=" << img.y << " w=" << img.width << " h=" << img.height << std::endl; }
         setReturnS32(ctx, 0);
     }
 
     void sceGsSetDefStoreImage(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        sceGsSetDefLoadImage(rdram, ctx, runtime);
+        uint32_t imgAddr = getRegU32(ctx, 4);
+        const GsSetDefImageArgs args = decodeGsSetDefImageArgs(rdram, ctx);
+
+        GsImageMem img{};
+        img.x = static_cast<uint16_t>(args.x);
+        img.y = static_cast<uint16_t>(args.y);
+        img.width = static_cast<uint16_t>(args.width);
+        img.height = static_cast<uint16_t>(args.height);
+        img.vram_addr = static_cast<uint16_t>(args.vramAddr);
+        img.vram_width = static_cast<uint8_t>(args.vramWidth);
+        img.psm = static_cast<uint8_t>(args.psm);
+
+        writeGsImage(rdram, imgAddr, img); // runtime-private layout, read back only by sceGsExecStoreImage
+        setReturnS32(ctx, 0);
     }
 
     void sceGsSwapDBuffDc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -1250,7 +1299,8 @@ namespace ps2_stubs
                 }
             }
 
-            while ((mem.readIORegister(0x10003020) & 0xC00) != 0)
+            // GIF_STAT bits 10 / 11 only: as stored (readIORegister also reads the chain worker's path-3 mask)
+            while ((mem.peekIORegister(0x10003020) & 0xC00) != 0)
             {
                 if (++count > kTimeout)
                 {
@@ -1271,7 +1321,7 @@ namespace ps2_stubs
                 result |= 2;
             if ((mem.readIORegister(0x10003C00) & 0x1F000003) != 0)
                 result |= 4;
-            if ((mem.readIORegister(0x10003020) & 0xC00) != 0)
+            if ((mem.peekIORegister(0x10003020) & 0xC00) != 0)
                 result |= 0x10;
 
             setReturnS32(ctx, result);

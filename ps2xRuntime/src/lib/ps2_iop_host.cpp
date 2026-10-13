@@ -6,6 +6,7 @@
 #include "runtime/ps2_memory.h"
 #include "Kernel/Stubs/MemoryCard.h"
 #include "Kernel/Syscalls/Common.h"
+#include "runtime/ee_scheduler.h"
 
 #include <algorithm>
 #include <cstring>
@@ -236,7 +237,7 @@ uint32_t PS2IopHostAdapter::allocateIopHandle(ps2x::iop::IopHandleKind kind)
 
 uint32_t PS2IopHostAdapter::allocateGuest(uint32_t size, uint32_t alignment)
 {
-    return m_runtime.guestMalloc(size, alignment);
+    return m_runtime.kernelMalloc(size, alignment);
 }
 
 void PS2IopHostAdapter::freeGuest(uint32_t address)
@@ -515,6 +516,59 @@ bool PS2IopHostAdapter::sendSifCommand(uint32_t commandId,
                                          commandId,
                                          packet,
                                          packetSize);
+}
+
+bool PS2IopHostAdapter::findEeRpcServer(uint32_t sid, uint32_t &serverData, uint32_t &buffer,
+                                        uint32_t &callbackBuffer) const
+{
+    serverData = buffer = callbackBuffer = 0u;
+    uint8_t *const rdram = m_activeRdram ? m_activeRdram : m_runtime.memory().getRDRAM();
+    std::lock_guard<std::mutex> lock(g_rpc_mutex);
+    const auto it = g_rpc_servers.find(sid);
+    if (it == g_rpc_servers.end() || it->second.sd_ptr == 0u)
+        return false;
+    const auto *sd = reinterpret_cast<const t_SifRpcServerData *>(getConstMemPtr(rdram, it->second.sd_ptr));
+    // only servers the EE registered itself (IOP-routed SIDs get a placeholder descriptor without a function)
+    if (!sd || sd->func == 0u || !m_runtime.hasFunction(sd->func))
+        return false;
+    serverData = it->second.sd_ptr;
+    buffer = sd->buf;
+    callbackBuffer = sd->cbuf;
+    return true;
+}
+
+bool PS2IopHostAdapter::callEeRpcServer(uint32_t serverData, uint32_t function, uint32_t sendSize,
+                                        std::function<void(uint32_t)> done)
+{
+    uint8_t *const rdram = m_activeRdram ? m_activeRdram : m_runtime.memory().getRDRAM();
+    const auto *sd = reinterpret_cast<const t_SifRpcServerData *>(getConstMemPtr(rdram, serverData));
+    if (!sd || sd->func == 0u || !m_runtime.hasFunction(sd->func))
+        return false;
+    const uint32_t buffer = sd->buf;
+    GuestInvocation invocation{};
+    invocation.kind = GuestInvocationKind::SifCommand;
+    invocation.tag = 0x8000000Au; // SIF_CMD_RPC_CALL
+    invocation.context = m_runtime.cpu();
+    invocation.context.pc = sd->func;
+    SET_GPR_U32(&invocation.context, 4, function);
+    SET_GPR_U32(&invocation.context, 5, buffer);
+    SET_GPR_U32(&invocation.context, 6, sendSize);
+    SET_GPR_U32(&invocation.context, 7, 0u);
+    SET_GPR_U32(&invocation.context, 29, 0u);
+    SET_GPR_U32(&invocation.context, 31, 0u);
+    invocation.onComplete = [done = std::move(done), buffer](const R5900Context &completed, R5900Context &)
+    {
+        const uint32_t result = static_cast<uint32_t>(_mm_cvtsi128_si32(completed.r[2]));
+        if (done)
+            done(result != 0u ? result : buffer);
+    };
+    m_runtime.eeScheduler().queueInvocation(std::move(invocation));
+    return true;
+}
+
+void PS2IopHostAdapter::submitAudio(const int16_t *frames, size_t frameCount)
+{
+    m_runtime.audioBackend().submitPcmStream(frames, frameCount);
 }
 
 void PS2IopHostAdapter::log(ps2x::iop::LogLevel level, std::string_view message)

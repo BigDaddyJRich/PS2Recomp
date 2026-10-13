@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <unordered_map>
 #include "Common.h"
 #include "RPC.h"
 #include "../../ps2_iop_transport.h"
@@ -327,6 +329,13 @@ namespace ps2_syscalls
             client->server = 0;
             client->buf = 0;
             client->cbuf = 0;
+            static std::mutex unboundMutex;
+            static std::unordered_map<uint32_t, uint64_t> unbound; // sid -> failed binds (logged at 1, 1000, 100000)
+            std::lock_guard<std::mutex> lock(unboundMutex);
+            const uint64_t n = ++unbound[rpcId];
+            if (n == 1u || n == 1000u || n == 100000u)
+                std::fprintf(stderr, "[bindrpc] sid 0x%x has no server yet (try %llu, ra 0x%x)%c", rpcId,
+                             static_cast<unsigned long long>(n), getRegU32(ctx, 31), 10);
         }
 
         SifRpcDebugEvent event = makeRpcDebugEvent("BindRpc", ctx, runtime);
@@ -968,36 +977,122 @@ namespace ps2_syscalls
         SifCallRpc(rdram, ctx, runtime);
     }
 
+    namespace
+    {
+        // EE libsif: _sceSifSendCmd(cid, mode, packet, packetSize, src, dest, size). The EE ABI passes all seven
+        // in registers (a0-a3, t0-t2). Like the real routine, the extra data (src -> IOP dest) goes first, then
+        // the packet with its header filled in: +0 = packetSize | size << 8, +4 = dest, +8 = cid. The packet is
+        // delivered to the handler the IOP registered for cid (sceSifAddCmdHandler on the IOP side).
+        void sendSifCmdToIop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
+                             uint32_t cid, uint32_t mode, uint32_t packetAddr, uint32_t packetSize,
+                             uint32_t srcExtra, uint32_t destExtra, int32_t sizeExtra)
+        {
+            constexpr uint32_t kMinPacketSize = 16u;
+            constexpr uint32_t kMaxPacketSize = 112u;
+            if (!runtime || packetAddr == 0u || packetSize < kMinPacketSize || packetSize > kMaxPacketSize)
+            {
+                setReturnS32(ctx, 0);
+                return;
+            }
+
+            uint32_t extraSize = 0u;
+            if (sizeExtra > 0 && srcExtra != 0u && destExtra != 0u)
+            {
+                extraSize = static_cast<uint32_t>(sizeExtra);
+                std::vector<uint8_t> extra(extraSize);
+                for (uint32_t i = 0; i < extraSize; ++i)
+                {
+                    const uint8_t *src = getConstMemPtr(rdram, srcExtra + i);
+                    if (!src)
+                    {
+                        setReturnS32(ctx, 0);
+                        return;
+                    }
+                    extra[i] = *src;
+                }
+                if (!runtime->writeIopMemory(destExtra, extra.data(), extra.size()))
+                {
+                    setReturnS32(ctx, 0);
+                    return;
+                }
+            }
+
+            uint8_t packet[kMaxPacketSize]{};
+            for (uint32_t i = 0; i < packetSize; ++i)
+            {
+                const uint8_t *src = getConstMemPtr(rdram, packetAddr + i);
+                if (!src)
+                {
+                    setReturnS32(ctx, 0);
+                    return;
+                }
+                packet[i] = *src;
+            }
+            const uint32_t sizeWord = packetSize | (extraSize << 8u);
+            const uint32_t destWord = extraSize != 0u ? destExtra : 0u;
+            std::memcpy(packet + 0u, &sizeWord, sizeof(sizeWord));
+            std::memcpy(packet + 4u, &destWord, sizeof(destWord));
+            std::memcpy(packet + 8u, &cid, sizeof(cid));
+            // The real routine writes the header back into the caller's packet too.
+            for (uint32_t i = 0; i < 12u; ++i)
+            {
+                if (uint8_t *dst = getMemPtr(rdram, packetAddr + i))
+                    *dst = packet[i];
+            }
+
+            const bool delivered = PS2IopTransport::sendSifCommand(runtime, rdram, ctx, cid, packet, packetSize);
+
+            static const bool trace = std::getenv("VENDETTA_IOPLOG") != nullptr;
+            static int logCount = 0;
+            if (trace || logCount < 8)
+            {
+                uint32_t words[8]{};
+                std::memcpy(words, packet, std::min<uint32_t>(packetSize, sizeof(words)));
+                std::cerr << "[sif-cmd] EE->IOP cid=0x" << std::hex << cid
+                          << " mode=0x" << mode
+                          << " psize=0x" << packetSize
+                          << " extra=0x" << destExtra << "+0x" << extraSize
+                          << " packet " << words[4] << ' ' << words[5] << ' ' << words[6] << ' ' << words[7]
+                          << (delivered ? " -> IOP handler" : " (no IOP handler)")
+                          << std::dec << std::endl;
+                ++logCount;
+            }
+
+            // A command with no IOP handler is still a finished DMA on real hardware; return a DMA id (non-zero).
+            static uint32_t nextDmaId = 1u;
+            uint32_t dmaId = nextDmaId++;
+            if (dmaId == 0u || dmaId > 0x7FFFFFFFu)
+            {
+                nextDmaId = 2u;
+                dmaId = 1u;
+            }
+            setReturnS32(ctx, static_cast<int32_t>(dmaId));
+        }
+    }
+
     void sceSifSendCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        uint32_t cid = getRegU32(ctx, 4);
-        uint32_t packetAddr = getRegU32(ctx, 5);
-        uint32_t packetSize = getRegU32(ctx, 6);
-        uint32_t srcExtra = getRegU32(ctx, 7);
+        // sceSifSendCmd(cid, packet, packetSize, src, dest, size) = _sceSifSendCmd(cid, 0, ...)
+        sendSifCmdToIop(rdram, ctx, runtime,
+                        getRegU32(ctx, 4), 0u, getRegU32(ctx, 5), getRegU32(ctx, 6),
+                        getRegU32(ctx, 7), getRegU32(ctx, 8), static_cast<int32_t>(getRegU32(ctx, 9)));
+    }
 
-        uint32_t sp = getRegU32(ctx, 29);
-        uint32_t destExtra = 0;
-        uint32_t sizeExtra = 0;
-        readStackU32(rdram, sp, 0x10, destExtra);
-        readStackU32(rdram, sp, 0x14, sizeExtra);
+    void isceSifSendCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        // isceSifSendCmd(cid, packet, packetSize, src, dest, size) = _sceSifSendCmd(cid, 1, ...)
+        sendSifCmdToIop(rdram, ctx, runtime,
+                        getRegU32(ctx, 4), 1u, getRegU32(ctx, 5), getRegU32(ctx, 6),
+                        getRegU32(ctx, 7), getRegU32(ctx, 8), static_cast<int32_t>(getRegU32(ctx, 9)));
+    }
 
-        if (sizeExtra > 0 && srcExtra && destExtra)
-        {
-            rpcCopyToRdram(rdram, destExtra, srcExtra, sizeExtra);
-        }
-
-        static int logCount = 0;
-        if (logCount < 5)
-        {
-            RUNTIME_LOG("[sceSifSendCmd] cid=0x" << std::hex << cid
-                                                 << " packet=0x" << packetAddr
-                                                 << " psize=0x" << packetSize
-                                                 << " extra=0x" << destExtra << std::dec << std::endl);
-            ++logCount;
-        }
-
-        // Return non-zero on success.
-        setReturnS32(ctx, 1);
+    void _sceSifSendCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        // Its own entry: without it the leading-underscore alias binds this to sceSifSendCmd, whose arguments
+        // sit one register earlier (no mode).
+        sendSifCmdToIop(rdram, ctx, runtime,
+                        getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7),
+                        getRegU32(ctx, 8), getRegU32(ctx, 9), static_cast<int32_t>(getRegU32(ctx, 10)));
     }
 
     void sceRpcGetPacket(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

@@ -91,6 +91,10 @@ enum class GuestInvocationKind : uint8_t
     ExitHandler,
     HleCall,
     SifCommand,
+    // A library callback run nested in the calling thread's own context (e.g. libmpeg's sceMpegCbNodata from
+    // inside sceMpegGetPicture). Unlike the handler kinds above it does not mask interrupts: an interrupt that comes
+    // due while it runs is taken, as on hardware.
+    ThreadCallback,
 };
 
 struct GuestInvocation
@@ -164,6 +168,9 @@ struct EeAlarm
     uint32_t argument = 0;
     uint32_t gp = 0;
     uint32_t sp = 0;
+    // host-set alarms (e.g. libcdvd's command-end callback after a simulated drive delay): call the handler
+    // with a0 = argument instead of the kernel's (id, ticks, argument)
+    bool argumentInA0 = false;
 };
 
 struct EeIrqHandler
@@ -279,6 +286,8 @@ public:
     void requestStop();
     void postEvent(EeEvent event);
     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
+    void catchUpWithHostClock() noexcept;
+    void catchUpBeforeDeadline() noexcept;
     void accountCycles(uint32_t cycles) noexcept;
     [[nodiscard]] bool isExecutingGuest() const noexcept;
 
@@ -313,7 +322,8 @@ public:
     int pollEventFlag(int id, uint32_t bits, uint32_t mode, uint32_t &observedBits);
     void waitEventFlag(int id, uint32_t bits, uint32_t mode, uint32_t resultAddress);
 
-    int setAlarm(uint16_t ticks, uint32_t handler, uint32_t argument, uint32_t gp, uint32_t sp);
+    int setAlarm(uint16_t ticks, uint32_t handler, uint32_t argument, uint32_t gp, uint32_t sp,
+                 bool argumentInA0 = false);
     int cancelAlarm(int id);
     void queueInvocation(GuestInvocation invocation);
     [[noreturn]] void invokeCurrent(GuestInvocation invocation);
@@ -390,6 +400,7 @@ private:
     static int waitObjectId(const EeWaitState &wait);
     void writeGuestU32(uint32_t address, uint32_t value);
     void waitForEvent();
+    void maybePresent();
     void scheduleEvent(uint64_t deadlineCycle, std::chrono::steady_clock::time_point hostDeadline, EeEvent event);
     void updateNextDeadline();
     [[nodiscard]] bool hasReadyAtOrAbovePriority(int priority) const;
@@ -426,6 +437,12 @@ private:
     bool m_insideInterrupt = false;
     uint32_t m_pendingEeTimerInterrupts = 0;
     uint64_t m_eeCycle = 0;
+    // EE cycles not yet handed to the IOP (accountCycles hands them over in batches, see there)
+    uint64_t m_iopPendingCycles = 0;
+    // EE time follows the host clock while the guest is busy (see catchUpWithHostClock)
+    std::chrono::steady_clock::time_point m_hostClockOrigin{};
+    uint64_t m_hostClockOriginCycle = 0;
+    uint32_t m_hostClockCheckCountdown = 0;
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
     std::thread::id m_executorThread{};
     std::atomic<bool> m_running{false};
@@ -447,6 +464,19 @@ private:
     uint32_t m_gsVSyncCallback = 0;
     uint32_t m_gsVSyncCallbackGp = 0;
     uint32_t m_gsVSyncCallbackSp = 0;
+    // The presentation settle point: after a VBlankStart, the picture is handed to the screen once every handler that
+    // vblank queued (the GS VSync callback, the INTC 2 handlers) has finished, or at the next VBlankStart (forced).
+    // VENDETTA_GS_PRESENT=vblank presents at VBlankStart instead.
+    enum class PresentMode : uint8_t
+    {
+        Settle,
+        VBlank,
+    };
+    PresentMode m_presentMode = PresentMode::Settle;
+    bool m_presentDue = false;
+    uint64_t m_presentTick = 0;
+    uint32_t m_presentDueVblanks = 0;
+    std::vector<uint64_t> m_vsyncHandlerSeqs;
     std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
     std::atomic<uint64_t> m_nextDeadlineCycle{0};
 

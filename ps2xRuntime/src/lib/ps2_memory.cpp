@@ -1,4 +1,8 @@
+#include <cstdio>
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_vu_code_log.h"
+#include "runtime/ps2_chain.h"
+#include "runtime/ps2_host_profile.h"
 #include "runtime/ps2_address.h"
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
@@ -9,6 +13,82 @@
 #include <algorithm>
 #include <string>
 #include <vector>
+namespace ps2_stubs { void mpegIpuToDmaStart(uint8_t *rdram, uint32_t &chcr, uint32_t &madr, uint32_t &qwc, uint32_t &tadr); }
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
+
+namespace
+{
+    // Guest RAM: PS2_RAM_BACKING_SIZE reserved, pages committed on request (zero-filled by the host).
+    uint8_t *reserveGuestRam()
+    {
+#if defined(_WIN32)
+        return static_cast<uint8_t *>(VirtualAlloc(nullptr, PS2_RAM_BACKING_SIZE, MEM_RESERVE, PAGE_NOACCESS));
+#else
+        void *p = mmap(nullptr, PS2_RAM_BACKING_SIZE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        return p == MAP_FAILED ? nullptr : static_cast<uint8_t *>(p);
+#endif
+    }
+
+    bool commitGuestRam(uint8_t *base, uint32_t offset, uint32_t size)
+    {
+#if defined(_WIN32)
+        return VirtualAlloc(base + offset, size, MEM_COMMIT, PAGE_READWRITE) != nullptr;
+#else
+        constexpr uintptr_t kPage = 4096u;
+        const uintptr_t start = reinterpret_cast<uintptr_t>(base + offset) & ~(kPage - 1u);
+        const uintptr_t end = (reinterpret_cast<uintptr_t>(base + offset) + size + kPage - 1u) & ~(kPage - 1u);
+        return mprotect(reinterpret_cast<void *>(start), end - start, PROT_READ | PROT_WRITE) == 0;
+#endif
+    }
+
+    void releaseGuestRam(uint8_t *base)
+    {
+        if (!base)
+            return;
+#if defined(_WIN32)
+        VirtualFree(base, 0, MEM_RELEASE);
+#else
+        munmap(base, PS2_RAM_BACKING_SIZE);
+#endif
+    }
+
+    std::atomic<uint8_t *> g_guestRamBase{nullptr};
+
+#if defined(_WIN32)
+    // A guest access above 32 MB that nothing committed: say which guest address, then let the crash happen as before.
+    LONG CALLBACK reportStrayGuestRamAccess(EXCEPTION_POINTERS *info)
+    {
+        const EXCEPTION_RECORD *rec = info ? info->ExceptionRecord : nullptr;
+        uint8_t *base = g_guestRamBase.load(std::memory_order_acquire);
+        if (!rec || !base || rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || rec->NumberParameters < 2)
+            return EXCEPTION_CONTINUE_SEARCH;
+        const auto *host = reinterpret_cast<const uint8_t *>(rec->ExceptionInformation[1]);
+        if (host < base || host >= base + PS2_RAM_BACKING_SIZE)
+            return EXCEPTION_CONTINUE_SEARCH;
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true))
+        {
+            std::fprintf(stderr,
+                         "[ram] guest %s at 0x%08X: above the PS2's 32 MB and not committed (PS2Memory::commitRam) "
+                         "- something relied on RAM wrapping at 32 MB\n",
+                         rec->ExceptionInformation[0] == 1 ? "write" : "read",
+                         static_cast<unsigned>(host - base));
+            std::fflush(stderr);
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+#endif
+}
 
 namespace
 {
@@ -105,6 +185,10 @@ namespace
     // so the whole read-modify-write is a single atomic step -- this register is
     // also touched by the vsync worker (FIELD bit) and the GIF (SIGNAL/FINISH) on
     // other threads, so a load-then-store here would race with them.
+    // FLUSH (bit 8) and RESET (bit 9) are commands, not state: they read back 0 (sceGsResetGraph writes RESET
+    // and then reads CSR for the GS revision).
+    constexpr uint64_t kCsrSelfClearingMask = 0x300ull;
+
     inline void writeCsrHalf(std::atomic<uint64_t> &csr, uint32_t off, uint32_t value)
     {
         constexpr uint32_t kW1cMask = 0x3u;
@@ -118,6 +202,7 @@ namespace
                 uint32_t mergedLow = (oldLow & kW1cMask) | (value & ~kW1cMask);
                 desired = (expected & 0xFFFFFFFF00000000ull) | static_cast<uint64_t>(mergedLow);
                 desired &= ~static_cast<uint64_t>(value & kW1cMask);
+                desired &= ~kCsrSelfClearingMask;
             }
             else
             {
@@ -125,6 +210,33 @@ namespace
                 desired = (expected & ~mask) | (static_cast<uint64_t>(value) << (off * 8u));
             }
         } while (!csr.compare_exchange_weak(expected, desired));
+    }
+
+    // CSR RESET (bit 9) resets the GS, its privileged registers included (PCSX2 clears them all on a reset too): the
+    // display circuits are off (PMODE 0) until the game sets its display up again, so the screen is black meanwhile.
+    // Kept, they showed the last picture with the new display mode — Def Jam Vendetta's sceGsResetGraph between two
+    // movies left the EA SPORTS BIG logo on screen for a second, stretched to twice its height (FIELD -> FRAME).
+    // CSR keeps its own handling (the FIELD bit, the revision the game reads back); IMR = its reset value (all masked).
+    inline void resetGsPrivilegedRegisters(GSRegisters &gs)
+    {
+        gs.pmode = 0;
+        gs.smode1 = 0;
+        gs.smode2 = 0;
+        gs.srfsh = 0;
+        gs.synch1 = 0;
+        gs.synch2 = 0;
+        gs.syncv = 0;
+        gs.dispfb1 = 0;
+        gs.display1 = 0;
+        gs.dispfb2 = 0;
+        gs.display2 = 0;
+        gs.extbuf = 0;
+        gs.extdata = 0;
+        gs.extwrite = 0;
+        gs.bgcolor = 0;
+        gs.imr = 0x7F00;
+        gs.busdir = 0;
+        gs.siglblid = 0;
     }
 
     // Same as writeCsrHalf but for a full 64-bit CSR write (bits 0..1 are still
@@ -138,6 +250,7 @@ namespace
         {
             desired = (expected & kW1cMask) | (value & ~kW1cMask);
             desired &= ~(value & kW1cMask);
+            desired &= ~kCsrSelfClearingMask;
         } while (!csr.compare_exchange_weak(expected, desired));
     }
 
@@ -248,7 +361,8 @@ PS2Memory::~PS2Memory()
 {
     if (m_rdram)
     {
-        delete[] m_rdram;
+        g_guestRamBase.store(nullptr, std::memory_order_release);
+        releaseGuestRam(m_rdram);
         m_rdram = nullptr;
     }
 
@@ -293,11 +407,13 @@ PS2Memory::~PS2Memory()
     }
 }
 
-bool PS2Memory::initialize(size_t ramSize)
+bool PS2Memory::initialize()
 {
     auto cleanup = [this]()
     {
-        delete[] m_rdram;
+        if (m_rdram)
+            g_guestRamBase.store(nullptr, std::memory_order_release);
+        releaseGuestRam(m_rdram);
         delete[] m_scratchpad;
         delete[] iop_ram;
         delete[] m_gsVRAM;
@@ -336,8 +452,16 @@ bool PS2Memory::initialize(size_t ramSize)
     try
     {
         // Allocate main RAM
-        m_rdram = new uint8_t[ramSize];
-        std::memset(m_rdram, 0, ramSize);
+        // Reserve the whole backing range; commit the PS2's 32 MB (zero-filled).
+        m_rdram = reserveGuestRam();
+        if (!m_rdram || !commitGuestRam(m_rdram, 0u, PS2_RAM_SIZE))
+            throw std::bad_alloc();
+        g_guestRamBase.store(m_rdram, std::memory_order_release);
+#if defined(_WIN32)
+        static std::atomic<bool> s_strayAccessReporter{false};
+        if (!s_strayAccessReporter.exchange(true))
+            AddVectoredExceptionHandler(1, reportStrayGuestRamAccess);
+#endif
 
         // Allocate scratchpad
         m_scratchpad = new uint8_t[PS2_SCRATCHPAD_SIZE];
@@ -402,6 +526,97 @@ bool PS2Memory::initialize(size_t ramSize)
 void PS2Memory::resetEeTimers() noexcept
 {
     m_eeTimers = {};
+    m_eeTimersShadow = {};
+    m_eeTimerPending = 0u;
+    m_eeTimerHorizon = 0u;
+    m_eeTimerLateMask = 0u;
+    static const bool verify = []
+    {
+        const char *value = std::getenv("VENDETTA_EETIMER_VERIFY");
+        return value && *value && *value != '0';
+    }();
+    m_eeTimerVerify = verify;
+}
+
+// One timer advanced by eeCycles EE cycles (the timer's ticks carry their remainder); the interrupt bits it raises.
+uint32_t PS2Memory::advanceEeTimer(EeTimer &timer, size_t index, uint64_t eeCycles) noexcept
+{
+    uint32_t interruptMask = 0u;
+    if ((timer.mode & kEeTimerModeCue) == 0u)
+    {
+        return 0u;
+    }
+
+    const uint64_t clockHz = kEeTimerClockHz[timer.mode & kEeTimerModeClksMask];
+    const uint64_t wholeSeconds = eeCycles / kEeClockHz;
+    const uint64_t remainingCycles = eeCycles % kEeClockHz;
+    const uint64_t scaled = remainingCycles * clockHz + timer.clockRemainder;
+    const uint64_t ticks = wholeSeconds * clockHz + scaled / kEeClockHz;
+    timer.clockRemainder = scaled % kEeClockHz;
+    if (ticks == 0u)
+    {
+        return 0u;
+    }
+
+    const uint32_t oldCount = timer.count & 0xFFFFu;
+    const uint32_t compare = timer.compare & 0xFFFFu;
+    const uint64_t compareDistance = ticksUntilMatch(oldCount, compare);
+    const uint64_t overflowDistance = 0x10000ull - oldCount;
+    const bool zeroReturn = (timer.mode & kEeTimerModeZret) != 0u;
+    const bool compareReached = ticks >= compareDistance;
+    bool overflowReached = false;
+
+    if (zeroReturn)
+    {
+        overflowReached = ticks >= overflowDistance && overflowDistance <= compareDistance;
+        if (compareReached)
+        {
+            const uint64_t remaining = ticks - compareDistance;
+            timer.count = compare == 0u
+                              ? static_cast<uint32_t>(remaining & 0xFFFFu)
+                              : static_cast<uint32_t>(remaining % compare);
+        }
+        else
+        {
+            timer.count = static_cast<uint32_t>((oldCount + ticks) & 0xFFFFu);
+        }
+    }
+    else
+    {
+        overflowReached = ticks >= overflowDistance;
+        timer.count = static_cast<uint32_t>((oldCount + ticks) & 0xFFFFu);
+    }
+
+    if (compareReached && (timer.mode & kEeTimerModeCmpe) != 0u && (timer.mode & kEeTimerModeEquf) == 0u)
+    {
+        timer.mode |= kEeTimerModeEquf;
+        interruptMask |= 1u << index;
+    }
+    if (overflowReached && (timer.mode & kEeTimerModeOvfe) != 0u && (timer.mode & kEeTimerModeOvff) == 0u)
+    {
+        timer.mode |= kEeTimerModeOvff;
+        interruptMask |= 1u << index;
+    }
+    return interruptMask;
+}
+
+uint32_t PS2Memory::advanceEeTimersNow(uint64_t eeCycles) noexcept
+{
+    uint32_t interruptMask = 0u;
+    for (size_t index = 0; index < m_eeTimers.size(); ++index)
+        interruptMask |= advanceEeTimer(m_eeTimers[index], index, eeCycles);
+    return interruptMask;
+}
+
+// Before a timer register is written: the cycles not yet handed to the timers (fewer than the next event needs, so
+// they raise nothing — kept for the next advance if they ever did)
+void PS2Memory::flushEeTimers() noexcept
+{
+    if (m_eeTimerPending != 0u)
+    {
+        m_eeTimerLateMask |= advanceEeTimersNow(m_eeTimerPending);
+        m_eeTimerPending = 0u;
+    }
 }
 
 uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
@@ -411,76 +626,62 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
         return 0u;
     }
 
-    constexpr uint32_t kGifStat = 0x10003020u;
-    constexpr uint32_t kGifFqcMask = 0x1F000000u;
-    auto gifStatIt = m_ioRegisters.find(kGifStat);
-    if (gifStatIt != m_ioRegisters.end())
-        gifStatIt->second &= ~kGifFqcMask;
-
-    uint32_t interruptMask = 0u;
-    for (size_t index = 0; index < m_eeTimers.size(); ++index)
+    // GIF_STAT's FIFO count reads as empty once EE time moves on (it is set while GIF transfers are pending)
+    if (m_gifFqcMaybeSet)
     {
-        EeTimer &timer = m_eeTimers[index];
-        if ((timer.mode & kEeTimerModeCue) == 0u)
-        {
-            continue;
-        }
+        constexpr uint32_t kGifStat = 0x10003020u;
+        constexpr uint32_t kGifFqcMask = 0x1F000000u;
+        auto gifStatIt = m_ioRegisters.find(kGifStat);
+        if (gifStatIt != m_ioRegisters.end())
+            gifStatIt->second &= ~kGifFqcMask;
+        m_gifFqcMaybeSet = false;
+    }
 
-        const uint64_t clockHz = kEeTimerClockHz[timer.mode & kEeTimerModeClksMask];
-        const uint64_t wholeSeconds = eeCycles / kEeClockHz;
-        const uint64_t remainingCycles = eeCycles % kEeClockHz;
-        const uint64_t scaled = remainingCycles * clockHz + timer.clockRemainder;
-        const uint64_t ticks = wholeSeconds * clockHz + scaled / kEeClockHz;
-        timer.clockRemainder = scaled % kEeClockHz;
-        if (ticks == 0u)
-        {
-            continue;
-        }
-
-        const uint32_t oldCount = timer.count & 0xFFFFu;
-        const uint32_t compare = timer.compare & 0xFFFFu;
-        const uint64_t compareDistance = ticksUntilMatch(oldCount, compare);
-        const uint64_t overflowDistance = 0x10000ull - oldCount;
-        const bool zeroReturn = (timer.mode & kEeTimerModeZret) != 0u;
-        const bool compareReached = ticks >= compareDistance;
-        bool overflowReached = false;
-
-        if (zeroReturn)
-        {
-            overflowReached = ticks >= overflowDistance && overflowDistance <= compareDistance;
-            if (compareReached)
+    m_eeTimerPending += eeCycles;
+    uint32_t interruptMask = m_eeTimerLateMask;
+    m_eeTimerLateMask = 0u;
+    const bool advanced = m_eeTimerPending >= m_eeTimerHorizon;
+    if (advanced)
+    {
+        interruptMask |= advanceEeTimersNow(m_eeTimerPending);
+        m_eeTimerPending = 0u;
+        m_eeTimerHorizon = cyclesUntilNextEeTimerEventNow();
+    }
+    if (m_eeTimerVerify)
+    {
+        // the old way: every timer advanced at every checkpoint — the same interrupts at the same checkpoint, and the
+        // same state whenever the timers have advanced
+        uint32_t shadowMask = 0u;
+        for (size_t index = 0; index < m_eeTimersShadow.size(); ++index)
+            shadowMask |= advanceEeTimer(m_eeTimersShadow[index], index, eeCycles);
+        bool same = shadowMask == interruptMask;
+        if (advanced)
+            for (size_t index = 0; index < m_eeTimers.size(); ++index)
             {
-                const uint64_t remaining = ticks - compareDistance;
-                timer.count = compare == 0u
-                                  ? static_cast<uint32_t>(remaining & 0xFFFFu)
-                                  : static_cast<uint32_t>(remaining % compare);
+                const EeTimer &a = m_eeTimers[index], &b = m_eeTimersShadow[index];
+                same = same && a.count == b.count && a.mode == b.mode && a.compare == b.compare && a.clockRemainder == b.clockRemainder;
             }
-            else
-            {
-                timer.count = static_cast<uint32_t>((oldCount + ticks) & 0xFFFFu);
-            }
-        }
-        else
-        {
-            overflowReached = ticks >= overflowDistance;
-            timer.count = static_cast<uint32_t>((oldCount + ticks) & 0xFFFFu);
-        }
-
-        if (compareReached && (timer.mode & kEeTimerModeCmpe) != 0u && (timer.mode & kEeTimerModeEquf) == 0u)
-        {
-            timer.mode |= kEeTimerModeEquf;
-            interruptMask |= 1u << index;
-        }
-        if (overflowReached && (timer.mode & kEeTimerModeOvfe) != 0u && (timer.mode & kEeTimerModeOvff) == 0u)
-        {
-            timer.mode |= kEeTimerModeOvff;
-            interruptMask |= 1u << index;
-        }
+        ++m_eeTimerVerifyChecks;
+        if (!same && ++m_eeTimerVerifyMismatches <= 16u)
+            std::fprintf(stderr, "[eetimer-verify] checkpoint %llu: interrupts 0x%x, the per-checkpoint advance 0x%x%c",
+                         static_cast<unsigned long long>(m_eeTimerVerifyChecks), interruptMask, shadowMask, 10);
+        if ((m_eeTimerVerifyChecks & ((1ull << 26) - 1u)) == 0u)
+            std::fprintf(stderr, "[eetimer-verify] %llu checkpoints checked, %llu differed%c",
+                         static_cast<unsigned long long>(m_eeTimerVerifyChecks),
+                         static_cast<unsigned long long>(m_eeTimerVerifyMismatches), 10);
     }
     return interruptMask;
 }
 
 uint64_t PS2Memory::cyclesUntilNextEeTimerInterrupt() const noexcept
+{
+    const uint64_t next = cyclesUntilNextEeTimerEventNow();
+    if (next == std::numeric_limits<uint64_t>::max())
+        return next;
+    return next > m_eeTimerPending ? next - m_eeTimerPending : 1u;
+}
+
+uint64_t PS2Memory::cyclesUntilNextEeTimerEventNow() const noexcept
 {
     uint64_t nearest = std::numeric_limits<uint64_t>::max();
     for (const EeTimer &timer : m_eeTimers)
@@ -560,9 +761,20 @@ const uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t
     }
     if (const uint8_t *ptr = mapRange(PS2_VU1_CODE_BASE, PS2_VU1_CODE_SIZE, m_vu1Code))
     {
+        const_cast<PS2Memory *>(this)->fenceChain(ChainFence::VuMemory);
         return ptr;
     }
-    return mapRange(PS2_VU1_DATA_BASE, PS2_VU1_DATA_SIZE, m_vu1Data);
+    const uint8_t *vu1Data = mapRange(PS2_VU1_DATA_BASE, PS2_VU1_DATA_SIZE, m_vu1Data);
+    if (vu1Data)
+        const_cast<PS2Memory *>(this)->fenceChain(ChainFence::VuMemory);
+    return vu1Data;
+}
+
+bool PS2Memory::commitRam(uint32_t guestOffset, uint32_t size)
+{
+    if (!m_rdram || size == 0u || guestOffset >= PS2_RAM_BACKING_SIZE || size > PS2_RAM_BACKING_SIZE - guestOffset)
+        return false;
+    return commitGuestRam(m_rdram, guestOffset, size);
 }
 
 uint32_t PS2Memory::translateAddress(uint32_t virtualAddress)
@@ -678,7 +890,7 @@ uint8_t PS2Memory::read8(uint32_t address)
     {
         return m_scratchpad[physAddr];
     }
-    if (physAddr < PS2_RAM_SIZE)
+    if (physAddr < PS2_RAM_BACKING_SIZE)
     {
         return m_rdram[physAddr];
     }
@@ -714,9 +926,9 @@ uint16_t PS2Memory::read16(uint32_t address)
     {
         return loadScalar<uint16_t>(m_scratchpad, physAddr, PS2_SCRATCHPAD_SIZE, "read16 scratchpad", address);
     }
-    if (physAddr < PS2_RAM_SIZE)
+    if (physAddr < PS2_RAM_BACKING_SIZE)
     {
-        return loadScalar<uint16_t>(m_rdram, physAddr, PS2_RAM_SIZE, "read16 rdram", address);
+        return loadScalar<uint16_t>(m_rdram, physAddr, PS2_RAM_BACKING_SIZE, "read16 rdram", address);
     }
     uint32_t vuOffset = 0;
     uint32_t vuLimit = 0;
@@ -744,6 +956,7 @@ uint32_t PS2Memory::read32(uint32_t address)
 
     if (isGsPrivReg(address))
     {
+        fenceGsPrivAccess(address);
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
@@ -765,9 +978,9 @@ uint32_t PS2Memory::read32(uint32_t address)
     {
         return loadScalar<uint32_t>(m_scratchpad, physAddr, PS2_SCRATCHPAD_SIZE, "read32 scratchpad", address);
     }
-    if (physAddr < PS2_RAM_SIZE)
+    if (physAddr < PS2_RAM_BACKING_SIZE)
     {
-        return loadScalar<uint32_t>(m_rdram, physAddr, PS2_RAM_SIZE, "read32 rdram", address);
+        return loadScalar<uint32_t>(m_rdram, physAddr, PS2_RAM_BACKING_SIZE, "read32 rdram", address);
     }
     uint32_t vuOffset = 0;
     uint32_t vuLimit = 0;
@@ -792,6 +1005,7 @@ uint64_t PS2Memory::read64(uint32_t address)
 
     if (isGsPrivReg(address))
     {
+        fenceGsPrivAccess(address);
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
@@ -808,9 +1022,9 @@ uint64_t PS2Memory::read64(uint32_t address)
     {
         return loadScalar<uint64_t>(m_scratchpad, physAddr, PS2_SCRATCHPAD_SIZE, "read64 scratchpad", address);
     }
-    if (physAddr < PS2_RAM_SIZE)
+    if (physAddr < PS2_RAM_BACKING_SIZE)
     {
-        return loadScalar<uint64_t>(m_rdram, physAddr, PS2_RAM_SIZE, "read64 rdram", address);
+        return loadScalar<uint64_t>(m_rdram, physAddr, PS2_RAM_BACKING_SIZE, "read64 rdram", address);
     }
     uint32_t vuOffset = 0;
     uint32_t vuLimit = 0;
@@ -845,9 +1059,9 @@ __m128i PS2Memory::read128(uint32_t address)
         inRange(physAddr, sizeof(__m128i), PS2_SCRATCHPAD_SIZE, "read128 scratchpad", address);
         return _mm_loadu_si128(reinterpret_cast<__m128i *>(&m_scratchpad[physAddr]));
     }
-    if (physAddr < PS2_RAM_SIZE)
+    if (physAddr < PS2_RAM_BACKING_SIZE)
     {
-        inRange(physAddr, sizeof(__m128i), PS2_RAM_SIZE, "read128 rdram", address);
+        inRange(physAddr, sizeof(__m128i), PS2_RAM_BACKING_SIZE, "read128 rdram", address);
         return _mm_loadu_si128(reinterpret_cast<__m128i *>(&m_rdram[physAddr]));
     }
     uint32_t vuOffset = 0;
@@ -872,7 +1086,7 @@ void PS2Memory::write8(uint32_t address, uint8_t value)
     {
         m_scratchpad[physAddr] = value;
     }
-    else if (physAddr < PS2_RAM_SIZE)
+    else if (physAddr < PS2_RAM_BACKING_SIZE)
     {
         m_rdram[physAddr] = value;
     }
@@ -887,6 +1101,7 @@ void PS2Memory::write8(uint32_t address, uint8_t value)
             if (vuMem == m_vu0Code)
                 markVU0CodeModified();
             else if (vuMem == m_vu1Code)
+                ps2_vu_code_log::record(this, getVU1CodeGeneration() + 1u, vuOffset, vuOffset + 1u);
                 markVU1CodeModified();
             return;
         }
@@ -916,9 +1131,9 @@ void PS2Memory::write16(uint32_t address, uint16_t value)
     {
         storeScalar<uint16_t>(m_scratchpad, physAddr, PS2_SCRATCHPAD_SIZE, value, "write16 scratchpad", address);
     }
-    else if (physAddr < PS2_RAM_SIZE)
+    else if (physAddr < PS2_RAM_BACKING_SIZE)
     {
-        storeScalar<uint16_t>(m_rdram, physAddr, PS2_RAM_SIZE, value, "write16 rdram", address);
+        storeScalar<uint16_t>(m_rdram, physAddr, PS2_RAM_BACKING_SIZE, value, "write16 rdram", address);
     }
     else
     {
@@ -930,6 +1145,7 @@ void PS2Memory::write16(uint32_t address, uint16_t value)
             if (vuMem == m_vu0Code)
                 markVU0CodeModified();
             else if (vuMem == m_vu1Code)
+                ps2_vu_code_log::record(this, getVU1CodeGeneration() + 1u, vuOffset, vuOffset + 2u);
                 markVU1CodeModified();
             return;
         }
@@ -953,6 +1169,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
 
     if (isGsPrivReg(address))
     {
+        fenceGsPrivAccess(address);
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
@@ -960,6 +1177,8 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
             // CSR: bits 0..1 of the low dword are write-one-to-clear status bits.
             // Done as a single atomic RMW -- see writeCsrHalf's comment.
             writeCsrHalf(gs_regs.csr, off, value);
+            if (off == 0u && (value & 0x200u) != 0u)
+                resetGsPrivilegedRegisters(gs_regs);
         }
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
@@ -977,12 +1196,12 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
     {
         storeScalar<uint32_t>(m_scratchpad, physAddr, PS2_SCRATCHPAD_SIZE, value, "write32 scratchpad", address);
     }
-    else if (physAddr < PS2_RAM_SIZE)
+    else if (physAddr < PS2_RAM_BACKING_SIZE)
     {
         // Check if this might be code modification
         markModified(address, 4);
 
-        storeScalar<uint32_t>(m_rdram, physAddr, PS2_RAM_SIZE, value, "write32 rdram", address);
+        storeScalar<uint32_t>(m_rdram, physAddr, PS2_RAM_BACKING_SIZE, value, "write32 rdram", address);
     }
     else
     {
@@ -994,6 +1213,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
             if (vuMem == m_vu0Code)
                 markVU0CodeModified();
             else if (vuMem == m_vu1Code)
+                ps2_vu_code_log::record(this, getVU1CodeGeneration() + 1u, vuOffset, vuOffset + 4u);
                 markVU1CodeModified();
             return;
         }
@@ -1013,12 +1233,15 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
 
     if (isGsPrivReg(address))
     {
+        fenceGsPrivAccess(address);
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
             // CSR: bits 0..1 are write-one-to-clear status bits. Done as a single
             // atomic RMW -- see writeCsrFull's comment.
             writeCsrFull(gs_regs.csr, value);
+            if ((value & 0x200ull) != 0ull)
+                resetGsPrivilegedRegisters(gs_regs);
         }
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
@@ -1034,10 +1257,10 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
     {
         storeScalar<uint64_t>(m_scratchpad, physAddr, PS2_SCRATCHPAD_SIZE, value, "write64 scratchpad", address);
     }
-    else if (physAddr < PS2_RAM_SIZE)
+    else if (physAddr < PS2_RAM_BACKING_SIZE)
     {
         markModified(address, 8);
-        storeScalar<uint64_t>(m_rdram, physAddr, PS2_RAM_SIZE, value, "write64 rdram", address);
+        storeScalar<uint64_t>(m_rdram, physAddr, PS2_RAM_BACKING_SIZE, value, "write64 rdram", address);
     }
     else
     {
@@ -1049,6 +1272,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
             if (vuMem == m_vu0Code)
                 markVU0CodeModified();
             else if (vuMem == m_vu1Code)
+                ps2_vu_code_log::record(this, getVU1CodeGeneration() + 1u, vuOffset, vuOffset + 8u);
                 markVU1CodeModified();
             return;
         }
@@ -1081,7 +1305,10 @@ void PS2Memory::write128(uint32_t address, __m128i value)
     {
         alignas(16) uint8_t fifoData[16];
         _mm_storeu_si128(reinterpret_cast<__m128i *>(fifoData), value);
-        processVIF1Data(fifoData, sizeof(fifoData));
+        if (m_chain)
+            m_chain->submitVif1(fifoData, sizeof(fifoData));
+        else
+            processVIF1Data(fifoData, sizeof(fifoData));
         return;
     }
 
@@ -1090,10 +1317,10 @@ void PS2Memory::write128(uint32_t address, __m128i value)
         inRange(physAddr, sizeof(__m128i), PS2_SCRATCHPAD_SIZE, "write128 scratchpad", address);
         _mm_storeu_si128(reinterpret_cast<__m128i *>(&m_scratchpad[physAddr]), value);
     }
-    else if (physAddr < PS2_RAM_SIZE)
+    else if (physAddr < PS2_RAM_BACKING_SIZE)
     {
         markModified(address, 16);
-        inRange(physAddr, sizeof(__m128i), PS2_RAM_SIZE, "write128 rdram", address);
+        inRange(physAddr, sizeof(__m128i), PS2_RAM_BACKING_SIZE, "write128 rdram", address);
         _mm_storeu_si128(reinterpret_cast<__m128i *>(&m_rdram[physAddr]), value);
     }
     else
@@ -1107,6 +1334,7 @@ void PS2Memory::write128(uint32_t address, __m128i value)
             if (vuMem == m_vu0Code)
                 markVU0CodeModified();
             else if (vuMem == m_vu1Code)
+                ps2_vu_code_log::record(this, getVU1CodeGeneration() + 1u, vuOffset, vuOffset + 16u);
                 markVU1CodeModified();
             return;
         }
@@ -1122,44 +1350,60 @@ void PS2Memory::write128(uint32_t address, __m128i value)
     }
 }
 
+void PS2Memory::applyEeTimerWrite(EeTimer &timer, uint32_t timerOffset, uint32_t value) noexcept
+{
+    switch (timerOffset)
+    {
+    case kEeTimerCountOffset:
+        timer.count = value & 0xFFFFu;
+        timer.clockRemainder = 0u;
+        break;
+    case kEeTimerModeOffset:
+    {
+        const uint32_t previousMode = timer.mode;
+        const uint32_t status = (previousMode & kEeTimerModeStatusMask) & ~(value & kEeTimerModeStatusMask);
+        timer.mode = (value & kEeTimerModeConfigMask) | status;
+        if (((previousMode ^ timer.mode) & (kEeTimerModeClksMask | kEeTimerModeCue)) != 0u)
+        {
+            timer.clockRemainder = 0u;
+        }
+        break;
+    }
+    case kEeTimerCompareOffset:
+        timer.compare = value & 0xFFFFu;
+        break;
+    case kEeTimerHoldOffset:
+        timer.hold = value & 0xFFFFu;
+        break;
+    default:
+        break;
+    }
+}
+
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
+    if (ChainWorker::onWorker()) // the IO register map is the game thread's (not thread-safe)
+        ps2_host_profile::count(ps2_host_profile::ChainOwnerViolations);
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
+    if (address == 0x10003020u) // GIF_STAT: the FIFO count may be set
+        m_gifFqcMaybeSet = true;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
-        EeTimer &timer = m_eeTimers[timerIndex];
-        switch (timerOffset)
-        {
-        case kEeTimerCountOffset:
-            timer.count = value & 0xFFFFu;
-            timer.clockRemainder = 0u;
-            break;
-        case kEeTimerModeOffset:
-        {
-            const uint32_t previousMode = timer.mode;
-            const uint32_t status = (previousMode & kEeTimerModeStatusMask) & ~(value & kEeTimerModeStatusMask);
-            timer.mode = (value & kEeTimerModeConfigMask) | status;
-            if (((previousMode ^ timer.mode) & (kEeTimerModeClksMask | kEeTimerModeCue)) != 0u)
-            {
-                timer.clockRemainder = 0u;
-            }
-            break;
-        }
-        case kEeTimerCompareOffset:
-            timer.compare = value & 0xFFFFu;
-            break;
-        case kEeTimerHoldOffset:
-            timer.hold = value & 0xFFFFu;
-            break;
-        default:
+        if (timerOffset != kEeTimerCountOffset && timerOffset != kEeTimerModeOffset &&
+            timerOffset != kEeTimerCompareOffset && timerOffset != kEeTimerHoldOffset)
             return false;
-        }
+        flushEeTimers();
+        applyEeTimerWrite(m_eeTimers[timerIndex], timerOffset, value);
+        if (m_eeTimerVerify)
+            applyEeTimerWrite(m_eeTimersShadow[timerIndex], timerOffset, value);
+        m_eeTimerHorizon = cyclesUntilNextEeTimerEventNow();
         return true;
     }
 
     if (isGsPrivReg(address))
     {
+        fenceGsPrivAccess(address);
         // NB: unreachable from write8/16/32/64 today since those all funnel IO
         // register writes through addresses in PS2_IO_BASE's range, which is
         // disjoint from PS2_GS_PRIV_REG_BASE; kept correct for direct callers.
@@ -1169,6 +1413,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         if (regOff == kGsCsrRegOffset)
         {
             writeCsrHalf(gs_regs.csr, off, value);
+            if (off == 0u && (value & 0x200u) != 0u)
+                resetGsPrivilegedRegisters(gs_regs);
         }
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
@@ -1221,66 +1467,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     if (address >= 0x10003C00u && address < 0x10003E00u)
     {
         m_vifWriteCount.fetch_add(1, std::memory_order_relaxed);
-
-        switch (address)
-        {
-        case 0x10003C10u:     // VIF1_FBRST
-            if (value & 0x1u) // RST
-            {
-                const bool wasPath3Masked = m_path3Masked;
-                std::memset(&vif1_regs, 0, sizeof(vif1_regs));
-                m_vif1PendingPath2ImageQwc = 0u;
-                m_vif1PendingPath2DirectHl = false;
-                m_path3Masked = false;
-                if (wasPath3Masked)
-                    flushMaskedPath3Packets();
-            }
-            if (value & 0x8u) // STC
-            {
-                vif1_regs.stat &= ~((1u << 8) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 13));
-            }
-            break;
-        case 0x10003C30u:
-            vif1_regs.mark = value & 0xFFFFu;
-            vif1_regs.stat &= ~(1u << 6); // clear MRK flag on CPU write
-            break;
-        case 0x10003C40u:
-            vif1_regs.cycle = value & 0xFFFFu;
-            break;
-        case 0x10003C50u:
-            vif1_regs.mode = value & 0x3u;
-            break;
-        case 0x10003C60u:
-            vif1_regs.num = value & 0xFFu;
-            break;
-        case 0x10003C70u:
-            vif1_regs.mask = value;
-            break;
-        case 0x10003C80u:
-            vif1_regs.code = value;
-            break;
-        case 0x10003C90u:
-            vif1_regs.itops = value & 0x3FFu;
-            break;
-        case 0x10003CA0u:
-            vif1_regs.base = value & 0x3FFu;
-            break;
-        case 0x10003CB0u:
-            vif1_regs.ofst = value & 0x3FFu;
-            break;
-        case 0x10003CC0u:
-            vif1_regs.tops = value & 0x3FFu;
-            break;
-        case 0x10003CD0u:
-            vif1_regs.itop = value & 0x3FFu;
-            break;
-        case 0x10003CE0u:
-            vif1_regs.top = value & 0x3FFu;
-            break;
-        default:
-            break;
-        }
-
+        if (m_chain)
+            m_chain->writeVif1Register(address, value);
+        else
+            applyVif1RegisterWrite(address, value);
         return true;
     }
 
@@ -1308,6 +1498,17 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
             if (tryProcessScratchpadDma(channelBase, value))
             {
+                return true;
+            }
+
+            if (channelBase == 0x1000B400u) // HCTP: toIPU (Sofdec movie data) -> FFmpeg decoder (Kernel/Stubs/MPEG.cpp)
+            {
+                uint32_t chcr = value, dmadr = madr, dqwc = qwc, dtadr = m_ioRegisters[channelBase + 0x30];
+                ps2_stubs::mpegIpuToDmaStart(m_rdram, chcr, dmadr, dqwc, dtadr);
+                m_ioRegisters[channelBase + 0x00] = chcr;
+                m_ioRegisters[channelBase + 0x10] = dmadr;
+                m_ioRegisters[channelBase + 0x20] = dqwc;
+                m_ioRegisters[channelBase + 0x30] = dtadr;
                 return true;
             }
 
@@ -1364,7 +1565,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         else
                         {
                             base2 = m_rdram;
-                            maxSz2 = PS2_RAM_SIZE;
+                            maxSz2 = PS2_RAM_BACKING_SIZE;
                         }
 
                         while (bytes > 0)
@@ -1389,7 +1590,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         tagPhys = translateAddress(localTagAddr);
 
                         const uint8_t *localBase = tagScratch ? m_scratchpad : m_rdram;
-                        const uint32_t localMax = tagScratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+                        const uint32_t localMax = tagScratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_BACKING_SIZE;
                         if (tagPhys + 16u > localMax)
                             return;
 
@@ -1403,6 +1604,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     const bool transferTagData = isVifChannel && (chcr & 0x40u) != 0u;
 
                     int tagsProcessed = 0;
+                    uint32_t tagIdCounts[8] = {};
+                    const uint32_t startTagAddr = tagAddr;
                     uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
 
                     while (tagsProcessed < kMaxChainTags)
@@ -1428,7 +1631,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         else
                         {
                             tagBase = m_rdram;
-                            tagMax = PS2_RAM_SIZE;
+                            tagMax = PS2_RAM_BACKING_SIZE;
                         }
                         if (physTag + 16 > tagMax)
                             break;
@@ -1441,6 +1644,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFFF);
                         lastTagUpper = static_cast<uint32_t>((tag >> 16) & 0xFFFFu);
                         ++tagsProcessed;
+                        ++tagIdCounts[id & 7u];
 
                         uint32_t dataAddr = 0;
                         bool hasPayload = (tagQwc > 0);
@@ -1521,6 +1725,19 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             break;
                     }
 
+                    {
+                        // VENDETTA_GSLOG=1: each VIF1 chain kick — where it starts, the tags by kind (refe cnt next ref
+                        // refs call ret end), where it stopped, the bytes it sends
+                        static const bool chainLog = std::getenv("VENDETTA_GSLOG") != nullptr;
+                        static uint32_t chainLogs = 0u;
+                        if (chainLog && channelBase == 0x10009000u && chainLogs < 3000u)
+                        {
+                            ++chainLogs;
+                            std::fprintf(stderr, "[gslog] vif1 chain start=0x%x tags=%d ids=%u/%u/%u/%u/%u/%u/%u/%u next=0x%x asp=%u bytes=%zu%c",
+                                         startTagAddr, tagsProcessed, tagIdCounts[0], tagIdCounts[1], tagIdCounts[2], tagIdCounts[3],
+                                         tagIdCounts[4], tagIdCounts[5], tagIdCounts[6], tagIdCounts[7], tagAddr, asp, chainBuf.size(), 10);
+                        }
+                    }
                     m_ioRegisters[channelBase + 0x30] = tagAddr;
                     m_ioRegisters[channelBase + 0x40] = asr0;
                     m_ioRegisters[channelBase + 0x50] = asr1;
@@ -1584,6 +1801,68 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     return false;
 }
 
+void PS2Memory::applyVif1RegisterWrite(uint32_t address, uint32_t value)
+{
+    switch (address)
+    {
+    case 0x10003C10u:     // VIF1_FBRST
+        if (value & 0x1u) // RST
+        {
+            const bool wasPath3Masked = m_path3Masked;
+            std::memset(&vif1_regs, 0, sizeof(vif1_regs));
+            m_vif1PendingPath2ImageQwc = 0u;
+            m_vif1PendingPath2DirectHl = false;
+            m_path3Masked = false;
+            if (wasPath3Masked)
+                flushMaskedPath3Packets();
+        }
+        if (value & 0x8u) // STC
+        {
+            vif1_regs.stat &= ~((1u << 8) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 13));
+        }
+        break;
+    case 0x10003C30u:
+        vif1_regs.mark = value & 0xFFFFu;
+        vif1_regs.stat &= ~(1u << 6); // clear MRK flag on CPU write
+        break;
+    case 0x10003C40u:
+        vif1_regs.cycle = value & 0xFFFFu;
+        break;
+    case 0x10003C50u:
+        vif1_regs.mode = value & 0x3u;
+        break;
+    case 0x10003C60u:
+        vif1_regs.num = value & 0xFFu;
+        break;
+    case 0x10003C70u:
+        vif1_regs.mask = value;
+        break;
+    case 0x10003C80u:
+        vif1_regs.code = value;
+        break;
+    case 0x10003C90u:
+        vif1_regs.itops = value & 0x3FFu;
+        break;
+    case 0x10003CA0u:
+        vif1_regs.base = value & 0x3FFu;
+        break;
+    case 0x10003CB0u:
+        vif1_regs.ofst = value & 0x3FFu;
+        break;
+    case 0x10003CC0u:
+        vif1_regs.tops = value & 0x3FFu;
+        break;
+    case 0x10003CD0u:
+        vif1_regs.itop = value & 0x3FFu;
+        break;
+    case 0x10003CE0u:
+        vif1_regs.top = value & 0x3FFu;
+        break;
+    default:
+        break;
+    }
+}
+
 bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
 {
     static constexpr uint32_t kSprFromChannel = 0x1000D000u;
@@ -1610,7 +1889,7 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
         return false;
     }
 
-    if (mainOffset > PS2_RAM_SIZE || byteCount > PS2_RAM_SIZE - mainOffset)
+    if (mainOffset > PS2_RAM_BACKING_SIZE || byteCount > PS2_RAM_BACKING_SIZE - mainOffset)
         return false;
 
     const bool fromScratchpad = channelBase == kSprFromChannel;
@@ -1660,6 +1939,60 @@ void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
     queueCompletedDmacCause(cause);
 }
 
+namespace
+{
+    thread_local bool t_skipCsrFence = false;
+}
+
+void PS2Memory::skipNextCsrFence() noexcept { t_skipCsrFence = true; }
+
+void PS2Memory::fenceChain(ChainFence reason)
+{
+    if (m_chain && m_chain->async() && !ChainWorker::onWorker())
+        m_chain->fence(reason);
+}
+
+// CSR's SIGNAL / FINISH bits and SIGLBLID are written by the GS front end, which the chain worker runs: the game
+// thread waits for the worker before it reads or writes them. (FIELD, the display registers and IMR are the game
+// thread's own.)
+void PS2Memory::fenceGsPrivAccess(uint32_t address)
+{
+    const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+    const bool skip = t_skipCsrFence;
+    t_skipCsrFence = false;
+    if (!m_chain || !m_chain->async())
+        return;
+    if (regOff == kGsCsrRegOffset)
+    {
+        if (!skip)
+            fenceChain(ChainFence::Csr);
+    }
+    else if (regOff == 0x1080u)
+        fenceChain(ChainFence::Siglblid);
+}
+
+void PS2Memory::submitChainGif(const uint8_t *data, uint32_t sizeBytes)
+{
+    if (m_chain)
+        m_chain->submitGif(data, sizeBytes);
+    else
+        submitGifPacket(GifPathId::Path3, data, sizeBytes, false);
+}
+
+void PS2Memory::submitChainVif1(const uint8_t *data, uint32_t sizeBytes)
+{
+    if (m_chain)
+        m_chain->submitVif1(data, sizeBytes);
+    else
+        processVIF1Data(data, sizeBytes);
+}
+
+uint32_t PS2Memory::peekIORegister(uint32_t address) const
+{
+    const auto it = m_ioRegisters.find(address);
+    return it != m_ioRegisters.end() ? it->second : 0u;
+}
+
 void PS2Memory::processPendingTransfers()
 {
     const bool hadGif = !m_pendingGifTransfers.empty();
@@ -1677,6 +2010,7 @@ void PS2Memory::processPendingTransfers()
         constexpr uint32_t kGifFqcMask = 0x1F000000u;
         uint32_t &gifStat = m_ioRegisters[kGifStat];
         gifStat = (gifStat & ~kGifFqcMask) | (observedGifQwc << 24u);
+        m_gifFqcMaybeSet = true;
     }
 
     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
@@ -1686,7 +2020,7 @@ void PS2Memory::processPendingTransfers()
         {
             m_seenGifCopy = true;
             m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
-            submitGifPacket(GifPathId::Path3, p.chainData.data(), static_cast<uint32_t>(p.chainData.size()), false);
+            submitChainGif(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
         }
         else if (p.qwc > 0)
         {
@@ -1715,7 +2049,7 @@ void PS2Memory::processPendingTransfers()
                         break;
                     m_seenGifCopy = true;
                     m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
-                    submitGifPacket(GifPathId::Path3, m_scratchpad + srcPhys, chunk, false);
+                    submitChainGif(m_scratchpad + srcPhys, chunk);
                     bytesLeft -= chunk;
                     srcPhys += chunk;
                 }
@@ -1725,16 +2059,16 @@ void PS2Memory::processPendingTransfers()
                 uint32_t bytesLeft = sizeBytes;
                 while (bytesLeft >= 16)
                 {
-                    if (srcPhys >= PS2_RAM_SIZE)
+                    if (srcPhys >= PS2_RAM_BACKING_SIZE)
                         srcPhys = 0;
                     uint32_t chunk = bytesLeft;
-                    if (srcPhys + chunk > PS2_RAM_SIZE)
-                        chunk = PS2_RAM_SIZE - srcPhys;
+                    if (srcPhys + chunk > PS2_RAM_BACKING_SIZE)
+                        chunk = PS2_RAM_BACKING_SIZE - srcPhys;
                     if (chunk == 0)
                         break;
                     m_seenGifCopy = true;
                     m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
-                    submitGifPacket(GifPathId::Path3, m_rdram + srcPhys, chunk, false);
+                    submitChainGif(m_rdram + srcPhys, chunk);
                     bytesLeft -= chunk;
                     srcPhys += chunk;
                 }
@@ -1785,11 +2119,11 @@ void PS2Memory::processPendingTransfers()
                 uint32_t bytesLeft = sizeBytes;
                 while (bytesLeft > 0)
                 {
-                    if (srcPhys >= PS2_RAM_SIZE)
+                    if (srcPhys >= PS2_RAM_BACKING_SIZE)
                         srcPhys = 0;
                     uint32_t chunk = bytesLeft;
-                    if (srcPhys + chunk > PS2_RAM_SIZE)
-                        chunk = PS2_RAM_SIZE - srcPhys;
+                    if (srcPhys + chunk > PS2_RAM_BACKING_SIZE)
+                        chunk = PS2_RAM_BACKING_SIZE - srcPhys;
                     if (chunk == 0)
                         break;
                     processVIF0Data(srcPhys, chunk);
@@ -1806,7 +2140,7 @@ void PS2Memory::processPendingTransfers()
     {
         if (!p.chainData.empty())
         {
-            processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
+            submitChainVif1(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
         }
         else if (p.qwc > 0)
         {
@@ -1833,7 +2167,7 @@ void PS2Memory::processPendingTransfers()
                         chunk = PS2_SCRATCHPAD_SIZE - srcPhys;
                     if (chunk == 0)
                         break;
-                    processVIF1Data(m_scratchpad + srcPhys, chunk);
+                    submitChainVif1(m_scratchpad + srcPhys, chunk);
                     bytesLeft -= chunk;
                     srcPhys += chunk;
                 }
@@ -1843,14 +2177,14 @@ void PS2Memory::processPendingTransfers()
                 uint32_t bytesLeft = sizeBytes;
                 while (bytesLeft > 0)
                 {
-                    if (srcPhys >= PS2_RAM_SIZE)
+                    if (srcPhys >= PS2_RAM_BACKING_SIZE)
                         srcPhys = 0;
                     uint32_t chunk = bytesLeft;
-                    if (srcPhys + chunk > PS2_RAM_SIZE)
-                        chunk = PS2_RAM_SIZE - srcPhys;
+                    if (srcPhys + chunk > PS2_RAM_BACKING_SIZE)
+                        chunk = PS2_RAM_BACKING_SIZE - srcPhys;
                     if (chunk == 0)
                         break;
-                    processVIF1Data(srcPhys, chunk);
+                    submitChainVif1(m_rdram + srcPhys, chunk); // (the loop keeps it inside RAM)
                     bytesLeft -= chunk;
                     srcPhys += chunk;
                 }
@@ -1859,7 +2193,13 @@ void PS2Memory::processPendingTransfers()
     }
     m_pendingVif1Transfers.clear();
 
-    if (m_gifArbiter)
+    // the GIF arbiter's queue to the GS (the chain does it after the data it was given; nothing to do if none)
+    if (m_chain)
+    {
+        if (hadGif || hadVif1)
+            m_chain->drainArbiter();
+    }
+    else if (m_gifArbiter)
         m_gifArbiter->drain();
 
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000;
@@ -1976,11 +2316,11 @@ void PS2Memory::processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount)
     uint32_t bytesLeft = sizeBytes;
     while (bytesLeft >= 16)
     {
-        if (srcPhysAddr >= PS2_RAM_SIZE)
+        if (srcPhysAddr >= PS2_RAM_BACKING_SIZE)
             srcPhysAddr = 0;
         uint32_t chunk = bytesLeft;
-        if (srcPhysAddr + chunk > PS2_RAM_SIZE)
-            chunk = PS2_RAM_SIZE - srcPhysAddr;
+        if (srcPhysAddr + chunk > PS2_RAM_BACKING_SIZE)
+            chunk = PS2_RAM_BACKING_SIZE - srcPhysAddr;
         if (chunk == 0)
             break;
 
@@ -2027,7 +2367,7 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
             const bool scratch = isScratchpad(guestAddr);
             const uint32_t phys = translateAddress(guestAddr);
             const uint8_t *base = scratch ? m_scratchpad : m_rdram;
-            const uint32_t limit = scratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+            const uint32_t limit = scratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_BACKING_SIZE;
             if (!base || phys > limit || bytes > limit - phys)
                 return false;
             out = base + phys;
@@ -2219,7 +2559,7 @@ bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t c
             const bool scratch = isScratchpad(guestAddr);
             const uint32_t phys = translateAddress(guestAddr);
             const uint8_t *base = scratch ? m_scratchpad : m_rdram;
-            const uint32_t limit = scratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+            const uint32_t limit = scratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_BACKING_SIZE;
             if (!base || phys > limit || bytes > limit - phys)
                 return false;
             out = base + phys;
@@ -2280,6 +2620,8 @@ int PS2Memory::pollDmaRegisters()
 
 uint32_t PS2Memory::readIORegister(uint32_t address)
 {
+    if (ChainWorker::onWorker())
+        ps2_host_profile::count(ps2_host_profile::ChainOwnerViolations);
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
@@ -2288,7 +2630,11 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         switch (timerOffset)
         {
         case kEeTimerCountOffset:
-            return timer.count & 0xFFFFu;
+        {
+            EeTimer now = timer;
+            advanceEeTimer(now, timerIndex, m_eeTimerPending);
+            return now.count & 0xFFFFu;
+        }
         case kEeTimerModeOffset:
             return timer.mode & (kEeTimerModeConfigMask | kEeTimerModeStatusMask);
         case kEeTimerCompareOffset:
@@ -2346,7 +2692,8 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         const uint32_t ctrl = m_ioRegisters.count(0x10003000u) ? m_ioRegisters[0x10003000u] : 0u;
 
         // M3R and IMT mirror GIF_MODE, PSE mirrors GIF_CTRL, and M3P is the
-        // effective PATH3 mask controlled by the VIF1 MSKPATH3 command.
+        // effective PATH3 mask controlled by the VIF1 MSKPATH3 command (the chain worker's).
+        fenceChain(ChainFence::GifStat);
         stat = (stat & ~0xFu) |
                (mode & 0x1u) |
                (m_path3Masked ? 0x2u : 0u) |
@@ -2445,6 +2792,54 @@ bool PS2Memory::isCodeAddress(uint32_t address) const
         }
     }
     return false;
+}
+
+namespace ps2_vu_code_log
+{
+    namespace
+    {
+        struct Write
+        {
+            const PS2Memory *memory = nullptr;
+            uint64_t generation = 0;
+            uint32_t begin = 0;
+            uint32_t end = 0;
+        };
+        constexpr uint32_t kLogSize = 64u;
+        std::mutex g_mutex;
+        std::array<Write, kLogSize> g_log{};
+    }
+
+    void record(const PS2Memory *memory, uint64_t generation, uint32_t begin, uint32_t end)
+    {
+        std::lock_guard lock(g_mutex);
+        g_log[generation % kLogSize] = Write{memory, generation, begin, end};
+    }
+
+    bool writtenSince(const PS2Memory *memory, uint64_t since, uint64_t now, uint32_t &begin, uint32_t &end)
+    {
+        begin = end = 0u;
+        if (now <= since)
+            return true;
+        if (now - since > kLogSize)
+            return false;
+        std::lock_guard lock(g_mutex);
+        uint32_t low = PS2_VU1_CODE_SIZE, high = 0u;
+        for (uint64_t generation = since + 1u; generation <= now; ++generation)
+        {
+            const Write &write = g_log[generation % kLogSize];
+            if (write.memory != memory || write.generation != generation)
+                return false; // overwritten by newer writes, or a write that was not logged
+            low = std::min(low, write.begin);
+            high = std::max(high, write.end);
+        }
+        if (high > low)
+        {
+            begin = low;
+            end = high;
+        }
+        return true;
+    }
 }
 
 void PS2Memory::markModified(uint32_t address, uint32_t size)

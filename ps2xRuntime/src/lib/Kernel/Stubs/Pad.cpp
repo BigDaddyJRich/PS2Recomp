@@ -1,5 +1,12 @@
+#include <utility>
+#include <vector>
+#include <string>
+#include <chrono>
 #include "Common.h"
+#include <cstdlib>
 #include "Pad.h"
+#include "runtime/ps2_pad.h"
+#include "runtime/ps2_pad_rumble.h"
 
 namespace ps2_stubs
 {
@@ -7,6 +14,7 @@ namespace ps2_stubs
     {
         constexpr uint8_t kPadModeDigital = 0x41;
         constexpr uint8_t kPadModeDualShock = 0x73;
+        constexpr uint8_t kPadModeDualShock2 = 0x79; // analog + pressure (scePadEnterPressMode): ID 7, 9 halfwords
         constexpr uint8_t kPadAnalogCenter = 0x80;
         constexpr int32_t kPadTypeDigital = 4;
         constexpr int32_t kPadTypeDualShock = 7;
@@ -14,7 +22,7 @@ namespace ps2_stubs
         constexpr int32_t kPadStateExecCmd = 5;
         constexpr int32_t kPadStateStable = 6;
         constexpr size_t kPadPortCount = 2;
-        constexpr size_t kPadSlotCount = 1;
+        constexpr size_t kPadSlotCount = 4; // a multitap's slots A-D (ps2_pad_layout: which port has one)
 
         constexpr uint16_t kPadBtnSelect = 1u << 0;
         constexpr uint16_t kPadBtnL3 = 1u << 1;
@@ -58,13 +66,15 @@ namespace ps2_stubs
             uint8_t lastData[32]{};
             uint32_t readCount = 0u;
             uint32_t lastReadDataAddr = 0u;
+            bool connected = false;        // a controller in this place (slot A of a port always counts as one)
+            uint8_t actAlign[6] = {0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu}; // scePadSetActAlign: byte i -> motor
         };
 
         std::mutex g_padOverrideMutex;
         std::mutex g_padStateMutex;
         bool g_padOverrideEnabled = false;
         PadInputState g_padOverrideState{};
-        PadPortState g_padPorts[kPadPortCount]{};
+        PadPortState g_padPorts[kPadPortCount][kPadSlotCount]{};
         int g_padReadLogCount = 0;
 
         uint8_t axisToByte(float axis)
@@ -94,14 +104,16 @@ namespace ps2_stubs
             return -1;
         }
 
-        void applyGamepadState(PadInputState &state)
+        // Each pad has its own controller (ps2_pad_layout; the keyboard drives the first pad too, see readPadPortData) —
+        // one controller used to drive both ports, so it moved player 1 and player 2 at once.
+        void applyGamepadState(PadInputState &state, int port, int slot)
         {
             if (!IsWindowReady())
             {
                 return;
             }
 
-            const int gamepad = findFirstGamepad();
+            const int gamepad = ps2_pad_layout::hostController(port, slot);
             if (gamepad < 0)
             {
                 return;
@@ -194,9 +206,12 @@ namespace ps2_stubs
 
         void resetPadStateLocked()
         {
-            for (PadPortState &portState : g_padPorts)
+            for (auto &port : g_padPorts)
             {
-                portState = PadPortState{};
+                for (PadPortState &portState : port)
+                {
+                    portState = PadPortState{};
+                }
             }
         }
 
@@ -206,11 +221,11 @@ namespace ps2_stubs
             {
                 return nullptr;
             }
-            if (slot < 0 || slot >= static_cast<int>(kPadSlotCount))
+            if (slot < 0 || slot >= static_cast<int>(kPadSlotCount) || slot >= ps2_pad_layout::slotCount(port))
             {
                 return nullptr;
             }
-            return &g_padPorts[port];
+            return &g_padPorts[port][slot];
         }
 
         void initializePadPortLocked(PadPortState &portState, uint32_t dmaAddr)
@@ -245,7 +260,9 @@ namespace ps2_stubs
         void fillPadStatus(uint8_t *data, const PadInputState &state, const PadPortState &portState)
         {
             std::memset(data, 0, 32);
-            data[1] = portState.analogMode ? kPadModeDualShock : kPadModeDigital;
+            // In pressure mode a DualShock 2 answers 0x79 (and the 12 pressure bytes); games check it — Def Jam
+            // Vendetta reads a pad only when its mode byte is 0x79.
+            data[1] = !portState.analogMode ? kPadModeDigital : (portState.pressureEnabled ? kPadModeDualShock2 : kPadModeDualShock);
             data[2] = static_cast<uint8_t>(state.buttons & 0xFFu);
             data[3] = static_cast<uint8_t>((state.buttons >> 8) & 0xFFu);
             data[4] = state.rx;
@@ -260,10 +277,82 @@ namespace ps2_stubs
             data[13] = pressureValue(state, portState, kPadBtnCircle);
             data[14] = pressureValue(state, portState, kPadBtnCross);
             data[15] = pressureValue(state, portState, kPadBtnSquare);
-            data[16] = pressureValue(state, portState, kPadBtnL1);
-            data[17] = pressureValue(state, portState, kPadBtnL2);
-            data[18] = pressureValue(state, portState, kPadBtnR1);
+            data[16] = pressureValue(state, portState, kPadBtnL1); // libpad order: L1, R1, L2, R2
+            data[17] = pressureValue(state, portState, kPadBtnR1);
+            data[18] = pressureValue(state, portState, kPadBtnL2);
             data[19] = pressureValue(state, portState, kPadBtnR2);
+        }
+
+        // VENDETTA_PADSCRIPT="70:START,72.5:CROSS,80:DOWN@3" — scripted presses for tests (each held 0.2 s, seconds
+        // counted from the game's first pad read), added to the real input; "@N" = the Nth pad (ps2_pad_layout's order:
+        // 1 = port 1, then port 2 and its multitap), else the first. Names: START SELECT CROSS CIRCLE SQUARE TRIANGLE
+        // UP DOWN LEFT RIGHT L1 R1 L2 R2 L3 R3. With VENDETTA_PADS=<n> the first n pads count as plugged in.
+        // VENDETTA_NO_HOST_INPUT=1 (test runs: tools\run_test.ps1 sets it): the real keyboard / controllers are not read,
+        // so nothing typed elsewhere while the game window has focus reaches the game (Enter = START skipped the intro
+        // in test runs); a pad script still drives port 0.
+        bool hostInputIgnored()
+        {
+            static const bool ignored = []()
+            {
+                const char *value = std::getenv("VENDETTA_NO_HOST_INPUT");
+                return value != nullptr && value[0] != '0';
+            }();
+            return ignored;
+        }
+
+        void applyPadScript(PadInputState &state, int pad)
+        {
+            struct Press
+            {
+                double at;
+                uint16_t mask;
+                int pad;
+            };
+            static const std::vector<Press> presses = []()
+            {
+                std::vector<Press> list;
+                const char *env = std::getenv("VENDETTA_PADSCRIPT");
+                if (!env)
+                    return list;
+                static const std::pair<const char *, uint16_t> names[] = {
+                    {"START", kPadBtnStart}, {"SELECT", kPadBtnSelect}, {"CROSS", kPadBtnCross}, {"CIRCLE", kPadBtnCircle},
+                    {"SQUARE", kPadBtnSquare}, {"TRIANGLE", kPadBtnTriangle}, {"UP", kPadBtnUp}, {"DOWN", kPadBtnDown},
+                    {"LEFT", kPadBtnLeft}, {"RIGHT", kPadBtnRight}, {"L1", kPadBtnL1}, {"R1", kPadBtnR1},
+                    {"L2", kPadBtnL2}, {"R2", kPadBtnR2}, {"L3", kPadBtnL3}, {"R3", kPadBtnR3}};
+                std::string text(env);
+                size_t start = 0;
+                while (start < text.size())
+                {
+                    size_t end = text.find(',', start);
+                    if (end == std::string::npos)
+                        end = text.size();
+                    const std::string item = text.substr(start, end - start);
+                    const size_t colon = item.find(':');
+                    if (colon != std::string::npos)
+                    {
+                        const double at = std::atof(item.substr(0, colon).c_str());
+                        std::string name = item.substr(colon + 1);
+                        int target = 0;
+                        if (const size_t atSign = name.find('@'); atSign != std::string::npos)
+                        {
+                            target = std::max(1, std::atoi(name.c_str() + atSign + 1)) - 1;
+                            name.resize(atSign);
+                        }
+                        for (const auto &entry : names)
+                            if (name == entry.first)
+                                list.push_back({at, entry.second, target});
+                    }
+                    start = end + 1;
+                }
+                return list;
+            }();
+            if (presses.empty())
+                return;
+            static const auto origin = std::chrono::steady_clock::now();
+            const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - origin).count();
+            for (const Press &press : presses)
+                if (press.pad == pad && now >= press.at && now < press.at + 0.2)
+                    state.buttons = static_cast<uint16_t>(state.buttons & ~press.mask);
         }
 
         bool readPadPortData(int port, int slot, PS2Runtime *runtime, uint8_t *outData, uint32_t dataAddr)
@@ -308,13 +397,17 @@ namespace ps2_stubs
                     state.ly = backendData[7];
                     usedBackend = true;
                 }
-                else
+                else if (!hostInputIgnored())
                 {
-                    applyGamepadState(state);
-                    applyKeyboardState(state, portState.analogMode);
+                    applyGamepadState(state, port, slot);
+                    if (ps2_pad_layout::padIndex(port, slot) == 0)
+                    {
+                        applyKeyboardState(state, portState.analogMode);
+                    }
                 }
             }
 
+            applyPadScript(state, ps2_pad_layout::padIndex(port, slot));
             fillPadStatus(outData, state, portState);
 
             {
@@ -344,6 +437,7 @@ namespace ps2_stubs
     {
         (void)rdram;
         (void)runtime;
+        ps2_pad_rumble::stopAll();
         {
             std::lock_guard<std::mutex> lock(g_padStateMutex);
             resetPadStateLocked();
@@ -446,19 +540,35 @@ namespace ps2_stubs
     {
         (void)rdram;
         (void)runtime;
-        // Most games use one slot unless multitap is active.
-        setReturnS32(ctx, 1);
+        // 4 on the port with the multitap (ps2_host_settings' multitapPort), else 1
+        setReturnS32(ctx, ps2_pad_layout::slotCount(static_cast<int>(getRegU32(ctx, 4))));
     }
 
     void scePadGetState(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
         (void)runtime;
+        const int port = static_cast<int>(getRegU32(ctx, 4));
+        const int slot = static_cast<int>(getRegU32(ctx, 5));
+        // slot A of a port is always there (as before); a multitap's slots B-D only with a controller in them
+        const bool plugged = slot == 0 || ps2_pad_layout::connected(port, slot);
         std::lock_guard<std::mutex> lock(g_padStateMutex);
-        PadPortState *portState = lookupPadPortStateLocked(static_cast<int>(getRegU32(ctx, 4)),
-                                                           static_cast<int>(getRegU32(ctx, 5)));
+        PadPortState *portState = lookupPadPortStateLocked(port, slot);
         int32_t state = kPadStateDisconnected;
-        if (portState && portState->open)
+        if (portState && portState->open && plugged != portState->connected)
+        {
+            // plugged in: a fresh pad (digital, no pressure, motors off), as real hardware
+            portState->connected = plugged;
+            portState->analogMode = false;
+            portState->pressureEnabled = false;
+            portState->buttonMask = 0xFFFFu;
+            portState->reqState = 0u;
+            portState->transientState = 0u;
+            std::fill(std::begin(portState->actAlign), std::end(portState->actAlign), uint8_t{0xFFu});
+            if (!plugged)
+                ps2_pad_rumble::set(port, slot, false, 0u);
+        }
+        if (portState && portState->open && portState->connected)
         {
             if (portState->transientState != 0u)
             {
@@ -469,6 +579,17 @@ namespace ps2_stubs
             {
                 state = kPadStateStable;
             }
+        }
+        // VENDETTA_PADLOG=1: each change of a port's state (what the game's pad loop waits on).
+        static const bool padLog = std::getenv("VENDETTA_PADLOG") != nullptr;
+        static int32_t lastState[kPadPortCount][kPadSlotCount] = {{-1, -1, -1, -1}, {-1, -1, -1, -1}};
+        const uint32_t logPort = getRegU32(ctx, 4) & 1u;
+        const uint32_t logSlot = getRegU32(ctx, 5) & 3u;
+        if (padLog && state != lastState[logPort][logSlot])
+        {
+            std::cerr << "[padlog] scePadGetState port=" << getRegU32(ctx, 4) << " slot=" << getRegU32(ctx, 5)
+                      << " -> " << state << (portState ? "" : " (no port)") << std::endl;
+            lastState[logPort][logSlot] = state;
         }
         setReturnS32(ctx, state);
     }
@@ -589,9 +710,11 @@ namespace ps2_stubs
         }
 
         portState->open = false;
+        portState->connected = false;
         portState->pressureEnabled = false;
         portState->reqState = 0u;
         portState->transientState = 0u;
+        ps2_pad_rumble::set(static_cast<int>(getRegU32(ctx, 4)), static_cast<int>(getRegU32(ctx, 5)), false, 0u);
         setReturnS32(ctx, 1);
     }
 
@@ -610,6 +733,7 @@ namespace ps2_stubs
         }
 
         portState->open = true;
+        portState->connected = false;      // scePadGetState looks
         portState->analogMode = false;     // real pads open DIGITAL
         portState->pressureEnabled = false;
         portState->buttonMask = 0xFFFFu;
@@ -637,10 +761,21 @@ namespace ps2_stubs
         }
 
         ps2TraceGuestRangeWrite(rdram, dataAddr, 32u, "scePadRead", ctx);
-        if (!readPadPortData(port, slot, runtime, data, dataAddr))
+        if ((slot != 0 && !ps2_pad_layout::connected(port, slot)) || !readPadPortData(port, slot, runtime, data, dataAddr))
         {
             setReturnS32(ctx, 0);
             return;
+        }
+
+        static const bool padLog = std::getenv("VENDETTA_PADLOG") != nullptr;
+        static uint32_t lastButtons[kPadPortCount][kPadSlotCount] = {{0x10000u, 0x10000u, 0x10000u, 0x10000u},
+                                                                      {0x10000u, 0x10000u, 0x10000u, 0x10000u}}; // so the first read is logged too
+        const uint32_t buttons = (static_cast<uint32_t>(data[2]) << 8) | data[3];
+        if (padLog && buttons != lastButtons[port & 1][slot & 3])
+        {
+            std::cerr << "[padlog] scePadRead port=" << port << " slot=" << slot << " buttons(active low)=0x" << std::hex
+                      << buttons << std::dec << std::endl;
+            lastButtons[port & 1][slot & 3] = buttons;
         }
 
         PS2_IF_AGRESSIVE_LOGS({
@@ -685,17 +820,62 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 
+    // scePadSetActAlign(port, slot, align[6]): which byte of scePadSetActDirect's data drives which motor (0 = the
+    // small motor, 1 = the large one, 0xFF = none). Def Jam Vendetta: {0, 1, 0xFF ...} (0x29A380).
     void scePadSetActAlign(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)rdram;
         (void)runtime;
+        const uint8_t *align = getConstMemPtr(rdram, getRegU32(ctx, 6));
+        std::lock_guard<std::mutex> lock(g_padStateMutex);
+        PadPortState *portState = lookupPadPortStateLocked(static_cast<int>(getRegU32(ctx, 4)),
+                                                           static_cast<int>(getRegU32(ctx, 5)));
+        if (!portState || !portState->open || !align)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
+        std::memcpy(portState->actAlign, align, sizeof(portState->actAlign));
+        portState->reqState = 0u;
+        queueExecCmdStateLocked(*portState);
         setReturnS32(ctx, 1);
     }
 
+    // scePadSetActDirect(port, slot, data[6]): the motors now — the small one on / off, the large one 0-255 — to the
+    // PC controller behind the pad (ps2_pad_rumble). VENDETTA_PADLOG=1 logs each change.
     void scePadSetActDirect(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)rdram;
         (void)runtime;
+        const int port = static_cast<int>(getRegU32(ctx, 4));
+        const int slot = static_cast<int>(getRegU32(ctx, 5));
+        const uint8_t *data = getConstMemPtr(rdram, getRegU32(ctx, 6));
+        bool smallMotor = false;
+        uint8_t largeMotor = 0u;
+        {
+            std::lock_guard<std::mutex> lock(g_padStateMutex);
+            const PadPortState *portState = lookupPadPortStateLocked(port, slot);
+            if (!portState || !portState->open || !portState->connected || !data)
+            {
+                setReturnS32(ctx, 0);
+                return;
+            }
+            for (size_t i = 0; i < sizeof(portState->actAlign); ++i)
+            {
+                if (portState->actAlign[i] == 0u)
+                    smallMotor = data[i] != 0u;
+                else if (portState->actAlign[i] == 1u)
+                    largeMotor = data[i];
+            }
+        }
+        static const bool padLog = std::getenv("VENDETTA_PADLOG") != nullptr;
+        static int lastMotors[kPadPortCount][kPadSlotCount] = {{-1, -1, -1, -1}, {-1, -1, -1, -1}};
+        const int motors = (smallMotor ? 0x100 : 0) | largeMotor;
+        if (padLog && motors != lastMotors[port & 1][slot & 3])
+        {
+            std::cerr << "[padlog] scePadSetActDirect port=" << port << " slot=" << slot << " small=" << smallMotor
+                      << " large=" << static_cast<int>(largeMotor) << std::endl;
+            lastMotors[port & 1][slot & 3] = motors;
+        }
+        ps2_pad_rumble::set(port, slot, smallMotor, largeMotor);
         setReturnS32(ctx, 1);
     }
 
@@ -818,7 +998,7 @@ namespace ps2_stubs
             {
                 for (size_t slot = 0; slot < kPadDebugSlotCount; ++slot)
                 {
-                    const PadPortState &src = g_padPorts[port];
+                    const PadPortState &src = g_padPorts[port][slot];
                     PadDebugPortSnapshot &dst = snapshot.ports[port][slot];
                     dst.open = src.open;
                     dst.analogMode = src.analogMode;

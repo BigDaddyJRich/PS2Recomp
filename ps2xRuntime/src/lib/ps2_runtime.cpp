@@ -1,3 +1,7 @@
+#include "runtime/ps2_host_profile.h"
+#include "runtime/ps2_host_settings.h"
+#include "runtime/ps2_pad_rumble.h"
+#include "runtime/ps2_widescreen.h"
 #include "ps2_runtime.h"
 #include "ps2_log.h"
 #include "ps2_stubs.h"
@@ -18,6 +22,7 @@
 #include <stdexcept>
 #include <fstream>
 #include <algorithm>
+#include <cmath>
 #include <array>
 #include <cstring>
 #include <limits>
@@ -26,6 +31,16 @@
 #include <thread>
 #include <unordered_map>
 #include <sstream>
+#if defined(PS2X_HAS_GLFW)
+#define GLFW_INCLUDE_NONE
+#include <GLFW/glfw3.h>
+#include "runtime/ps2_host_window.h"
+#endif
+#if defined(PS2X_HAS_GLFW) && defined(PS2X_HAS_PARALLEL_GS)
+#include "gs/gs_vulkan_present.h"
+#include "ps2_host_input.h"
+#define PS2X_VULKAN_PRESENT 1
+#endif
 
 namespace ps2_stubs
 {
@@ -85,12 +100,32 @@ struct ProgramHeader
     uint32_t align;
 };
 
+void ps2RecordDispatch(char what, uint32_t pc, uint32_t sp, uint32_t ra, int thread); // defined below
+bool ps2DispatchRecording() noexcept;                                                  // defined below
+namespace
+{
+    // VENDETTA_DISPATCHLOG=1: every call, return and thread dispatch into a small ring (the "ended at pc 0" report
+    // prints it). Off by default: two records per guest call were ~2% of the game thread.
+    const bool g_recordDispatches = []
+    {
+        const char *value = std::getenv("VENDETTA_DISPATCHLOG");
+        return value && *value && *value != '0';
+    }();
+}
+
 namespace
 {
     constexpr uint32_t kGuestHeapDefaultBase = 0x00100000u;
     constexpr uint32_t kGuestHeapDefaultAlignment = 16u;
     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
-    constexpr uint32_t kGuestHeapHardLimit = 0x01F00000u;
+    constexpr uint32_t kGuestHeapHardLimit = 0x01FF0000u; // HCTP: ps2_main mallocs up to 0x1FF0000 (main stack above); old-fork CAM fix
+    constexpr uint32_t kGuestLowPoolBase = 0x000A0000u; // see resetGuestHeapLocked
+    constexpr uint32_t kGuestLowPoolSize = 0x0005F000u;
+    // kernel RAM (see Helpers/State.h): interrupt / callback stacks and the runtime's small buffers
+    constexpr uint32_t kKernelCallbackStackFloor = 0x00048000u;
+    constexpr uint32_t kKernelCallbackStackTop = 0x00080000u;
+    constexpr uint32_t kKernelArenaBase = 0x00041000u;
+    constexpr uint32_t kKernelArenaLimit = 0x00048000u;
 
     constexpr uint32_t COP0_CAUSE_EXCCODE_MASK = 0x0000007Cu;
     constexpr uint32_t COP0_CAUSE_BD = 0x80000000u;
@@ -373,10 +408,325 @@ namespace
     }
 }
 
-static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+namespace
 {
-    static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
-    static bool s_hasLatchedInitialFrame = false;
+    int s_frameTextureFilter = TEXTURE_FILTER_BILINEAR;
+    // shown through Vulkan: the newest picture shared with the window's Vulkan device (valid until the next take)
+    const GSGpuFrame *s_sharedFrame = nullptr;
+    // The graphics card's picture: (covered share of the video mode's width) / (share of its height), for the aspect.
+    float s_presentAspectScale = 1.0f;
+
+    // the log's note on the refresh choice
+    const char *refreshChoiceName(int refreshRate)
+    {
+        return refreshRate == ps2_host_settings::kRefreshSmoothest ? " (the smoothest)"
+               : refreshRate == ps2_host_settings::kRefreshAutomatic ? " (automatic)"
+               : refreshRate == 0                                    ? " (the screen's own)"
+                                                                     : "";
+    }
+}
+
+// The window as the settings ask (ps2_host_settings): which screen, maximised, borderless, or fullscreen at a chosen
+// resolution and refresh rate. raylib's own fullscreen asks for any refresh rate (GLFW then takes the screen's highest),
+// so the mode is set again through GLFW, built into raylib on desktops: the rate asked for, or the screen's current one.
+static void applyWindowSettings()
+{
+#if !defined(PLATFORM_VITA)
+    const ps2_host_settings::Settings &settings = ps2_host_settings::get();
+    const int monitorCount = GetMonitorCount();
+    const int monitor = std::clamp(settings.screen - 1, 0, std::max(0, monitorCount - 1));
+    if (settings.screen > monitorCount)
+        std::cerr << "[window] screen " << settings.screen << " not found (" << monitorCount << " screens); using screen "
+                  << (monitor + 1) << std::endl;
+    if (monitorCount > 1 && monitor != GetCurrentMonitor())
+        SetWindowMonitor(monitor);
+    switch (settings.mode)
+    {
+    case ps2_host_settings::WindowMode::Window:
+        if (settings.maximised)
+            MaximizeWindow();
+        break;
+    case ps2_host_settings::WindowMode::Borderless:
+        ToggleBorderlessWindowed();
+        ClearWindowState(FLAG_WINDOW_TOPMOST); // raylib makes it always-on-top; Alt-Tab and other windows should still work
+        break;
+    case ps2_host_settings::WindowMode::Fullscreen:
+    {
+        const int width = settings.fullscreenWidth > 0 ? settings.fullscreenWidth : GetMonitorWidth(monitor);
+        const int height = settings.fullscreenHeight > 0 ? settings.fullscreenHeight : GetMonitorHeight(monitor);
+        SetWindowSize(width, height);
+#if defined(PS2X_HAS_GLFW)
+        // One mode change, straight to the size and rate wanted: raylib's ToggleFullscreen first took the screen's
+        // highest rate, then the rate was set again — two changes, the desktop showing for a moment in between.
+        bool switched = false;
+        int count = 0;
+        GLFWmonitor **monitors = glfwGetMonitors(&count);
+        GLFWwindow *window = glfwGetCurrentContext();
+        if (window && monitors && monitor < count)
+        {
+            // the rates this screen has at this size (GLFW takes the closest one to what is asked)
+            int modeCount = 0;
+            const GLFWvidmode *modes = glfwGetVideoModes(monitors[monitor], &modeCount);
+            std::vector<int> rates;
+            for (int i = 0; i < modeCount; ++i)
+                if (modes[i].width == width && modes[i].height == height &&
+                    std::find(rates.begin(), rates.end(), modes[i].refreshRate) == rates.end())
+                    rates.push_back(modes[i].refreshRate);
+            std::sort(rates.begin(), rates.end());
+            const GLFWvidmode *current = glfwGetVideoMode(monitors[monitor]);
+            // the game makes ~60 pictures a second: automatic / smoothest / the screen's own / a fixed rate
+            // (ps2_host_settings::chooseRefreshRate)
+            const int chosen = ps2_host_settings::chooseRefreshRate(settings.refreshRate, current ? current->refreshRate : 0, rates);
+            const int rate = chosen > 0 ? chosen : GLFW_DONT_CARE;
+            std::cerr << "[window] fullscreen " << width << "x" << height << " at " << rate << " Hz"
+                      << refreshChoiceName(settings.refreshRate)
+                      << "; the screen has";
+            for (int r : rates)
+                std::cerr << " " << r;
+            std::cerr << (rates.empty() ? " no mode of that size" : " Hz") << std::endl;
+            // The screen black before the mode change: the change blanks the screen for a moment, and with the window
+            // still hidden the desktop came back on screen until the game's first picture. A frameless black window
+            // over the whole screen (at its current mode) first, then the change under it.
+            if (current)
+            {
+                const Vector2 at = GetMonitorPosition(monitor);
+                SetWindowState(FLAG_WINDOW_UNDECORATED);
+                SetWindowPosition(static_cast<int>(at.x), static_cast<int>(at.y));
+                SetWindowSize(current->width, current->height);
+                ClearWindowState(FLAG_WINDOW_HIDDEN);
+                for (int i = 0; i < 2; ++i)
+                {
+                    BeginDrawing();
+                    ClearBackground(BLACK);
+                    EndDrawing();
+                }
+            }
+            // Alt-Tab: raylib makes every window with GLFW_AUTO_ICONIFY off, so a fullscreen window (always on top)
+            // stayed over the window Alt-Tab picked. Now losing focus to the player's own switch minimises it and gives
+            // the screen back its own mode (clicking it or Alt-Tab back restores both); another program taking the
+            // front by itself (Copilot's Quick View at a mode change) leaves it fullscreen (ps2_host_window).
+            ps2_host_window::minimiseOnlyWhenThePlayerSwitchesAway(window);
+            glfwSetWindowMonitor(window, monitors[monitor], 0, 0, width, height, rate);
+            switched = true;
+        }
+        if (!switched)
+            ToggleFullscreen();
+#else
+        ToggleFullscreen();
+#endif
+        HideCursor(); // the game has no pointer; the debug panel (F1) shows it again while open
+        break;
+    }
+    }
+    std::cerr << "[window] " << ps2_host_settings::windowModeName(settings.mode) << " on screen " << (monitor + 1) << " of "
+              << monitorCount << "; the screen now " << GetMonitorWidth(monitor) << "x" << GetMonitorHeight(monitor) << " at "
+              << GetMonitorRefreshRate(monitor) << " Hz; vsync " << (settings.vsync ? "on" : "off") << std::endl;
+#endif
+}
+
+#if defined(PS2X_VULKAN_PRESENT)
+namespace
+{
+    // The game's window shown through Vulkan (vulkanPresentWanted): a GLFW window without OpenGL (raylib's window is
+    // made too and stays hidden: raylib still plays the sound)
+    GLFWwindow *s_vulkanWindow = nullptr;
+    std::unique_ptr<VulkanPresenter> s_presenter;
+
+    // The refresh rate for a fullscreen mode: the rate asked for; "smoothest" = the highest multiple of 60 Hz the screen
+    // has at that size (else its highest); 0 = the screen's current rate.
+    int fullscreenRate(GLFWmonitor *monitor, int width, int height, const ps2_host_settings::Settings &settings,
+                       std::vector<int> &rates)
+    {
+        int modeCount = 0;
+        const GLFWvidmode *modes = glfwGetVideoModes(monitor, &modeCount);
+        for (int i = 0; i < modeCount; ++i)
+            if (modes[i].width == width && modes[i].height == height &&
+                std::find(rates.begin(), rates.end(), modes[i].refreshRate) == rates.end())
+                rates.push_back(modes[i].refreshRate);
+        std::sort(rates.begin(), rates.end());
+        const GLFWvidmode *current = glfwGetVideoMode(monitor);
+        const int chosen = ps2_host_settings::chooseRefreshRate(settings.refreshRate, current ? current->refreshRate : 0, rates);
+        return chosen > 0 ? chosen : GLFW_DONT_CARE;
+    }
+
+    // Made hidden, placed as the settings ask (window / maximised / borderless / fullscreen at its resolution and
+    // rate, on its screen), painted black, then shown - for fullscreen the black window covers the screen first and
+    // the mode changes under it (no desktop between). In fullscreen, losing focus to the player's own switch (Alt-Tab)
+    // minimises it; another program taking the front by itself doesn't (ps2_host_window).
+    GLFWwindow *createVulkanWindow(const char *title)
+    {
+        const ps2_host_settings::Settings &settings = ps2_host_settings::get();
+        glfwDefaultWindowHints();
+        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+        glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+        glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
+        glfwWindowHint(GLFW_AUTO_ICONIFY, GLFW_TRUE);
+        int count = 0;
+        GLFWmonitor **monitors = glfwGetMonitors(&count);
+        const int index = std::clamp(settings.screen - 1, 0, std::max(0, count - 1));
+        GLFWmonitor *monitor = count > 0 ? monitors[index] : glfwGetPrimaryMonitor();
+        const GLFWvidmode *current = monitor ? glfwGetVideoMode(monitor) : nullptr;
+        int monitorX = 0, monitorY = 0, workX = 0, workY = 0, workW = 1280, workH = 720;
+        if (monitor)
+        {
+            glfwGetMonitorPos(monitor, &monitorX, &monitorY);
+            glfwGetMonitorWorkarea(monitor, &workX, &workY, &workW, &workH);
+        }
+        const int screenW = current ? current->width : 1280, screenH = current ? current->height : 720;
+        const int windowW = std::min(1280, workW), windowH = std::min(720, workH);
+        GLFWwindow *window = glfwCreateWindow(windowW, windowH, title, nullptr, nullptr);
+        if (!window)
+            return nullptr;
+        ps2_host_window::minimiseOnlyWhenThePlayerSwitchesAway(window);
+
+        switch (settings.mode)
+        {
+        case ps2_host_settings::WindowMode::Window:
+            glfwSetWindowPos(window, workX + (workW - windowW) / 2, workY + (workH - windowH) / 2);
+            if (settings.maximised)
+                glfwMaximizeWindow(window);
+            glfwShowWindow(window);
+            glfwFocusWindow(window); // to the front (started from another program, Windows may leave it behind)
+            break;
+        case ps2_host_settings::WindowMode::Borderless:
+            glfwSetWindowAttrib(window, GLFW_DECORATED, GLFW_FALSE);
+            glfwSetWindowPos(window, monitorX, monitorY);
+            glfwSetWindowSize(window, screenW, screenH);
+            glfwShowWindow(window);
+            glfwFocusWindow(window);
+            break;
+        case ps2_host_settings::WindowMode::Fullscreen:
+        {
+            const int width = settings.fullscreenWidth > 0 ? settings.fullscreenWidth : screenW;
+            const int height = settings.fullscreenHeight > 0 ? settings.fullscreenHeight : screenH;
+            std::vector<int> rates;
+            const int rate = monitor ? fullscreenRate(monitor, width, height, settings, rates) : GLFW_DONT_CARE;
+            // the black cover first, the mode change under it
+            glfwSetWindowAttrib(window, GLFW_DECORATED, GLFW_FALSE);
+            glfwSetWindowPos(window, monitorX, monitorY);
+            glfwSetWindowSize(window, screenW, screenH);
+            glfwShowWindow(window);
+            // in front before the mode change: Windows only lets the window in front take the screen over (left behind,
+            // the game ran in the background and the screen kept its own rate)
+            glfwFocusWindow(window);
+            paintWindowBlack(window);
+            glfwPollEvents();
+            std::cerr << "[window] fullscreen " << width << "x" << height << " at " << rate << " Hz"
+                      << refreshChoiceName(settings.refreshRate) << "; the screen has";
+            for (int r : rates)
+                std::cerr << " " << r;
+            std::cerr << (rates.empty() ? " no mode of that size" : " Hz") << std::endl;
+            if (monitor)
+                glfwSetWindowMonitor(window, monitor, 0, 0, width, height, rate);
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_HIDDEN); // the game has no pointer
+            break;
+        }
+        }
+        paintWindowBlack(window);
+        glfwPollEvents();
+        const GLFWvidmode *now = monitor ? glfwGetVideoMode(monitor) : nullptr;
+        std::cerr << "[window] " << ps2_host_settings::windowModeName(settings.mode) << " (Vulkan) on screen " << (index + 1)
+                  << " of " << count << "; the screen now " << (now ? now->width : 0) << "x" << (now ? now->height : 0)
+                  << " at " << (now ? now->refreshRate : 0) << " Hz; vsync " << (settings.vsync ? "on" : "off") << std::endl;
+        return window;
+    }
+}
+#endif
+
+// VENDETTA_WINDOW_PACING=timer: the window refreshes on its own 60-a-second timer, as before (else once per new picture)
+static bool windowTimerPacing()
+{
+    static const bool timer = []
+    {
+        const char *value = std::getenv("VENDETTA_WINDOW_PACING");
+        return value && std::string(value) == "timer";
+    }();
+    return timer;
+}
+
+// The graphics card's newest picture (VENDETTA_GS=gpu): the texture takes its size, which grows with super-sampling.
+static bool UploadGpuFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+{
+    static uint64_t s_lastSeq = 0u;
+    static uint32_t s_width = 0u;
+    static uint32_t s_height = 0u;
+    const uint64_t previousSeq = s_lastSeq;
+    const GSGpuFrame *frame = rt->gs().takeGpuFrame(s_lastSeq);
+    if (frame && previousSeq != 0u && frame->seq > previousSeq + 1u)
+        ps2_host_profile::count(ps2_host_profile::WindowSkips, frame->seq - previousSeq - 1u);
+    if (frame && frame->shared)
+    {
+        // shown by the Vulkan presenter: nothing to upload here
+        s_sharedFrame = frame;
+        s_width = frame->width;
+        s_height = frame->height;
+        if (frame->modeWidth != 0u && frame->modeHeight != 0u && frame->internalWidth != 0u && frame->internalHeight != 0u)
+            s_presentAspectScale = (static_cast<float>(frame->internalWidth) / static_cast<float>(frame->modeWidth)) /
+                                   (static_cast<float>(frame->internalHeight) / static_cast<float>(frame->modeHeight));
+    }
+    else if (frame)
+    {
+        if (frame->width == 0u || frame->height == 0u)
+        {
+            // both display circuits off (after a GS reset until the game sets its display up again): black
+            std::vector<uint8_t> black(static_cast<size_t>(tex.width) * static_cast<size_t>(tex.height) * 4u, 0u);
+            for (size_t i = 3u; i < black.size(); i += 4u)
+                black[i] = 0xFFu;
+            UpdateTexture(tex, black.data());
+            s_width = static_cast<uint32_t>(tex.width);
+            s_height = static_cast<uint32_t>(tex.height);
+            s_presentAspectScale = 1.0f;
+        }
+        else
+        {
+            if (static_cast<uint32_t>(tex.width) != frame->width || static_cast<uint32_t>(tex.height) != frame->height)
+            {
+                UnloadTexture(tex);
+                Image blank = GenImageColor(static_cast<int>(frame->width), static_cast<int>(frame->height), BLACK);
+                tex = LoadTextureFromImage(blank);
+                UnloadImage(blank);
+                SetTextureFilter(tex, s_frameTextureFilter);
+            }
+            UpdateTexture(tex, frame->rgba.data());
+            s_width = frame->width;
+            s_height = frame->height;
+            if (frame->modeWidth != 0u && frame->modeHeight != 0u && frame->internalWidth != 0u && frame->internalHeight != 0u)
+                s_presentAspectScale = (static_cast<float>(frame->internalWidth) / static_cast<float>(frame->modeWidth)) /
+                                       (static_cast<float>(frame->internalHeight) / static_cast<float>(frame->modeHeight));
+        }
+    }
+    outWidth = (s_width != 0u) ? s_width : static_cast<uint32_t>(tex.width);
+    outHeight = (s_height != 0u) ? s_height : static_cast<uint32_t>(tex.height);
+    return frame != nullptr;
+}
+
+// true = a new picture was uploaded
+static bool UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+{
+    // the scaling filter can change at any time (the debug panel); FSR is done on the graphics card, the window then
+    // only places its picture (drawn at exactly the window's size)
+    const int wantedFilter =
+        rt->gs().presentFilter() == GSPresentFilter::Nearest ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR;
+    if (wantedFilter != s_frameTextureFilter)
+    {
+        s_frameTextureFilter = wantedFilter;
+        SetTextureFilter(tex, s_frameTextureFilter);
+    }
+    if (rt->gs().showsGpuPicture())
+        return UploadGpuFrame(tex, rt, outWidth, outHeight);
+    // back from the graphics card's picture (VENDETTA_GS=both, switched in the debug panel): the CPU picture's texture
+    if (tex.width != FB_WIDTH || tex.height != FB_HEIGHT)
+    {
+        UnloadTexture(tex);
+        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLACK);
+        tex = LoadTextureFromImage(blank);
+        UnloadImage(blank);
+        SetTextureFilter(tex, s_frameTextureFilter);
+        s_presentAspectScale = 1.0f;
+    }
+    // The newest picture the game thread presented (GS::presentAtSettlePoint), converted here; nothing new = keep
+    // showing the last one. The main thread never touches the renderer.
+    static uint64_t s_lastPresentedSeq = std::numeric_limits<uint64_t>::max();
     static uint32_t s_lastDisplayFbp = std::numeric_limits<uint32_t>::max();
     static uint32_t s_lastSourceFbp = std::numeric_limits<uint32_t>::max();
     static bool s_lastPreferred = false;
@@ -386,35 +736,29 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static std::vector<uint8_t> s_scratch;
     static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
 
-    const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
-    const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
-    if (needsLatch)
-    {
-        rt->gs().latchHostPresentationFrame();
-        s_lastPresentationTick = currentTick;
-        s_hasLatchedInitialFrame = true;
-    }
-    else if (s_hasUploadedFrame)
-    {
-        outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
-        outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
-        return;
-    }
-
-    s_scratch.clear();
     uint32_t width = 0u;
     uint32_t height = 0u;
     uint32_t displayFbp = 0u;
     uint32_t sourceFbp = 0u;
     bool usedPreferredDisplaySource = false;
-    if (!rt->gs().copyLatchedHostPresentationFrame(s_scratch,
+    const bool fresh = rt->gs().takePresentedFrame(s_lastPresentedSeq,
+                                                   s_scratch,
                                                    width,
                                                    height,
                                                    &displayFbp,
                                                    &sourceFbp,
-                                                   &usedPreferredDisplaySource))
+                                                   &usedPreferredDisplaySource);
+    if (!fresh && s_hasUploadedFrame)
     {
-        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
+        outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
+        outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
+        return false;
+    }
+    if (!fresh || s_scratch.empty() || width == 0u || height == 0u)
+    {
+        // nothing to show (no picture yet, or both display circuits off — after a GS reset until the game sets its
+        // display up again): black, as on the console
+        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLACK);
         UpdateTexture(tex, blank.data);
         UnloadImage(blank);
         outWidth = FB_WIDTH;
@@ -422,7 +766,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         s_lastWidth = outWidth;
         s_lastHeight = outHeight;
         s_hasUploadedFrame = true;
-        return;
+        return true;
     }
 
     PS2_IF_AGRESSIVE_LOGS({
@@ -435,7 +779,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
             height != s_lastHeight)
         {
             std::cout << "[frame:upload] idx=" << s_uploadDebugCount
-                      << " tick=" << currentTick
+                      << " seq=" << s_lastPresentedSeq
                       << " displayFbp=" << displayFbp
                       << " sourceFbp=" << sourceFbp
                       << " size=" << width << "x" << height
@@ -475,6 +819,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     outWidth = width;
     outHeight = height;
     s_hasUploadedFrame = true;
+    return true;
 }
 
 PS2Runtime::PS2Runtime()
@@ -503,8 +848,8 @@ PS2Runtime::PS2Runtime()
     m_guestHeapLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
     m_guestHeapSuggestedBase = kGuestHeapDefaultBase;
     m_guestHeapConfigured = false;
-    m_asyncCallbackStackFloor = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-    m_asyncCallbackStackTop = PS2_RAM_SIZE;
+    m_asyncCallbackStackFloor = kKernelCallbackStackFloor;
+    m_asyncCallbackStackTop = kKernelCallbackStackTop;
 }
 
 void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
@@ -599,6 +944,12 @@ ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx,
     return m_iopSubsystem->handleRpc(request);
 }
 
+bool PS2Runtime::sendIopSifCommand(uint8_t *rdram, R5900Context *ctx, uint32_t commandId, const void *packet, size_t packetSize)
+{
+    auto scope = m_iopHost->enterCall(ctx, rdram);
+    return m_iopSubsystem->handleSifCommand(commandId, packet, packetSize);
+}
+
 void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer)
 {
     auto scope = m_iopHost->enterCall(nullptr, rdram);
@@ -607,6 +958,7 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
 
 void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
 {
+    ps2_host_profile::Scope profile(ps2_host_profile::Iop);
     m_iopSubsystem->runEeCycles(eeCycles);
 }
 
@@ -665,45 +1017,32 @@ bool PS2Runtime::syncCoreSubsystems()
     }
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
-    m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
-                                    { m_gs.processGIFPacket(data, size); });
+    m_gifArbiter.setProcessPacketFn([this](GifPathId path, const uint8_t *data, uint32_t size)
+                                    { m_gs.processGIFPacket(data, size, static_cast<uint8_t>(path)); });
     m_memory.setGifArbiter(&m_gifArbiter);
+    m_memory.setChainWorker(&m_chain);
+    // VU1 runs where the VIF1 stream runs (the chain worker, or the game thread when inline): FBRST's DE1 / TE1 come
+    // from the kick, and VPU_STAT's stop bits go back through the chain.
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
-                                     if (!cpuContext)
-                                     {
-                                         cpuContext = &m_cpuContext;
-                                     }
-                                     m_vu1.state().dBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
-                                     m_vu1.state().tBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     const uint32_t fbrst = m_chain.kickFbrst();
+                                     m_vu1.state().dBitEnabled = (fbrst & (1u << 10)) != 0u;
+                                     m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
-                                     cpuContext->vu0_vpu_stat =
-                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
-                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+                                     m_chain.noteVu1Run((m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+                                                        (m_vu1.state().stoppedByT ? 0x0400u : 0u)); });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
-                                     if (!cpuContext)
-                                     {
-                                         cpuContext = &m_cpuContext;
-                                     }
-                                     m_vu1.state().dBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
-                                     m_vu1.state().tBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     const uint32_t fbrst = m_chain.kickFbrst();
+                                     m_vu1.state().dBitEnabled = (fbrst & (1u << 10)) != 0u;
+                                     m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                   m_gs, &m_memory, top, itop, 65536);
-                                     cpuContext->vu0_vpu_stat =
-                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
-                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+                                     m_chain.noteVu1Run((m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+                                                        (m_vu1.state().stoppedByT ? 0x0400u : 0u)); });
     resetIop();
     m_vu0.reset();
     m_vu1.reset();
@@ -731,12 +1070,70 @@ bool PS2Runtime::initialize(const char *title)
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        const ps2_host_settings::Settings &settings = ps2_host_settings::get();
+        // Made hidden, sized / made fullscreen as the settings ask, painted black, then shown: a window shown at once
+        // appeared as a blank 640 x 448 box in the middle of the screen before going fullscreen.
+        bool raylibMade = false;
+#if defined(PS2X_VULKAN_PRESENT)
+        GSGpuRenderer *gpu = m_gs.gpuRendererForSettings();
+        if (vulkanPresentWanted() && gpu)
+        {
+            // raylib's window made hidden and kept so (sound); the game's window is the Vulkan one, with its presenter
+            // made now: if either can't be, raylib's window is the game's as before (and the CPU renderer always)
+            SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_HIDDEN);
+            InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+            raylibMade = true;
+            glfwSwapInterval(0);
+            s_vulkanWindow = createVulkanWindow(title);
+            std::string whyNot = "no window";
+            if (s_vulkanWindow)
+            {
+                s_presenter = std::make_unique<VulkanPresenter>();
+                if (!s_presenter->init(s_vulkanWindow, gpu->deviceName(), settings.vsync, whyNot))
+                {
+                    s_presenter.reset();
+                    glfwDestroyWindow(s_vulkanWindow);
+                    s_vulkanWindow = nullptr;
+                }
+            }
+            if (s_vulkanWindow)
+                host_input::useWindow(s_vulkanWindow); // the keyboard and controllers read from it
+            else
+            {
+                std::cerr << "[present] the Vulkan window couldn't start (" << whyNot << "): raylib's window" << std::endl;
+                stopSharedPictures();
+                glfwSwapInterval(settings.vsync ? 1 : 0);
+            }
+        }
+        if (!s_vulkanWindow)
+        {
+#endif
+        if (!raylibMade)
+        {
+            SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_HIDDEN | (settings.vsync ? FLAG_VSYNC_HINT : 0u));
+            InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        }
+        applyWindowSettings();
+        BeginDrawing();
+        ClearBackground(BLACK);
+        EndDrawing();
+        if (IsWindowState(FLAG_WINDOW_HIDDEN))
+            ClearWindowState(FLAG_WINDOW_HIDDEN);
+        for (int i = 0; i < 2; ++i) // a shown window keeps white until it is presented to
+        {
+            BeginDrawing();
+            ClearBackground(BLACK);
+            EndDrawing();
+        }
+#if defined(PS2X_VULKAN_PRESENT)
+        }
+#endif
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+        if (IsAudioDeviceReady())
+            SetMasterVolume(static_cast<float>(settings.volume) / 100.0f);
 #endif
-        SetTargetFPS(60);
+        SetTargetFPS(windowTimerPacing() ? 60 : 0);
         if (m_debugUiInitCallback)
         {
             m_debugUiInitCallback(*this, m_debugUiUserData);
@@ -971,9 +1368,8 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
     }
     {
         std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
-        const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-        m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
-        m_asyncCallbackStackTop = PS2_RAM_SIZE;
+        m_asyncCallbackStackFloor = kKernelCallbackStackFloor;
+        m_asyncCallbackStackTop = kKernelCallbackStackTop;
     }
 
     LoadedModule module;
@@ -1011,6 +1407,17 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
 
     RUNTIME_LOG("ELF file loaded successfully. Entry point: 0x" << std::hex << m_cpuContext.pc << std::dec);
     return true;
+}
+
+void ps2_game_overrides::setWindowTitle(PS2Runtime &runtime, std::string_view title)
+{
+    (void)runtime;
+    if (IsWindowReady())
+        SetWindowTitle(std::string(title).c_str());
+#if defined(PS2X_VULKAN_PRESENT)
+    if (s_vulkanWindow)
+        glfwSetWindowTitle(s_vulkanWindow, std::string(title).c_str());
+#endif
 }
 
 const PS2Runtime::IoPaths &PS2Runtime::getIoPaths()
@@ -1316,6 +1723,16 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
             << " policy=" << static_cast<uint32_t>(policy)
             << " trace=" << formatDispatchHistory()
             << std::dec;
+        // which guest thread it was and what every thread was doing (callback nesting = invocationDepth)
+        if (m_eeScheduler)
+        {
+            const EeKernelSnapshot snap = m_eeScheduler->snapshot();
+            oss << " runningThread=" << snap.runningThreadId << " threads:";
+            for (const EeThreadSnapshot &t : snap.threads)
+                oss << " [" << t.id << " entry=0x" << std::hex << t.entry << " pc=0x" << t.pc << " ra=0x" << t.ra
+                    << std::dec << " st=" << static_cast<int>(t.status) << " wait=" << static_cast<int>(t.waitReason)
+                    << "/" << t.waitId << " depth=" << t.invocationDepth << "]";
+        }
 
         static std::mutex s_missingFunctionLogMutex;
         {
@@ -1396,14 +1813,32 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     RecompiledFunction targetFn = lookupFunction(targetPc);
     const uint32_t entryPc = ctx->pc;
-    targetFn(rdram, ctx, this);
+    const uint32_t entrySp = getRegU32(ctx, 29);
+    const uint32_t entryRa = getRegU32(ctx, 31);
+    if (!g_recordDispatches)
+    {
+        targetFn(rdram, ctx, this);
+    }
+    else
+    {
+        const int thread = m_eeScheduler ? m_eeScheduler->currentThreadId() : 0;
+        ps2RecordDispatch('C', targetPc, entrySp, entryRa, thread);
+        targetFn(rdram, ctx, this);
+        ps2RecordDispatch('R', ctx->pc, getRegU32(ctx, 29), getRegU32(ctx, 31), thread);
+    }
 
     if (isStopRequested() || ctx->pc == 0u)
     {
         return false;
     }
 
-    if (ctx->pc == entryPc)
+    // A native stub returns without touching pc (it is still the call's target) and leaves sp / ra as they were.
+    // A pc equal to the target can also mean a DEFERRED call deeper down: the callee (or something it called)
+    // reached a call of this same function, the call-site checkpoint fired, and pc names that not-yet-made call
+    // — with the inner frame's sp and the inner return address in ra. Taking that for "returned" resumed the caller
+    // on the inner frame (Def Jam Vendetta's recursive sound routine 0x1CEB18: the caller 0x1CEAF8 loaded ra from
+    // another frame, returned to 0 and the sound thread ended — the match freezes).
+    if (ctx->pc == entryPc && getRegU32(ctx, 29) == entrySp && getRegU32(ctx, 31) == entryRa)
     {
         ctx->pc = fallthroughPc;
     }
@@ -1439,11 +1874,42 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
 
     m_vu0.reset();
     copyVu0ContextToState(ctx, m_vu0.state());
+    // TEMP diag (HCTP_VU0LOG=1): first 24 VCALLMS - code words at the start PC, vf1/vf2 in, vf28-30 out (old fork [vu0io])
+    static const bool s_vu0Log = std::getenv("HCTP_VU0LOG") != nullptr;
+    static uint32_t s_vu0Calls = 0u;
+    static __m128 s_vu0Before[32];
+    const bool logThis = s_vu0Log && s_vu0Calls++ < 24u;
+    auto logVf = [ctx](const char *tag, int r) {
+        alignas(16) float f[4];
+        _mm_store_ps(f, ctx->vu0_vf[r]);
+        std::fprintf(stderr, " %s%d=(%g,%g,%g,%g)", tag, r, f[0], f[1], f[2], f[3]);
+    };
+    if (logThis)
+    {
+        uint32_t w[4];
+        std::memcpy(w, vu0Code + startPC, 16);
+        std::fprintf(stderr, "[vu0io] in pc=0x%x code=%08x %08x %08x %08x", startPC, w[0], w[1], w[2], w[3]);
+        logVf("vf", 1); logVf("vf", 2); logVf("vf", 20);
+        std::fprintf(stderr, "\n");
+        for (int r = 0; r < 32; ++r)
+            s_vu0Before[r] = ctx->vu0_vf[r];
+    }
     m_vu0.execute(vu0Code, PS2_VU0_CODE_SIZE,
                   vu0Data, PS2_VU0_DATA_SIZE,
                   m_gs, &m_memory,
                   startPC, 0u, ctx->vu0_itop, 4096);
     copyVu0StateToContext(m_vu0.state(), ctx);
+    if (logThis)
+    {
+        std::fprintf(stderr, "[vu0io] ran cycles=%llu endpc=0x%x changed:", static_cast<unsigned long long>(m_vu0.state().cycles), m_vu0.state().pc);
+        for (int r = 1; r < 32; ++r)
+            if (std::memcmp(&s_vu0Before[r], &ctx->vu0_vf[r], 16) != 0)
+                std::fprintf(stderr, " vf%d", r);
+        std::fprintf(stderr, " vi1-4=%d,%d,%d,%d\n", ctx->vi[1], ctx->vi[2], ctx->vi[3], ctx->vi[4]);
+        std::fprintf(stderr, "[vu0io] out");
+        logVf("vf", 28); logVf("vf", 29); logVf("vf", 30); logVf("vf", 31);
+        std::fprintf(stderr, "\n");
+    }
 }
 
 void PS2Runtime::vu0StartMicroProgram(uint8_t *rdram, R5900Context *ctx, uint32_t address)
@@ -1662,6 +2128,13 @@ void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
     if (limit > base)
     {
         m_guestHeapBlocks.push_back({base, limit - base, true});
+    }
+    // HCTP (old-fork fix, Oct 10/11): the game's ymem heap grabs all user RAM with one big malloc, so later libc
+    // mallocs (strtod Bigint -> endless _lshift loop) got NULL. Unused kernel RAM 0xA0000-0xFF000 is a fallback pool,
+    // kept LAST so first-fit only uses it once the main heap is full (not address-adjacent: never coalesced with it).
+    if (base > kGuestLowPoolBase + kGuestLowPoolSize)
+    {
+        m_guestHeapBlocks.push_back({kGuestLowPoolBase, kGuestLowPoolSize, true});
     }
 
     m_guestHeapBase = base;
@@ -1945,10 +2418,94 @@ uint32_t PS2Runtime::guestRealloc(uint32_t guestAddr, uint32_t newSize, uint32_t
     return newAddr;
 }
 
+// A ring of the last dispatches with the stack pointer and return address (what = 'D' dispatcher, 'C' call,
+// 'R' back from a call) — printed when a guest thread ends unexpectedly.
+namespace
+{
+    struct DispatchRecord
+    {
+        uint32_t pc, sp, ra;
+        char what;
+        int thread;
+    };
+    std::array<DispatchRecord, 64> g_dispatchRecords{};
+    uint32_t g_dispatchRecordNext = 0u;
+}
+
+void ps2RecordDispatch(char what, uint32_t pc, uint32_t sp, uint32_t ra, int thread)
+{
+    g_dispatchRecords[g_dispatchRecordNext++ % g_dispatchRecords.size()] = DispatchRecord{pc, sp, ra, what, thread};
+}
+
+bool ps2DispatchRecording() noexcept
+{
+    return g_recordDispatches;
+}
+
+std::string ps2FormatDispatchRecords()
+{
+    if (!g_recordDispatches)
+        return " (off: VENDETTA_DISPATCHLOG=1 records the last calls, returns and dispatches)";
+    std::ostringstream out;
+    for (uint32_t i = 0; i < g_dispatchRecords.size(); ++i)
+    {
+        const DispatchRecord &r = g_dispatchRecords[(g_dispatchRecordNext + i) % g_dispatchRecords.size()];
+        if (r.what == 0)
+            continue;
+        out << ' ' << r.what << r.thread << ":pc=" << std::hex << r.pc << ",sp=" << r.sp << ",ra=" << r.ra << std::dec;
+    }
+    return out.str();
+}
+
+std::string PS2Runtime::dispatchTrace() const
+{
+    return formatDispatchHistory();
+}
+
+uint32_t PS2Runtime::kernelMalloc(uint32_t size, uint32_t alignment)
+{
+    if (size == 0u)
+        return 0u;
+    const uint32_t align = std::max<uint32_t>(16u, alignment);
+    const uint32_t need = (size + 15u) & ~15u;
+    {
+        std::lock_guard<std::mutex> lock(m_kernelArenaMutex);
+        uint32_t cursor = kKernelArenaBase;
+        for (const auto &[addr, blockSize] : m_kernelArenaBlocks)
+        {
+            const uint32_t start = (cursor + align - 1u) & ~(align - 1u);
+            if (start + need <= addr)
+                break;
+            cursor = addr + blockSize;
+        }
+        const uint32_t start = (cursor + align - 1u) & ~(align - 1u);
+        bool fits = start + need <= kKernelArenaLimit;
+        for (const auto &[addr, blockSize] : m_kernelArenaBlocks)
+            if (addr < start + need && start < addr + blockSize)
+                fits = false;
+        if (fits)
+        {
+            m_kernelArenaBlocks.emplace(start, need);
+            return start;
+        }
+        static uint32_t overflows = 0u;
+        if (++overflows <= 20u)
+            std::cerr << "[kernel] kernelMalloc area full (" << m_kernelArenaBlocks.size() << " blocks) - " << size
+                      << " bytes from the guest heap instead (it may share RAM with the game's own heap)" << std::endl;
+    }
+    return guestMalloc(size, alignment);
+}
+
 void PS2Runtime::guestFree(uint32_t guestAddr)
 {
     if (guestAddr == 0u)
     {
+        return;
+    }
+    if (guestAddr >= kKernelArenaBase && guestAddr < kKernelArenaLimit)
+    {
+        std::lock_guard<std::mutex> lock(m_kernelArenaMutex);
+        m_kernelArenaBlocks.erase(guestAddr);
         return;
     }
 
@@ -2039,10 +2596,36 @@ uint16_t PS2Runtime::Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     }
 }
 
+namespace
+{
+    bool isGsCsrAddress(uint32_t vaddr) { return (vaddr & 0x1FFFFFF8u) == 0x12001000u; }
+}
+
+// A CSR read at a site registered as using only CSR.FIELD (the chain's exemption): no fence. Under
+// VENDETTA_CHAIN_VERIFY the value is compared with a fenced read (FIELD must match; SIGNAL / FINISH may lag).
+template <typename T, typename Read>
+T PS2Runtime::loadCsrExempt(Read read)
+{
+    ps2_host_profile::count(ps2_host_profile::ChainCsrExempt);
+    PS2Memory::skipNextCsrFence();
+    const T value = read();
+    if (m_chain.verifyExemptReads())
+    {
+        const T fenced = read();
+        if (((value ^ fenced) & static_cast<T>(0x2000u)) != 0u)
+            ps2_host_profile::count(ps2_host_profile::ChainVerifyMismatch);
+        else if (((value ^ fenced) & static_cast<T>(0x3u)) != 0u)
+            ps2_host_profile::count(ps2_host_profile::ChainCsrExemptDiff);
+    }
+    return value;
+}
+
 uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
     try
     {
+        if (isGsCsrAddress(vaddr) && m_chain.async() && m_chain.csrReadExempt(ctx->pc))
+            return loadCsrExempt<uint32_t>([&]() { return m_memory.read32(vaddr); });
         return m_memory.read32(vaddr);
     }
     catch (const std::exception &)
@@ -2056,6 +2639,8 @@ uint64_t PS2Runtime::Load64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
     try
     {
+        if (isGsCsrAddress(vaddr) && m_chain.async() && m_chain.csrReadExempt(ctx->pc))
+            return loadCsrExempt<uint64_t>([&]() { return m_memory.read64(vaddr); });
         return m_memory.read64(vaddr);
     }
     catch (const std::exception &)
@@ -2187,6 +2772,14 @@ void PS2Runtime::requestStop()
     {
         m_eeScheduler->requestStop();
     }
+    m_chain.wakeWaiters();    // a game thread held by the chain throttle sees the stop
+    m_gs.wakeRasterWaiters(); // ... or by the GS thread's flip throttle
+}
+
+R5900Context *PS2Runtime::currentEeContext()
+{
+    R5900Context *ctx = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+    return ctx ? ctx : &m_cpuContext;
 }
 
 bool PS2Runtime::isStopRequested() const
@@ -2339,8 +2932,12 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
     raiseCop0Exception(ctx, EXCEPTION_INTEGER_OVERFLOW);
 }
 
+void ps2HostPreferPerformance();      // Kernel/HostPower.cpp
+void ps2HostPreferPerformanceCores(); // Kernel/HostPower.cpp
+
 void PS2Runtime::run()
 {
+    ps2HostPreferPerformance();
     m_stopRequested.store(false, std::memory_order_relaxed);
     ps2_stubs::resetSifState();
     resetIop();
@@ -2361,12 +2958,34 @@ void PS2Runtime::run()
     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
+    // The picture is scaled to the window by a non-whole factor (a 224-line field on a 1440-line screen is ×6.4), so
+    // blocky nearest-pixel scaling makes uneven blocks: smoothed by default (VENDETTA_FILTER: fsr on the graphics card,
+    // bilinear, or nearest = the blocky look).
+    {
+        const GSPresentFilter filter = m_gs.presentFilter();
+        s_frameTextureFilter = filter == GSPresentFilter::Nearest ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR;
+        SetTextureFilter(frameTex, s_frameTextureFilter);
+        std::cerr << "[present] filter="
+                  << (filter == GSPresentFilter::Fsr ? "fsr" : filter == GSPresentFilter::Nearest ? "nearest" : "bilinear")
+                  << " renderer=" << gsRendererModeName(m_gs.rendererMode()) << std::endl;
+    }
 
     std::atomic<bool> gameThreadFinished{false};
 
+#if defined(PS2X_VULKAN_PRESENT)
+    // shown through Vulkan (vulkanPresentWanted): the window and its presenter were made at start; raylib's hidden
+    // window doesn't wait for the screen, so the loop waits once
+    VulkanPresenter *presenter = s_presenter.get();
+    GLFWwindow *presenterWindow = s_vulkanWindow;
+#endif
+
+    m_chain.start(); // the VIF1 -> VU1 -> GS chain worker (VENDETTA_CHAIN_ASYNC=1)
     std::thread gameThread([&]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
+        ps2_host_profile::recordThisThread();
+        ps2HostPreferPerformanceCores();
+        ChainWorker::markProducerThread();
         try
         {
             m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
@@ -2422,29 +3041,107 @@ void PS2Runtime::run()
         });
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
-        UploadFrame(frameTex, this, presentWidth, presentHeight);
+        // The window shows each picture once, as soon as the game has finished it: it waits for a new one (up to
+        // 20 ms — a game frame comes every 16.7 ms — so input and the window are still served at least 50 times a
+        // second when the picture stands still, a menu waiting for a press). With its own 60-a-second timer, which
+        // drifts against the game's 59.94 and jitters by a millisecond, a picture was now and then shown twice and the
+        // next one never — a slight stutter although every frame was on time. VENDETTA_WINDOW_PACING=timer = the old way.
+        bool freshPicture = UploadFrame(frameTex, this, presentWidth, presentHeight);
+        if (!windowTimerPacing())
+        {
+            const auto waitStart = std::chrono::steady_clock::now();
+            while (!freshPicture && !isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire) &&
+                   std::chrono::steady_clock::now() - waitStart < std::chrono::milliseconds(20))
+            {
+                std::this_thread::sleep_for(std::chrono::microseconds(250));
+                freshPicture = UploadFrame(frameTex, this, presentWidth, presentHeight);
+            }
+        }
+        ps2_host_profile::count(freshPicture ? ps2_host_profile::WindowFrames : ps2_host_profile::WindowRepeats);
 
         BeginDrawing();
         ClearBackground(BLACK);
         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
-        const float screenWidth = static_cast<float>(GetScreenWidth());
-        const float screenHeight = static_cast<float>(GetScreenHeight());
-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
-        const float dstWidth = srcWidth * scale;
-        const float dstHeight = srcHeight * scale;
+        // the framebuffer's size: in fullscreen raylib's screen size can stay at the window's size from before (Windows
+        // clamps a framed 2560 x 1440 window to the screen minus its title bar), which left a bar under the picture
+        const float screenWidth = static_cast<float>(GetRenderWidth());
+        const float screenHeight = static_cast<float>(GetRenderHeight());
+        // A PS2 picture fills a 4:3 TV whatever the frame buffer's width (512-wide menus and 640-wide movies alike);
+        // scaling by pixels made 512 × 448 screens look squeezed. VENDETTA_ASPECT=16:9 stretches to widescreen; the
+        // setting shape = "stretch" (VENDETTA_ASPECT=fill) fills the window whatever its shape.
+        static const float displayAspect = []
+        {
+            const char *aspect = std::getenv("VENDETTA_ASPECT");
+            if (aspect && std::string(aspect) == "16:9")
+                return 16.0f / 9.0f;
+            return ps2_host_settings::get().stretch ? 0.0f : 4.0f / 3.0f;
+        }();
+        // widescreen: a frame the game drew wide (squeezed into its buffer) is shown at exactly the target shape, filling
+        // a screen of that shape (the TV picture's small covered-share correction would leave thin bars at the sides)
+        const float wideAspect = ps2_widescreen::wideNow() ? ps2_widescreen::targetAspect() : 0.0f;
+        const float aspect = wideAspect > 0.0f        ? wideAspect
+                             : displayAspect > 0.0f ? displayAspect * s_presentAspectScale
+                                                    : screenWidth / std::max(1.0f, screenHeight);
+        // whole pixels: an FSR picture is drawn at exactly this size, one texel per pixel
+        const float dstHeight = std::round(std::min(screenHeight, screenWidth / aspect));
+        const float dstWidth = std::round(std::min(screenWidth, dstHeight * aspect));
+#if defined(PS2X_VULKAN_PRESENT)
+        if (!presenterWindow) // the Vulkan window sets FSR's size itself
+#endif
+        if (GSGpuRenderer *gpu = m_gs.gpuRendererForSettings())
+            gpu->setOutputSize(static_cast<uint32_t>(dstWidth), static_cast<uint32_t>(dstHeight));
         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
         const Rectangle dstRect{
-            (screenWidth - dstWidth) * 0.5f,
-            (screenHeight - dstHeight) * 0.5f,
+            std::floor((screenWidth - dstWidth) * 0.5f),
+            std::floor((screenHeight - dstHeight) * 0.5f),
             dstWidth,
             dstHeight};
+        {
+            // once per change of layout: where the picture goes (and what raylib says the window is)
+            static float s_loggedLayout[6] = {};
+            const float layout[6] = {screenWidth, screenHeight, dstRect.x, dstRect.y, dstWidth, dstHeight};
+            if (!std::equal(std::begin(layout), std::end(layout), std::begin(s_loggedLayout)))
+            {
+                std::copy(std::begin(layout), std::end(layout), std::begin(s_loggedLayout));
+                std::cerr << "[present] picture " << dstWidth << "x" << dstHeight << " at " << dstRect.x << "," << dstRect.y
+                          << " in " << screenWidth << "x" << screenHeight << " (raylib's screen " << GetScreenWidth() << "x"
+                          << GetScreenHeight() << "); source " << srcWidth << "x" << srcHeight << std::endl;
+            }
+        }
         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
         EndDrawing();
+
+#if defined(PS2X_VULKAN_PRESENT)
+        if (presenterWindow)
+            host_input::poll(); // the controllers' state for the pads (raylib's frame polled the events)
+        // minimised (Alt-Tab from fullscreen): nothing to show (the swapchain would wait for a size on this thread)
+        if (presenterWindow && s_sharedFrame && freshPicture && !glfwGetWindowAttrib(presenterWindow, GLFW_ICONIFIED))
+        {
+            GSGpuRenderer *gpu = m_gs.gpuRendererForSettings();
+            if (presenter && gpu)
+            {
+                int fbWidth = 0, fbHeight = 0;
+                glfwGetFramebufferSize(presenterWindow, &fbWidth, &fbHeight);
+                const float vkAspect = aspect > 0.0f ? aspect : 4.0f / 3.0f;
+                const float vkHeight = std::round(std::min(static_cast<float>(fbHeight), fbWidth / vkAspect));
+                const float vkWidth = std::round(std::min(static_cast<float>(fbWidth), vkHeight * vkAspect));
+                gpu->setOutputSize(static_cast<uint32_t>(vkWidth), static_cast<uint32_t>(vkHeight)); // FSR at that size
+                presenter->present(*s_sharedFrame, *gpu, static_cast<int>(std::floor((fbWidth - vkWidth) * 0.5f)),
+                                   static_cast<int>(std::floor((fbHeight - vkHeight) * 0.5f)), static_cast<int>(vkWidth),
+                                   static_cast<int>(vkHeight), m_gs.presentFilter() == GSPresentFilter::Nearest);
+            }
+        }
+        if (presenterWindow && glfwWindowShouldClose(presenterWindow))
+        {
+            requestStop();
+            break;
+        }
+#endif
 
         if (WindowShouldClose())
         {
@@ -2459,12 +3156,22 @@ void PS2Runtime::run()
     {
         gameThread.join();
     }
+    ps2_pad_rumble::stopAll(); // the game is done with the pads: no controller left vibrating
+    m_chain.shutdown();          // the chain worker first (it feeds the GS)...
+    m_gs.shutdownRasterThread(); // ... then the GS thread
+    m_gs.shutdownGpu();          // ... then the graphics card renderer
 
     if (m_debugUiInitialized && m_debugUiShutdownCallback)
     {
         m_debugUiShutdownCallback(*this, m_debugUiUserData);
         m_debugUiInitialized = false;
     }
+#if defined(PS2X_VULKAN_PRESENT)
+    s_presenter.reset();
+    if (presenterWindow)
+        glfwDestroyWindow(presenterWindow);
+    s_vulkanWindow = nullptr;
+#endif
     UnloadTexture(frameTex);
     CloseWindow();
 

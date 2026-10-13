@@ -8,6 +8,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "spu2.h"
+
 namespace ps2x::iop::detail
 {
     class IopMemory
@@ -34,7 +36,9 @@ namespace ps2x::iop::detail
         struct DmaStart
         {
             int irq = 0;
+            int core = 0; // the SPU2 core (AutoDMA: whose input the pcm feeds)
             uint64_t delayCycles = 0;
+            std::vector<int16_t> pcm; // AutoDMA: the stereo frames (L, R interleaved, 48 kHz) the SPU2 plays
         };
 
         IopMemory();
@@ -52,6 +56,8 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool writeRam(uint32_t address, const void *source, size_t size);
         [[nodiscard]] bool zeroRam(uint32_t address, size_t size);
         [[nodiscard]] bool ownsRamRange(uint32_t address, size_t size) const;
+        // Any IOP RAM, including what the guest uses without an allocation (its stacks, module data).
+        [[nodiscard]] bool isRamRange(uint32_t address, size_t size) const;
         [[nodiscard]] bool isHardwareAddress(uint32_t address) const;
         [[nodiscard]] std::string readString(uint32_t address, size_t limit = 1024u) const;
 
@@ -69,6 +75,7 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
+        [[nodiscard]] Spu2 &spu2() noexcept { return m_spu2; }
 
         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
 
@@ -87,5 +94,6 @@ namespace ps2x::iop::detail
         uint32_t m_interruptMask = 0;
         uint32_t m_interruptControl = 1;
         std::optional<DmaStart> m_dmaStart;
+        Spu2 m_spu2;
     };
 }

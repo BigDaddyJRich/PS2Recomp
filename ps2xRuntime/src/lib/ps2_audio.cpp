@@ -1,6 +1,9 @@
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_host_backend.h"
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -77,7 +80,64 @@ struct PS2AudioBackend::Impl
         uint32_t sampleKey;
     };
     std::vector<TrackedSound> activeSounds;
+
+    // The AutoDMA PCM stream: a ring of interleaved stereo samples, filled by submitPcmStream (the IOP), drained
+    // by the audio thread's callback.
+    static constexpr uint32_t kPcmRate = 48000u;
+    static constexpr size_t kPcmRingFrames = kPcmRate;          // 1 s of room
+    static constexpr size_t kPcmMaxQueuedFrames = kPcmRate / 4u; // keep latency under ~250 ms
+    // Jitter buffer: the stream arrives in 10.7 ms chunks (a sound driver's half-buffers) while the audio device
+    // pulls its own block size; play only with ~100 ms in reserve, and after running dry refill it before
+    // resuming — rather than a click every few milliseconds.
+    static constexpr size_t kPcmPrimeFrames = kPcmRate / 10u;
+    bool pcmPrimed = false;
+    std::mutex pcmMutex;
+    std::vector<int16_t> pcmRing = std::vector<int16_t>(kPcmRingFrames * 2u);
+    size_t pcmRead = 0u;   // in frames
+    size_t pcmQueued = 0u; // frames waiting
+    bool pcmStreamStarted = false;
+    // VENDETTA_AUDIOLOG=1: underruns (frames of silence the callback had to play) and submissions per 5 s of audio
+    uint64_t pcmUnderrunFrames = 0u;
+    uint64_t pcmSubmittedFrames = 0u;
+    uint64_t pcmDroppedFrames = 0u;
+    std::FILE *pcmDump = nullptr; // VENDETTA_AUDIODUMP=<file>: the raw stream (s16le stereo 48 kHz)
+#if !defined(PLATFORM_VITA)
+    AudioStream pcmStream{};
+#endif
 };
+
+namespace
+{
+    PS2AudioBackend::Impl *g_pcmStreamOwner = nullptr; // raylib's stream callback has no user pointer
+
+    void pcmStreamCallback(void *buffer, unsigned int frames)
+    {
+        auto *out = static_cast<int16_t *>(buffer);
+        PS2AudioBackend::Impl *impl = g_pcmStreamOwner;
+        size_t written = 0u;
+        if (impl)
+        {
+            std::lock_guard<std::mutex> lock(impl->pcmMutex);
+            if (!impl->pcmPrimed && impl->pcmQueued >= PS2AudioBackend::Impl::kPcmPrimeFrames)
+                impl->pcmPrimed = true;
+            const size_t take = impl->pcmPrimed ? std::min<size_t>(frames, impl->pcmQueued) : 0u;
+            for (; written < take; ++written)
+            {
+                const size_t frame = (impl->pcmRead + written) % PS2AudioBackend::Impl::kPcmRingFrames;
+                out[written * 2u] = impl->pcmRing[frame * 2u];
+                out[written * 2u + 1u] = impl->pcmRing[frame * 2u + 1u];
+            }
+            impl->pcmRead = (impl->pcmRead + take) % PS2AudioBackend::Impl::kPcmRingFrames;
+            impl->pcmQueued -= take;
+            if (impl->pcmPrimed && written < frames)
+            {
+                impl->pcmUnderrunFrames += frames - written;
+                impl->pcmPrimed = false; // ran dry: rebuild the reserve
+            }
+        }
+        std::memset(out + written * 2u, 0, (frames - written) * 2u * sizeof(int16_t)); // underrun: silence
+    }
+}
 
 PS2AudioBackend::PS2AudioBackend() : m_impl(std::make_unique<Impl>())
 {
@@ -95,7 +155,7 @@ void PS2AudioBackend::onVagTransfer(const uint8_t *rdram, uint32_t srcAddr, uint
         return;
 
     const uint32_t physAddr = srcAddr & PS2_RAM_MASK;
-    if (physAddr + sizeBytes > PS2_RAM_SIZE)
+    if (physAddr + sizeBytes > PS2_RAM_BACKING_SIZE)
         return;
 
     std::vector<int16_t> pcm;
@@ -173,7 +233,7 @@ void PS2AudioBackend::onSoundCommand(uint32_t sid, uint32_t rpcNum,
             {
                 uint32_t cand = 0;
                 std::memcpy(&cand, sendBuf + off, sizeof(cand));
-                if (cand >= kMinPlausibleAddr && (cand <= PS2_RAM_MASK || (cand & ~PS2_RAM_MASK) == 0))
+                if (cand >= kMinPlausibleAddr && (cand < PS2_RAM_SIZE))
                     sampleAddr = cand;
             }
         }
@@ -307,6 +367,60 @@ void PS2AudioBackend::playDecodedSample(uint32_t sampleKey, DecodedSample &sampl
 #endif
 }
 
+void PS2AudioBackend::submitPcmStream(const int16_t *frames, size_t frameCount)
+{
+#if defined(PLATFORM_VITA)
+    (void)frames;
+    (void)frameCount;
+#else
+    if (!m_audioReady || !frames || frameCount == 0u)
+        return;
+    Impl &impl = *m_impl;
+    static const bool audioLog = std::getenv("VENDETTA_AUDIOLOG") != nullptr;
+    static const char *dumpPath = std::getenv("VENDETTA_AUDIODUMP");
+    if (dumpPath && !impl.pcmDump)
+        impl.pcmDump = std::fopen(dumpPath, "wb");
+    if (impl.pcmDump)
+    {
+        std::fwrite(frames, sizeof(int16_t) * 2u, frameCount, impl.pcmDump);
+        std::fflush(impl.pcmDump);
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl.pcmMutex);
+        const uint64_t before = impl.pcmSubmittedFrames;
+        impl.pcmSubmittedFrames += frameCount;
+        if (audioLog && before / (Impl::kPcmRate * 5u) != impl.pcmSubmittedFrames / (Impl::kPcmRate * 5u))
+        {
+            std::fprintf(stderr, "[audiolog] submitted=%llu queued=%zu underrun=%llu dropped=%llu (frames)\n",
+                         static_cast<unsigned long long>(impl.pcmSubmittedFrames), impl.pcmQueued,
+                         static_cast<unsigned long long>(impl.pcmUnderrunFrames),
+                         static_cast<unsigned long long>(impl.pcmDroppedFrames));
+        }
+        for (size_t i = 0; i < frameCount; ++i)
+        {
+            if (impl.pcmQueued >= Impl::kPcmMaxQueuedFrames) // running ahead of playback: drop the oldest
+            {
+                impl.pcmRead = (impl.pcmRead + 1u) % Impl::kPcmRingFrames;
+                --impl.pcmQueued;
+                ++impl.pcmDroppedFrames;
+            }
+            const size_t frame = (impl.pcmRead + impl.pcmQueued) % Impl::kPcmRingFrames;
+            impl.pcmRing[frame * 2u] = frames[i * 2u];
+            impl.pcmRing[frame * 2u + 1u] = frames[i * 2u + 1u];
+            ++impl.pcmQueued;
+        }
+    }
+    if (!impl.pcmStreamStarted)
+    {
+        impl.pcmStreamStarted = true;
+        g_pcmStreamOwner = &impl;
+        impl.pcmStream = LoadAudioStream(Impl::kPcmRate, 16, 2);
+        SetAudioStreamCallback(impl.pcmStream, pcmStreamCallback);
+        PlayAudioStream(impl.pcmStream);
+    }
+#endif
+}
+
 void PS2AudioBackend::stop(uint32_t voiceId)
 {
     (void)voiceId;
@@ -324,5 +438,14 @@ void PS2AudioBackend::stopAll()
         UnloadSound(t.snd);
     }
     m_impl->activeSounds.clear();
+    if (m_impl->pcmStreamStarted)
+    {
+        StopAudioStream(m_impl->pcmStream);
+        UnloadAudioStream(m_impl->pcmStream);
+        m_impl->pcmStreamStarted = false;
+        g_pcmStreamOwner = nullptr;
+        std::lock_guard<std::mutex> pcmLock(m_impl->pcmMutex);
+        m_impl->pcmQueued = 0u;
+    }
 #endif
 }

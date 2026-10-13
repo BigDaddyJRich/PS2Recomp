@@ -1,5 +1,7 @@
+#include "runtime/ps2_host_profile.h"
 #include "Common.h"
 #include "MPEG.h"
+#include <cstdlib>
 #include "runtime/ee_scheduler.h"
 
 #if !defined(PS2X_HAS_FFMPEG)
@@ -16,6 +18,9 @@ extern "C"
 }
 #endif
 
+#include <atomic>
+#include <cstdio>
+#include <cstring>
 #include <deque>
 #include <memory>
 
@@ -512,6 +517,13 @@ namespace ps2_stubs
             uint64_t presentationEndTickQ32 = std::numeric_limits<uint64_t>::max();
             int64_t firstPresentedPts90k = -1;
             uint64_t ptsPresentationBaseTickQ32 = 0u;
+            bool nodataCallbackPending = false;
+            uint64_t bytesAdded = 0u;           // sceMpegAddBs total, to see whether a Nodata callback added any
+            bool nodataGaveNothing = false;     // the last Nodata round added nothing: wait instead of asking again
+            uint32_t sequenceEndsSeen = 0u;     // sequence_end_codes fed so far
+            bool fedByAddBs = false;            // the game feeds the bitstream itself (sceMpegAddBs), no PSS stream
+            bool returnWithoutPicture = false;  // a Nodata round ended the bitstream: GetPicture returns, no new frame
+            bool fedByIpu = false;              // HCTP Sofdec: bitstream comes by toIPU DMA; no vsync pacing (Sofdec times itself)
         };
 
         struct MpegStreamCallbackEvent
@@ -1088,6 +1100,7 @@ namespace ps2_stubs
 
             if (containsMpegSequenceEnd(data, size))
             {
+                ++playback.sequenceEndsSeen;
                 playback.sawSequenceEnd = true;
                 playback.cdStreamGeneration = g_mpeg_stub_state.cdStreamGeneration;
             }
@@ -1481,7 +1494,7 @@ namespace ps2_stubs
             {
                 const uint32_t curAddr = addr + static_cast<uint32_t>(copied);
                 const uint32_t offset = curAddr & PS2_RAM_MASK;
-                size_t chunk = std::min<size_t>(size - copied, PS2_RAM_SIZE - offset);
+                size_t chunk = std::min<size_t>(size - copied, PS2_RAM_BACKING_SIZE - offset);
                 if (chunk == 0u)
                 {
                     break;
@@ -1521,7 +1534,7 @@ namespace ps2_stubs
 
             const uint32_t base = ringBaseAddr & PS2_RAM_MASK;
             const uint32_t data = dataAddr & PS2_RAM_MASK;
-            if (ringBaseAddr != 0u && ringSize != 0u && ringSize <= PS2_RAM_SIZE)
+            if (ringBaseAddr != 0u && ringSize != 0u && ringSize <= PS2_RAM_BACKING_SIZE)
             {
                 const uint32_t ringOffset = (data - base) & PS2_RAM_MASK;
                 if (ringOffset < ringSize)
@@ -1590,7 +1603,7 @@ namespace ps2_stubs
                 return;
             }
 
-            const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
+            const uint32_t cbDataAddr = runtime->kernelMalloc(kMpegCallbackDataSize, 16u);
             if (cbDataAddr == 0u)
             {
                 return;
@@ -1652,6 +1665,104 @@ namespace ps2_stubs
             dispatchStreamCallbacks(rdram, ctx, runtime, events);
         }
 
+        constexpr uint32_t kMpegCbNodata = 1u; // sceMpegCbType: Error 0, Nodata 1, StopDMA 2, RestartDMA 3, ...
+
+        // libmpeg calls the sceMpegCbNodata callbacks when the decoder has run out of bitstream; games that feed
+        // video themselves (no PSS demux) add the next piece with sceMpegAddBs from there (Def Jam Vendetta's EA
+        // MPC player). Collects them for one request at a time; call with g_mpeg_stub_mutex held.
+        // (callable = there is recompiled code at the address)
+        std::vector<MpegRegisteredCallback> takeNodataCallbacksLocked(PS2Runtime *runtime, uint32_t mpegAddr, MpegPlaybackState &playback)
+        {
+            std::vector<MpegRegisteredCallback> out;
+            if (playback.nodataCallbackPending || playback.nodataGaveNothing)
+            {
+                return out;
+            }
+            const auto it = g_mpeg_stub_state.callbacksByMpeg.find(mpegAddr);
+            if (it == g_mpeg_stub_state.callbacksByMpeg.end())
+            {
+                return out;
+            }
+            for (const MpegRegisteredCallback &callback : it->second)
+            {
+                if (!callback.stream && callback.type == kMpegCbNodata && callback.func != 0u &&
+                    runtime->hasFunction(callback.func))
+                {
+                    out.push_back(callback);
+                }
+            }
+            playback.nodataCallbackPending = !out.empty();
+            return out;
+        }
+
+        void sceMpegGetPictureImpl(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+
+        // Runs the callbacks the way libmpeg does: nested on the thread inside sceMpegGetPicture —
+        // callback(mpeg, cbData {type = Nodata}, anyData) — so they see the caller's thread (Vendetta's callback
+        // takes a lock the calling thread already holds, keyed by GetThreadId). Afterwards sceMpegGetPicture runs
+        // again on the same context; if no bitstream was added it waits for other input instead of asking again.
+        [[noreturn]] void invokeNodataCallbacks(uint8_t *rdram,
+                                                R5900Context *callerCtx,
+                                                PS2Runtime *runtime,
+                                                uint32_t mpegAddr,
+                                                uint64_t bytesBefore,
+                                                uint32_t sequenceEndsBefore,
+                                                const std::vector<MpegRegisteredCallback> &callbacks)
+        {
+            std::vector<GuestInvocation> invocations;
+            for (size_t i = 0; i < callbacks.size(); ++i)
+            {
+                const MpegRegisteredCallback &callback = callbacks[i];
+                const bool last = i + 1u == callbacks.size();
+                const uint32_t cbDataAddr = runtime->kernelMalloc(kMpegCallbackDataSize, 16u);
+                if (uint8_t *data = cbDataAddr ? getMemPtr(rdram, cbDataAddr) : nullptr)
+                {
+                    std::memset(data, 0, kMpegCallbackDataSize);
+                    *reinterpret_cast<uint32_t *>(data) = kMpegCbNodata;
+                }
+
+                GuestInvocation invocation{};
+                invocation.kind = GuestInvocationKind::ThreadCallback;
+                invocation.context = *callerCtx;
+                SET_GPR_U32(&invocation.context, 4, mpegAddr);
+                SET_GPR_U32(&invocation.context, 5, cbDataAddr);
+                SET_GPR_U32(&invocation.context, 6, callback.data);
+                SET_GPR_U32(&invocation.context, 7, 0u);
+                SET_GPR_U32(&invocation.context, 29, 0u);
+                SET_GPR_U32(&invocation.context, 31, 0u);
+                invocation.context.pc = callback.func;
+                invocation.onComplete = [rdram, runtime, cbDataAddr, mpegAddr, bytesBefore, sequenceEndsBefore, last](const R5900Context &, R5900Context &parent)
+                {
+                    if (cbDataAddr != 0u)
+                    {
+                        runtime->guestFree(cbDataAddr);
+                    }
+                    if (!last)
+                    {
+                        return;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+                        const auto it = g_mpeg_stub_state.playbackByMpeg.find(mpegAddr);
+                        if (it != g_mpeg_stub_state.playbackByMpeg.end())
+                        {
+                            MpegPlaybackState &playback = it->second;
+                            playback.nodataCallbackPending = false;
+                            playback.nodataGaveNothing = playback.bytesAdded == bytesBefore;
+                            // The game had nothing but a sequence_end_code to add (its feeder hands one over when
+                            // its packet queue is empty): like libmpeg at the end of the bitstream, return without
+                            // a new picture so the game's loop runs (and refills the queue) before asking again.
+                            playback.returnWithoutPicture =
+                                playback.decodedFrames.empty() && playback.sequenceEndsSeen != sequenceEndsBefore;
+                        }
+                    }
+                    sceMpegGetPictureImpl(rdram, &parent, runtime);
+                };
+                invocations.push_back(std::move(invocation));
+            }
+            runtime->eeScheduler().invokeCurrentSequence(std::move(invocations));
+        }
+
         void writeBlankMpegFrame(uint8_t *rdram, uint32_t destAddr, uint32_t width, uint32_t height)
         {
             if (!rdram || destAddr == 0u)
@@ -1695,6 +1806,20 @@ namespace ps2_stubs
 
             const uint32_t width = static_cast<uint32_t>(frame.width);
             const uint32_t height = static_cast<uint32_t>(frame.height);
+            // VENDETTA_MPEGDUMP=<folder>: every 30th decoded frame as a PPM, before it reaches the guest / GS
+            static const char *dumpDir = std::getenv("VENDETTA_MPEGDUMP");
+            static uint32_t dumpCounter = 0u;
+            if (dumpDir && (dumpCounter++ % 30u) == 0u)
+            {
+                const std::string path = std::string(dumpDir) + "/frame" + std::to_string(dumpCounter) + ".ppm";
+                if (std::FILE *f = std::fopen(path.c_str(), "wb"))
+                {
+                    std::fprintf(f, "P6\n%u %u\n255\n", width, height);
+                    for (size_t i = 0; i < static_cast<size_t>(width) * height; ++i)
+                        std::fwrite(frame.rgba.data() + i * 4u, 1, 3, f);
+                    std::fclose(f);
+                }
+            }
             const uint32_t outWidth = align16(width);
             const uint32_t outHeight = align16(height);
             const uint32_t macroblockColumns = outWidth / 16u;
@@ -1889,7 +2014,7 @@ namespace ps2_stubs
             {
                 const uint32_t curAddr = dataAddr + static_cast<uint32_t>(copied);
                 const uint32_t offset = curAddr & PS2_RAM_MASK;
-                const size_t chunk = std::min<size_t>(static_cast<size_t>(byteCount) - copied, PS2_RAM_SIZE - offset);
+                const size_t chunk = std::min<size_t>(static_cast<size_t>(byteCount) - copied, PS2_RAM_BACKING_SIZE - offset);
                 const uint8_t *src = getConstMemPtr(rdram, curAddr);
                 if (!src || chunk == 0u)
                 {
@@ -1898,7 +2023,38 @@ namespace ps2_stubs
                 feedElementaryStream(playback, src, chunk);
                 copied += chunk;
             }
+            playback.bytesAdded += copied;
+            playback.fedByAddBs = true;
+            if (copied != 0u)
+            {
+                playback.nodataGaveNothing = false;
+            }
             wakePictureWaiter = playback.decodedFrames.size() != framesBefore || playback.streamEnded || playback.decoderFailed;
+            // Always: when the game ends the stream itself (sequence_end_codes, 00 00 01 B7 — EA's player adds them when
+            // its no-data callback finds no packet), say after how much: an early end shows here.
+            {
+                const uint8_t *head = getConstMemPtr(rdram, dataAddr);
+                if (head && byteCount >= 4u && byteCount <= 64u && head[0] == 0u && head[1] == 0u && head[2] == 1u && head[3] == 0xB7u)
+                    std::cerr << "[mpeg] the game ends the stream (sequence_end_code) after " << playback.bytesAdded
+                              << " bytes, " << playback.decodedFrames.size() << " pictures queued, vsync tick "
+                              << runtime->eeScheduler().currentVSyncTick() << std::endl;
+            }
+            // VENDETTA_MPEGLOG=1: the bitstream a game adds and what the decoder makes of it
+            static const bool mpegLog = std::getenv("VENDETTA_MPEGLOG") != nullptr;
+            static uint32_t addBsLogs = 0u;
+            if (mpegLog && addBsLogs < 200u)
+            {
+                ++addBsLogs;
+                const uint8_t *head = getConstMemPtr(rdram, dataAddr);
+                std::cerr << "[mpeglog] AddBs mpeg=0x" << std::hex << mpegAddr << " data=0x" << dataAddr << std::dec
+                          << " bytes=" << byteCount << " copied=" << copied
+                          << " frames " << framesBefore << "->" << playback.decodedFrames.size()
+                          << " ended=" << playback.streamEnded << " failed=" << playback.decoderFailed
+                          << " seqHdr=" << !playback.waitingForVideoSequenceHeader << std::hex;
+                for (uint32_t i = 0; head && i < 8u && i < byteCount; ++i)
+                    std::cerr << (i == 0 ? " head=" : " ") << static_cast<uint32_t>(head[i]);
+                std::cerr << std::dec << std::endl;
+            }
         }
 
         if (wakePictureWaiter)
@@ -1906,6 +2062,196 @@ namespace ps2_stubs
             runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_OK);
         }
         setReturnS32(ctx, static_cast<int32_t>(copied));
+    }
+
+    namespace
+    {
+        // HCTP Sofdec: the video elementary stream reaches the IPU by toIPU DMA (ch4) from Sofdec's vibuf ring
+        // (Sony vibuf.c), never through sceMpegAddBs. Bytes captured before any sceMpegGetPicture names the target
+        // stream wait here; GetPicture drains them into its own stream.
+        std::vector<uint8_t> g_ipuPending;     // guarded by g_mpeg_stub_mutex
+        uint32_t g_ipuTargetMpeg = 0u;         // the stream that last asked for a picture
+        PS2Runtime *g_ipuRuntime = nullptr;
+        std::atomic<uint64_t> g_ipuInTotal{0};
+
+        // Call with g_mpeg_stub_mutex held. Returns true if the stream got new pictures (or ended).
+        bool feedIpuBytesLocked(uint32_t mpegAddr, const uint8_t *data, size_t size)
+        {
+            MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+            const size_t framesBefore = playback.decodedFrames.size();
+            feedElementaryStream(playback, data, size);
+            playback.bytesAdded += size;
+            playback.fedByIpu = true;
+            playback.fedByAddBs = true;
+            if (size != 0u)
+                playback.nodataGaveNothing = false;
+            return playback.decodedFrames.size() != framesBefore || playback.streamEnded || playback.decoderFailed;
+        }
+
+        // Sofdec runs one vibuf ring per stream (logo movie + menu movie at once) into the one IPU. Find the stream
+        // whose ring holds the DMA tag at tadr: its Nodata callback data -> +0x1B30 -> + 0xA48 = vibuf
+        // (mpegNodata 0x3fc550; viBufCreate 0x3fb718: +4 tag ring (uncached), +8 block count n, tags 0..n).
+        uint32_t ipuRingOwnerLocked(uint8_t *rdram, uint32_t tadr)
+        {
+            tadr &= 0x0FFFFFFFu;
+            for (const auto &entry : g_mpeg_stub_state.callbacksByMpeg)
+            {
+                for (const MpegRegisteredCallback &cb : entry.second)
+                {
+                    if (cb.stream || cb.type != 1u || cb.data == 0u)
+                        continue;
+                    const uint8_t *d = getConstMemPtr(rdram, cb.data + 0x1B30u);
+                    if (!d)
+                        continue;
+                    uint32_t inst = 0u, tag = 0u, n = 0u;
+                    std::memcpy(&inst, d, 4);
+                    const uint8_t *vb = inst ? getConstMemPtr(rdram, inst + 0xA48u) : nullptr;
+                    if (!vb)
+                        continue;
+                    std::memcpy(&tag, vb + 4, 4);
+                    std::memcpy(&n, vb + 8, 4);
+                    tag &= 0x0FFFFFFFu;
+                    if (n == 0u || n > 4096u)
+                        continue;
+                    if (tadr >= tag && tadr <= tag + n * 16u)
+                        return entry.first;
+                }
+            }
+            return 0u;
+        }
+
+        void drainIpuPendingLocked(uint32_t mpegAddr)
+        {
+            g_ipuTargetMpeg = mpegAddr;
+            if (g_ipuPending.empty())
+                return;
+            std::vector<uint8_t> data;
+            data.swap(g_ipuPending);
+            feedIpuBytesLocked(mpegAddr, data.data(), data.size());
+        }
+    }
+
+    // Called by PS2Memory when D4_CHCR (0x1000B400) is written with STR set: walk the source chain like the DMAC,
+    // hand the bytes to the decoder and leave the registers as a finished transfer (MADR = end of the last block,
+    // QWC = 0, TADR advanced, CHCR.TAG = last tag's upper half, STR clear). Sofdec's vibuf derives consumption from
+    // D4_MADR. Old-fork lesson: draining a whole lap of the 256 x 2 KB ring in one kick leaves MADR where it started
+    // (= "nothing consumed", same 512 KB re-read forever) - so stop after ~64 KB like a stalled IPU DMA, tag ID forced
+    // to ref and TADR at the next tag, and let Sofdec's restart (Nodata -> viBufAddDMA / RestartDMA) continue it.
+    void mpegIpuToDmaStart(uint8_t *rdram, uint32_t &chcr, uint32_t &madr, uint32_t &qwc, uint32_t &tadr)
+    {
+        // Backpressure: the real IPU only pulls the stream as fast as pictures are decoded. While this stream already
+        // has decoded pictures waiting, consume nothing (registers unchanged, STR clear) - Sofdec restarts the DMA
+        // per picture / on Nodata. Without this the vibuf drained instantly and Sofdec read the whole movie ahead
+        // (thousands of queued frames, GBs of RGBA).
+        {
+            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+            const uint32_t owner = ipuRingOwnerLocked(rdram, tadr);
+            const uint32_t t = owner != 0u ? owner : g_ipuTargetMpeg;
+            const auto it = t != 0u ? g_mpeg_stub_state.playbackByMpeg.find(t) : g_mpeg_stub_state.playbackByMpeg.end();
+            if (it != g_mpeg_stub_state.playbackByMpeg.end() && it->second.decodedFrames.size() >= 4u)
+            {
+                chcr &= ~0x100u;
+                static std::atomic<uint32_t> s_full{0};
+                const uint32_t f = s_full.fetch_add(1u, std::memory_order_relaxed);
+                if (f < 8u || (f % 2000u) == 0u)
+                    std::fprintf(stderr, "[ipuin] full mpeg=0x%x queued=%zu tadr=0x%x (n=%u)\n", t, it->second.decodedFrames.size(), tadr, f);
+                return;
+            }
+        }
+        std::vector<uint8_t> in;
+        const uint32_t startMadr = madr, startTadr = tadr, startQwc = qwc, startChcr = chcr;
+        auto copyQw = [&](uint32_t addr, uint32_t count) {
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const uint8_t *src = getConstMemPtr(rdram, (addr & 0x7FFFFFFFu) + i * 16u);
+                if (!src)
+                    return;
+                in.insert(in.end(), src, src + 16);
+            }
+        };
+        uint32_t tagHi = chcr & 0xFFFF0000u;
+        bool end = false;
+        if (qwc > 0u)
+        {
+            copyQw(madr, qwc);
+            madr += qwc * 16u;
+            qwc = 0u;
+            const uint32_t id = (chcr >> 28) & 7u;
+            if (id == 0u || id == 7u)
+                end = true;
+        }
+        if (((chcr >> 2) & 3u) != 1u) // not chain mode
+            end = true;
+        for (uint32_t guard = 0; !end && guard < 65536u; ++guard)
+        {
+            const uint8_t *t = getConstMemPtr(rdram, tadr & 0x7FFFFFFFu);
+            if (!t)
+                break;
+            uint32_t lo, hi;
+            std::memcpy(&lo, t, 4);
+            std::memcpy(&hi, t + 4, 4);
+            const uint32_t q = lo & 0xFFFFu;
+            const uint32_t id = (lo >> 28) & 7u;
+            tagHi = lo & 0xFFFF0000u;
+            switch (id)
+            {
+            case 0u: copyQw(hi, q); madr = hi + q * 16u; tadr += 16u; end = true; break;     // refe
+            case 1u: copyQw(tadr + 16u, q); madr = tadr + 16u + q * 16u; tadr = madr; break; // cnt
+            case 2u: copyQw(tadr + 16u, q); madr = tadr + 16u + q * 16u; tadr = hi; break;   // next
+            case 3u: case 4u: copyQw(hi, q); madr = hi + q * 16u; tadr += 16u; break;         // ref/refs
+            case 7u: copyQw(tadr + 16u, q); madr = tadr + 16u + q * 16u; end = true; break;  // end
+            default: end = true; break;
+            }
+            if ((lo & 0x80000000u) && (chcr & 0x80u)) // IRQ with TIE stops the chain
+                end = true;
+            if (!end && in.size() >= 0x10000u)
+            {
+                tagHi = (tagHi & 0x8FFFFFFFu) | 0x30000000u;
+                break;
+            }
+        }
+        chcr = (chcr & 0x0000FEFFu) | tagHi;
+        g_ipuInTotal.fetch_add(in.size(), std::memory_order_relaxed);
+
+        uint32_t target = 0u;
+        bool wake = false;
+        PS2Runtime *runtime = nullptr;
+        size_t queued = 0u;
+        {
+            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+            const uint32_t owner = ipuRingOwnerLocked(rdram, startTadr);
+            target = owner != 0u ? owner : g_ipuTargetMpeg;
+            runtime = g_ipuRuntime;
+            if (target != 0u && g_mpeg_stub_state.playbackByMpeg.count(target) != 0u)
+            {
+                wake = feedIpuBytesLocked(target, in.data(), in.size());
+                queued = g_mpeg_stub_state.playbackByMpeg[target].decodedFrames.size();
+            }
+            else
+            {
+                g_ipuPending.insert(g_ipuPending.end(), in.begin(), in.end());
+                target = 0u;
+            }
+        }
+        if (wake && runtime)
+            runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, target, KE_OK);
+
+        // [ipuin] each toIPU kick: registers in/out, picture start codes (psc) and sequence headers (seq) in it
+        static std::atomic<uint32_t> s_n{0};
+        const uint32_t n = s_n.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 24u || (n % 500u) == 0u)
+        {
+            uint32_t psc = 0u, seq = 0u;
+            for (size_t i = 0; i + 3u < in.size(); ++i)
+                if (in[i] == 0u && in[i + 1u] == 0u && in[i + 2u] == 1u)
+                {
+                    if (in[i + 3u] == 0u) ++psc;
+                    else if (in[i + 3u] == 0xB3u) ++seq;
+                }
+            std::fprintf(stderr, "[ipuin] n=%u in chcr=0x%x madr=0x%x qwc=0x%x tadr=0x%x -> bytes=%zu total=%llu madr=0x%x tadr=0x%x chcr=0x%x psc=%u seq=%u mpeg=0x%x queued=%zu\n",
+                         n, startChcr, startMadr, startQwc, startTadr, in.size(),
+                         static_cast<unsigned long long>(g_ipuInTotal.load()), madr, tadr, chcr, psc, seq, target, queued);
+        }
     }
 
     void sceMpegAddCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -2014,7 +2360,7 @@ namespace ps2_stubs
         mpegGuestWrite32(rdram, puVar4 + 0x8, a1_init);
         mpegGuestWrite32(rdram, puVar4 + 0xC, a1_init);
 
-        const uint32_t allocResult = runtime ? runtime->guestMalloc(0x600, 8u) : (uVar3 + 0x200u);
+        const uint32_t allocResult = runtime ? runtime->kernelMalloc(0x600, 8u) : (uVar3 + 0x200u);
         mpegGuestWrite32(rdram, uVar3 + 0x44, allocResult);
 
         // param_1[0..2] = 0; param_1[4..0xe] = 0xffffffff/0 as per decompilation
@@ -2071,6 +2417,9 @@ namespace ps2_stubs
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
             g_mpeg_stub_state.callbacksByMpeg.erase(mpegAddr);
             g_mpeg_stub_state.playbackByMpeg.erase(mpegAddr);
+            if (g_ipuTargetMpeg == mpegAddr)
+                g_ipuTargetMpeg = 0u;
+            g_ipuPending.clear();
         }
         runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_WAIT_DELETE);
         setReturnU32(ctx, 0u);
@@ -2282,6 +2631,7 @@ namespace ps2_stubs
 
     void sceMpegGetPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        ps2_host_profile::Scope profile(ps2_host_profile::Mpeg);
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         const uint32_t imageAddr = getRegU32(ctx, 5);
         uint32_t width = kStubMovieWidth;
@@ -2291,8 +2641,13 @@ namespace ps2_stubs
         MpegDecodedFrame frame;
         {
             std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
+            g_ipuRuntime = runtime;
+            drainIpuPendingLocked(mpegAddr);
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+            const bool returnWithoutPicture = playback.returnWithoutPicture;
+            playback.returnWithoutPicture = false;
             if (playback.decodedFrames.empty() &&
+                !returnWithoutPicture &&
                 !g_mpeg_stub_state.currentCdStreamEofSeen &&
                 !playback.streamEnded &&
                 !playback.decoderFailed)
@@ -2307,7 +2662,23 @@ namespace ps2_stubs
                     });
                     ++g_mpeg_stub_state.getPictureWaitTraceCount;
                 }
+                const std::vector<MpegRegisteredCallback> nodataCallbacks = takeNodataCallbacksLocked(runtime, mpegAddr, playback);
+                const uint64_t bytesBefore = playback.bytesAdded;
+                const uint32_t sequenceEndsBefore = playback.sequenceEndsSeen;
+                static const bool mpegLog = std::getenv("VENDETTA_MPEGLOG") != nullptr;
+                static uint32_t waitLogs = 0u;
+                if (mpegLog && waitLogs < 200u)
+                {
+                    ++waitLogs;
+                    std::cerr << "[mpeglog] GetPicture waits mpeg=0x" << std::hex << mpegAddr << std::dec
+                              << " nodata-callbacks=" << nodataCallbacks.size()
+                              << " pending=" << playback.nodataCallbackPending << std::endl;
+                }
                 lock.unlock();
+                if (!nodataCallbacks.empty())
+                {
+                    invokeNodataCallbacks(rdram, ctx, runtime, mpegAddr, bytesBefore, sequenceEndsBefore, nodataCallbacks);
+                }
                 runtime->eeScheduler().waitExternal(
                     EeWaitReason::Mpeg,
                     kMpegPictureWaitType,
@@ -2341,7 +2712,7 @@ namespace ps2_stubs
                     playback.nextPictureTickQ32 = currentTickQ32;
                 }
 
-                if (currentTickQ32 < presentationTargetQ32)
+                if (currentTickQ32 < presentationTargetQ32 && !playback.fedByIpu)
                 {
                     const uint64_t eligibleTick = (presentationTargetQ32 + kPictureClockOne - 1u) >> 32u;
                     lock.unlock();
@@ -2428,6 +2799,14 @@ namespace ps2_stubs
         TODO_NAMED("sceMpegGetPictureRAW8xy", rdram, ctx, runtime);
     }
 
+    namespace
+    {
+        void sceMpegGetPictureImpl(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            sceMpegGetPicture(rdram, ctx, runtime);
+        }
+    }
+
     void sceMpegInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
@@ -2461,8 +2840,13 @@ namespace ps2_stubs
         const bool producerEnded =
             g_mpeg_stub_state.currentCdStreamEofSeen &&
             playback.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration;
-        const bool ended = producerEnded &&
-                           (playback.streamEnded || (playback.decoderFailed && playback.sawInput));
+        // A game that feeds the bitstream itself (sceMpegAddBs, no PSS / CD stream) has no producer EOF: there, as
+        // in libmpeg, the stream has ended once a sequence_end_code has been fed (Def Jam Vendetta's movie feeder
+        // adds one when its packet queue is empty, i.e. at the end of the file) — with every frame taken (below).
+        const bool addBsEnded = playback.fedByAddBs && playback.sequenceEndsSeen != 0u;
+        const bool ended = addBsEnded ||
+                           (producerEnded &&
+                            (playback.streamEnded || (playback.decoderFailed && playback.sawInput)));
         const uint64_t presentationEnd = playback.presentationEndTickQ32;
         const uint64_t currentTickQ32 = runtime != nullptr
                                             ? (runtime->eeScheduler().currentVSyncTick() << 32u)

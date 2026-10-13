@@ -915,6 +915,22 @@ namespace ps2recomp
             }
 
             m_functions = m_elfParser->extractFunctions();
+            // HCTP: [general].game_code = ["name@0xADDR", ...]: functions whose ELF name matches a runtime stub but must
+            // run as the game's own code (e.g. soft-float double libm). Renamed "<name>_game" so no name-based binding applies.
+            for (auto &function : m_functions)
+            {
+                for (const auto &entry : m_config.gameCodeFunctions)
+                {
+                    const auto at = entry.find("@0x");
+                    if (at == std::string::npos)
+                        continue;
+                    if (function.name == entry.substr(0, at) &&
+                        function.start == static_cast<uint32_t>(std::stoul(entry.substr(at + 3), nullptr, 16)))
+                    {
+                        function.name += "_game";
+                    }
+                }
+            }
             m_symbols = m_elfParser->extractSymbols();
             m_sections = m_elfParser->getSections();
             m_relocations = m_elfParser->getRelocations();

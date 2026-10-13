@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "iop_emulator.h"
 #include "imports/iop_cdvd.h"
 #include "core/iop_cpu.h"
@@ -16,14 +17,22 @@
 #include "imports/iop_timrman.h"
 #include "imports/iop_vblank.h"
 #include "iop_emulator_const.h"
+#include "ps2x/iop/iop_native_hooks.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
 #include <map>
+#include <unordered_map>
 #include <optional>
 #include <span>
 #include <sstream>
 #include <utility>
+#include <vector>
 
 namespace ps2x::iop::detail
 {
@@ -42,6 +51,14 @@ namespace ps2x::iop::detail
         {
             return IopMemory::physicalAddress(address);
         }
+
+        // The native hooks (ps2x/iop/iop_native_hooks.h), and which 4 KB pages of IOP RAM hold one (tested per instruction)
+        std::vector<ps2x::iop::NativeHook> &nativeHooks()
+        {
+            static std::vector<ps2x::iop::NativeHook> hooks;
+            return hooks;
+        }
+        std::array<uint8_t, kRamSize / 4096u> g_nativeHookPages{};
 
         int32_t sign16(uint32_t value)
         {
@@ -126,9 +143,14 @@ namespace ps2x::iop::detail
             ioman.reset();
             pendingDmaInterrupts.clear();
             pendingGuestCallbacks.clear();
+            dmaDueFloor = UINT64_MAX;
+            idleKnown = false;
+            idleUntil = 0u;
             nextModuleId = 1;
             moduleCursor = kModuleLoadBase;
             totalCycles = 0;
+            grantedCycles = 0;
+            cyclesAfterLastRun = 0;
             totalInstructions = 0;
             eeCycleCarry = 0;
             activeCpu = nullptr;
@@ -177,7 +199,16 @@ namespace ps2x::iop::detail
         void schedulePendingDma()
         {
             if (const auto dma = memory.takeDmaStart())
+            {
+                // A new completion: the floor must stay at or below it, and the idle skip must look again.
+                // (Replacing an irq's earlier entry with a later one leaves the floor low; that only costs one
+                // walk, which then sets it exactly.)
                 pendingDmaInterrupts[dma->irq] = totalCycles + dma->delayCycles;
+                dmaDueFloor = std::min(dmaDueFloor, totalCycles + dma->delayCycles);
+                idleKnown = false;
+                if (!dma->pcm.empty())
+                    memory.spu2().queueInput(dma->core, dma->pcm.data(), dma->pcm.size() / 2u);
+            }
         }
 
         bool readRam(uint32_t address, void *destination, size_t size) const
@@ -239,6 +270,42 @@ namespace ps2x::iop::detail
 
         ImportDisposition dispatchImport(const IopImportCall &call, CpuState &cpu)
         {
+            // VENDETTA_IOPLOG=1: every IOP module call into the kernel / SIF / sound libraries, with its result.
+            static const bool trace = std::getenv("VENDETTA_IOPLOG") != nullptr;
+            // (Checked before the name compares below, which only matter for the log.)
+            if (!trace)
+                return dispatchImportUntraced(call, cpu);
+            // Left out: string / print helpers and the calls that repeat every few hundred cycles (thread
+            // yield / sleep / wake, libsd status polls), which would bury everything else.
+            const bool noisy = iequals(call.library, "sysclib") || iequals(call.library, "stdio") ||
+                               (iequals(call.library, "thbase") && (call.ordinal >= 24u && call.ordinal <= 26u)) ||
+                               (iequals(call.library, "thbase") && (call.ordinal == 34u || call.ordinal == 40u)) ||
+                               (iequals(call.library, "libsd") && (call.ordinal == 10u || call.ordinal == 20u));
+            if (noisy)
+                return dispatchImportUntraced(call, cpu);
+            const uint32_t pc = cpu.pc, ra = cpu.gpr[31];
+            const uint32_t a0 = cpu.gpr[4], a1 = cpu.gpr[5], a2 = cpu.gpr[6], a3 = cpu.gpr[7];
+            const ImportDisposition disposition = dispatchImportUntraced(call, cpu);
+            static uint32_t traced = 0u;
+            if (traced < 200000u)
+            {
+                ++traced;
+                std::ostringstream out;
+                out << "[iop-call] " << call.library << ':' << std::dec << call.ordinal << std::hex
+                    << " pc=0x" << pc << " ra=0x" << ra << " a0=0x" << a0 << " a1=0x" << a1
+                    << " a2=0x" << a2 << " a3=0x" << a3;
+                if (disposition == ImportDisposition::JumpToGuest)
+                    out << " -> guest 0x" << cpu.pc;
+                else
+                    out << " v0=0x" << cpu.gpr[2] << (disposition == ImportDisposition::Missing ? " (missing)" : "");
+                out << " cyc=" << std::dec << totalCycles;
+                log(LogLevel::Info, out.str());
+            }
+            return disposition;
+        }
+
+        ImportDisposition dispatchImportUntraced(const IopImportCall &call, CpuState &cpu)
+        {
             const uint32_t a0 = cpu.gpr[4];
             auto setV0 = [&](uint32_t value)
             {
@@ -252,6 +319,7 @@ namespace ps2x::iop::detail
             {
                 if (const auto callback = cdvd.takeCompletionCallback())
                 {
+                    idleKnown = false;
                     pendingGuestCallbacks.emplace(
                         totalCycles + kCdvdCompletionCycles,
                         ScheduledGuestCallback{
@@ -358,8 +426,158 @@ namespace ps2x::iop::detail
             return ImportDisposition::Missing;
         }
 
+        // VENDETTA_IOPPROF=1: samples the IOP pc every 64 instructions; every 64M instructions logs the busiest
+        // 32-byte blocks (with the share of samples) and clears the counts.
+        void profileSample(uint32_t pc)
+        {
+            static const bool enabled = std::getenv("VENDETTA_IOPPROF") != nullptr;
+            if (!enabled || (totalInstructions & 63u) != 0u)
+                return;
+            ++profileCounts[pc & ~31u];
+            if (++profileSamples < (64u * 1024u * 1024u) / 64u)
+                return;
+            std::vector<std::pair<uint32_t, uint64_t>> top(profileCounts.begin(), profileCounts.end());
+            std::sort(top.begin(), top.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+            std::ostringstream out;
+            const double hostMs = static_cast<double>(profileHostNs) / 1.0e6;
+            const auto now = std::chrono::steady_clock::now();
+            const double wallMs = profileWallStart.time_since_epoch().count() == 0
+                                      ? 0.0
+                                      : std::chrono::duration<double, std::milli>(now - profileWallStart).count();
+            // runCycles calls (one per EE checkpoint) and how many of them the idle skip answered, since the last line.
+            const uint64_t calls = runCalls - profileRunCallsMark;
+            const uint64_t skips = idleSkips - profileIdleSkipsMark;
+            out << "[iop-prof] " << (64u * 1024u * 1024u) / 1000000u << "M instr in " << static_cast<uint64_t>(hostMs)
+                << " ms inside the IOP of " << static_cast<uint64_t>(wallMs) << " ms wall ("
+                << static_cast<uint64_t>(hostMs > 0.0 ? 64.0 * 1024.0 * 1024.0 / hostMs / 1000.0 : 0.0)
+                << "M instr/s while running); calls " << calls << " ("
+                << static_cast<uint64_t>(wallMs > 0.0 ? static_cast<double>(calls) * 1000.0 / wallMs : 0.0)
+                << "/s), idle skips " << skips << " ("
+                << static_cast<uint64_t>(wallMs > 0.0 ? static_cast<double>(skips) * 1000.0 / wallMs : 0.0)
+                << "/s); top blocks:";
+            profileHostNs = 0u;
+            profileWallStart = now;
+            profileRunCallsMark = runCalls;
+            profileIdleSkipsMark = idleSkips;
+            for (size_t i = 0; i < top.size() && i < 12u; ++i)
+                out << " 0x" << std::hex << top[i].first << '=' << std::dec << (top[i].second * 100u / profileSamples) << '%';
+            log(LogLevel::Info, out.str());
+            profileCounts.clear();
+            profileSamples = 0u;
+        }
+
+        class CpuNativeCall final : public ps2x::iop::NativeCall
+        {
+        public:
+            CpuNativeCall(CpuState &cpu, IopMemory &memory) noexcept : m_cpu(cpu), m_memory(memory) {}
+            [[nodiscard]] uint32_t reg(uint32_t index) const override { return index < 32u ? m_cpu.gpr[index] : 0u; }
+            void setReg(uint32_t index, uint32_t value) override
+            {
+                if (index != 0u && index < 32u)
+                    m_cpu.gpr[index] = value;
+            }
+            [[nodiscard]] bool readRam(uint32_t address, void *destination, size_t size) const override
+            {
+                return m_memory.readRam(address, destination, size);
+            }
+            bool writeRam(uint32_t address, const void *source, size_t size) override
+            {
+                return m_memory.writeRam(address, source, size);
+            }
+
+        private:
+            CpuState &m_cpu;
+            IopMemory &m_memory;
+        };
+
+        // VENDETTA_IOP_NATIVE_VERIFY: the routine being interpreted for a check, until it returns to $ra
+        struct NativeWatch
+        {
+            CpuState *cpu = nullptr;
+            const ps2x::iop::NativeHook *hook = nullptr;
+            uint32_t ra = 0;
+            uint32_t sp = 0;
+            uint64_t instructions = 0;
+        };
+        NativeWatch nativeWatch;
+        uint64_t nativeVerifyChecks = 0;
+        uint64_t nativeVerifyDifferences = 0;
+
+        // At a hooked routine's first instruction (a clean entry: no branch or load in flight, the code as hashed):
+        // run it natively and continue at $ra; true = done. In the verify mode it is interpreted and checked instead.
+        bool runNativeHook(CpuState &cpu)
+        {
+            if (cpu.branchPending || cpu.pendingLoad)
+                return false;
+            const uint32_t phys = physicalAddress(cpu.pc);
+            for (const ps2x::iop::NativeHook &hook : nativeHooks())
+            {
+                if (physicalAddress(hook.address) != phys)
+                    continue;
+                const std::span<const uint8_t> ram = memory.ram();
+                if (hook.codeBytes > ram.size() - phys ||
+                    ps2x::iop::nativeCodeHash(ram.data() + phys, hook.codeBytes) != hook.codeHash)
+                    return false;
+                CpuNativeCall call(cpu, memory);
+                static const bool verify = []
+                {
+                    const char *value = std::getenv("VENDETTA_IOP_NATIVE_VERIFY");
+                    return value && *value && *value != '0';
+                }();
+                if (verify && hook.check)
+                {
+                    if (nativeWatch.cpu == nullptr)
+                    {
+                        hook.check(call, true, 0u);
+                        nativeWatch = NativeWatch{&cpu, &hook, cpu.gpr[31], cpu.gpr[29], 1u};
+                    }
+                    return false;
+                }
+                const uint32_t instructions = hook.run ? hook.run(call) : 0u;
+                if (instructions == 0u)
+                    return false;
+                static bool announced = false;
+                if (!announced)
+                {
+                    announced = true;
+                    std::ostringstream out;
+                    out << "[iop-native] running " << hook.name << " natively (0x" << std::hex << hook.address << ")";
+                    log(LogLevel::Info, out.str());
+                }
+                cpu.pc = cpu.gpr[31];
+                totalInstructions += instructions;
+                totalCycles += instructions;
+                return true;
+            }
+            return false;
+        }
+
+        void watchNativeHook(CpuState &cpu)
+        {
+            if (cpu.pc != nativeWatch.ra || cpu.gpr[29] != nativeWatch.sp || cpu.branchPending)
+            {
+                ++nativeWatch.instructions;
+                return;
+            }
+            CpuNativeCall call(cpu, memory);
+            nativeVerifyDifferences += nativeWatch.hook->check(call, false, nativeWatch.instructions);
+            if ((++nativeVerifyChecks & 255u) == 0u)
+            {
+                std::ostringstream out;
+                out << "[iop-native] verify: " << nativeVerifyChecks << " calls of " << nativeWatch.hook->name
+                    << " checked, " << nativeVerifyDifferences << " differences";
+                log(LogLevel::Info, out.str());
+            }
+            nativeWatch = NativeWatch{};
+        }
+
+        // VENDETTA_IOPPROF: tested here, so profileSample is not called at every instruction when it is off
+        const bool profileEnabled = std::getenv("VENDETTA_IOPPROF") != nullptr;
+
         bool step(CpuState &cpu)
         {
+            if (profileEnabled)
+                profileSample(cpu.pc);
             if (cpu.stopped)
                 return false;
             if (cpu.pc == kThreadReturnSentinel || cpu.pc == kCallReturnSentinel)
@@ -377,8 +595,18 @@ namespace ps2x::iop::detail
             }
             if (checkInterrupt(cpu))
                 return true;
+            if (nativeWatch.cpu == &cpu)
+                watchNativeHook(cpu);
+            if (g_nativeHookPages[physicalAddress(cpu.pc) >> 12] != 0u && runNativeHook(cpu))
+                return !cpu.stopped;
 
-            if (const auto import = imports.decode(cpu.pc))
+            // An import stub is "jr $ra; addiu $0, $0, ordinal": only a jr $ra can be one, so the registry (which reads
+            // the instruction again through IopMemory) is asked only then — the pc is in RAM (checked above).
+            const uint32_t phys = physicalAddress(cpu.pc);
+            uint32_t word = 0u;
+            if ((phys & 3u) == 0u)
+                std::memcpy(&word, memory.ram().data() + phys, sizeof(word));
+            if (const auto import = ((phys & 3u) != 0u || word == 0x03E00008u) ? imports.decode(cpu.pc) : decltype(imports.decode(cpu.pc)){})
             {
                 const ImportDisposition disposition = dispatchImport(*import, cpu);
                 ++totalInstructions;
@@ -399,6 +627,8 @@ namespace ps2x::iop::detail
 
         uint32_t runCpu(CpuState &cpu, uint32_t instructionBudget)
         {
+            // Guest code can change anything the idle skip relies on (threads, DMA, callbacks, timers).
+            idleKnown = false;
             CpuState *previous = activeCpu;
             activeCpu = &cpu;
             const uint64_t start = totalInstructions;
@@ -406,12 +636,17 @@ namespace ps2x::iop::detail
             {
                 if (!step(cpu))
                     break;
-                if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
+                // After every instruction, as before - but only called when something can be due: a call with
+                // nothing due changes nothing. No DMA interrupt completes before dmaDueFloor, and the guest
+                // callbacks are kept in cycle order, so the first one is the earliest.
+                if (!servicingDmaInterrupts && totalCycles >= dmaDueFloor)
                     servicePendingDmaInterrupts();
-                if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
+                if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty() &&
+                    pendingGuestCallbacks.begin()->first <= totalCycles)
                     servicePendingGuestCallbacks();
             }
             activeCpu = previous;
+            idleKnown = false;
             return static_cast<uint32_t>(totalInstructions - start);
         }
 
@@ -421,7 +656,8 @@ namespace ps2x::iop::detail
                               uint32_t a2,
                               uint32_t a3,
                               uint32_t gp,
-                              uint32_t budget = kMaxCallInstructions)
+                              uint32_t budget = kMaxCallInstructions,
+                              uint32_t extraRounds = 0u)
         {
             struct CallDepthGuard
             {
@@ -456,6 +692,15 @@ namespace ps2x::iop::detail
             }
             cpu.gpr[31] = kCallReturnSentinel;
             runCpu(cpu, budget);
+            // A module start routine (run here, not as an IOP thread) may outlast one budget: libsd's sceSdInit
+            // polls the SPU2, or it waits for a vblank. Real modload runs it to completion, so keep going.
+            for (uint32_t round = 0; round < extraRounds && !cpu.stopped && cpu.pc != kCallReturnSentinel; ++round)
+            {
+                std::fprintf(stderr, "[iop-start] call 0x%x not finished (pc 0x%x yielded %d), round %u\n", address,
+                             cpu.pc, cpu.yielded ? 1 : 0, round + 1u);
+                cpu.yielded = false;
+                runCpu(cpu, budget);
+            }
             return cpu.gpr[2];
         }
 
@@ -483,22 +728,32 @@ namespace ps2x::iop::detail
         // Not that good to use exception handling for control flow but will do for now
         void servicePendingDmaInterrupts()
         {
-            if (servicingDmaInterrupts || pendingDmaInterrupts.empty())
+            // Before dmaDueFloor nothing in the list is due, and a walk that finds nothing due changes nothing.
+            if (servicingDmaInterrupts || totalCycles < dmaDueFloor)
                 return;
+            if (pendingDmaInterrupts.empty())
+            {
+                dmaDueFloor = UINT64_MAX;
+                return;
+            }
 
             servicingDmaInterrupts = true;
 
             std::vector<int> completed;
+            uint64_t remainingFloor = UINT64_MAX;
             for (auto it = pendingDmaInterrupts.begin(); it != pendingDmaInterrupts.end();)
             {
                 if (it->second > totalCycles)
                 {
+                    remainingFloor = std::min(remainingFloor, it->second);
                     ++it;
                     continue;
                 }
                 completed.push_back(it->first);
                 it = pendingDmaInterrupts.erase(it);
             }
+            // Exact for what is left; a handler below that starts a new DMA lowers it again (schedulePendingDma).
+            dmaDueFloor = remainingFloor;
             try
             {
                 for (const int irq : completed)
@@ -514,7 +769,9 @@ namespace ps2x::iop::detail
 
         void servicePendingGuestCallbacks()
         {
-            if (servicingGuestCallbacks || pendingGuestCallbacks.empty())
+            // In cycle order: when the first one is not due, none is, and the walk below would take nothing.
+            if (servicingGuestCallbacks || pendingGuestCallbacks.empty() ||
+                pendingGuestCallbacks.begin()->first > totalCycles)
                 return;
 
             std::vector<ScheduledGuestCallback> callbacks;
@@ -553,28 +810,98 @@ namespace ps2x::iop::detail
             servicingGuestCallbacks = false;
         }
 
+        // Called at every EE checkpoint (millions of times a second), mostly with 1-4 IOP cycles, and most of
+        // those calls find the IOP idle: every thread waiting and nothing due within them.
         void runCycles(uint64_t cycles) noexcept
+        {
+            // The IOP runs up to the total of the cycles it has been given, not "now + cycles": a step can take more
+            // than one cycle (a native hook charges a whole routine at once) and pass the target; counted from where
+            // the IOP stood, that overshoot was never paid back and the IOP's clock — the SPU2's 48 kHz output with it
+            // — ran ahead of the EE's (the host's audio queue overflowed; the movies, timed by their sound, stuttered).
+            // Time the IOP spent outside runCycles (a synchronous RPC, a module load) counts as given, as before.
+            if (totalCycles > cyclesAfterLastRun)
+                grantedCycles += totalCycles - cyclesAfterLastRun;
+            grantedCycles += cycles;
+            const uint64_t target = std::max(grantedCycles, totalCycles);
+            ++runCalls;
+            // The idle skip. idleKnown means the last pass of runCyclesFull ended in its idle branch and nothing
+            // has changed since (every change clears it - see idleKnown). That branch found no thread ready and
+            // nothing - delay wake, DMA completion, guest callback, timer - due before idleUntil. Running the loop
+            // again with a target at or before idleUntil, its one pass would service nothing (all of those are due
+            // at idleUntil or later, after the current cycle, and a service call with nothing due changes nothing),
+            // find no thread (none was ready and no delay ends by then), take the idle branch with the same
+            // earliest cycle and set totalCycles to min(target, idleUntil) = target. Setting it here is that same
+            // result, and idleKnown / idleUntil are what that pass would have left.
+            if (idleKnown && target <= idleUntil)
+            {
+                ++idleSkips;
+                static const bool verify = std::getenv("VENDETTA_IOP_VERIFY") != nullptr;
+                if (!verify)
+                    totalCycles = target;
+                else
+                    verifyIdleSkip(target);
+            }
+            else
+            {
+                runCyclesFull(target);
+            }
+            if (totalCycles >= memory.spu2().nextSampleCycle())
+                runSoundChip();
+            cyclesAfterLastRun = totalCycles;
+        }
+
+        // The SPU2 plays up to the IOP's cycle (a 48 kHz sample every 768 cycles); its output goes to the host in
+        // blocks of 256 frames (~5 ms).
+        void runSoundChip() noexcept
         {
             try
             {
-                const uint64_t target = totalCycles + cycles;
+                memory.spu2().advanceTo(totalCycles, soundOutput);
+                if (soundOutput.size() >= 512u)
+                {
+                    host.submitAudio(soundOutput.data(), soundOutput.size() / 2u);
+                    soundOutput.clear();
+                }
+            }
+            catch (...)
+            {
+                soundOutput.clear();
+            }
+        }
+
+        void runCyclesFull(uint64_t target) noexcept
+        {
+            try
+            {
                 while (totalCycles < target)
                 {
+                    // This pass may change what the idle skip relies on (services, wakes, runs a thread); only
+                    // its idle branch, the last thing a pass does, sets it again.
+                    idleKnown = false;
+                    ++loopPasses;
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
                     timrman.serviceDue(totalCycles, *this);
-                    IopThread *next = kernel.beginNextReady(totalCycles);
+                    uint64_t nextDelayWake = UINT64_MAX;
+                    IopThread *next = kernel.beginNextReady(totalCycles, &nextDelayWake);
                     if (!next)
                     {
-                        uint64_t nextWake = kernel.nextWakeCycle(target);
+                        // The earliest cycle anything is due. (min(target, this) is what the loop always used:
+                        // nextWakeCycle(target) only folded target in earlier.)
+                        uint64_t nextEvent = nextDelayWake;
                         for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
-                            nextWake = std::min(nextWake, completionCycle);
+                            nextEvent = std::min(nextEvent, completionCycle);
                         if (!pendingGuestCallbacks.empty())
-                            nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
-                        nextWake = timrman.nextEventCycle(nextWake);
-                        totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
+                            nextEvent = std::min(nextEvent, pendingGuestCallbacks.begin()->first);
+                        nextEvent = timrman.nextEventCycle(nextEvent);
+                        totalCycles = std::max(totalCycles + 1u, std::min(target, nextEvent));
+                        idleUntil = nextEvent;
+                        // Only at the top level: nested inside running guest code (activeCpu set), a kernel call
+                        // after this could make a thread ready without clearing the flag before runCpu returns.
+                        idleKnown = activeCpu == nullptr;
                         continue;
                     }
+                    ++threadSlices;
                     const uint64_t before = totalCycles;
                     runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
                     kernel.endTimeslice(*next, kThreadReturnSentinel);
@@ -586,6 +913,44 @@ namespace ps2x::iop::detail
             {
                 // Runtime scheduling must never throw through EeScheduler::accountCycles().
             }
+        }
+
+        // VENDETTA_IOP_VERIFY=1: where the idle skip would answer, run the full loop instead (its result is the
+        // one kept) and check it did only what the skip assumes: one pass, nothing serviced, no thread run, no
+        // instruction, the same delays / DMA list / callbacks / timers, ending at the target with the same idleUntil.
+        void verifyIdleSkip(uint64_t target) noexcept
+        {
+            const uint64_t cycleBefore = totalCycles;
+            const uint64_t untilBefore = idleUntil;
+            const uint64_t instructionsBefore = totalInstructions;
+            const uint64_t slicesBefore = threadSlices;
+            const uint64_t passesBefore = loopPasses;
+            const size_t dmaBefore = pendingDmaInterrupts.size();
+            const size_t callbacksBefore = pendingGuestCallbacks.size();
+            const uint64_t delayBefore = kernel.nextWakeCycle(UINT64_MAX);
+            const uint64_t timerBefore = timrman.nextEventCycle(UINT64_MAX);
+            runCyclesFull(target);
+            ++verifyChecks;
+            const bool same = totalCycles == target && totalInstructions == instructionsBefore &&
+                              threadSlices == slicesBefore && loopPasses == passesBefore + 1u &&
+                              pendingDmaInterrupts.size() == dmaBefore &&
+                              pendingGuestCallbacks.size() == callbacksBefore &&
+                              kernel.nextWakeCycle(UINT64_MAX) == delayBefore &&
+                              timrman.nextEventCycle(UINT64_MAX) == timerBefore &&
+                              idleKnown && idleUntil == untilBefore;
+            if (!same && ++verifyMismatches <= 40u)
+            {
+                std::cerr << "[iopverify] idle skip differs from the full loop: cycle " << cycleBefore << " -> target "
+                          << target << " (idle until " << untilBefore << "); the loop reached " << totalCycles
+                          << " in " << (loopPasses - passesBefore) << " pass(es), ran " << (threadSlices - slicesBefore)
+                          << " thread slice(s) and " << (totalInstructions - instructionsBefore)
+                          << " instruction(s); DMA " << dmaBefore << "->" << pendingDmaInterrupts.size()
+                          << ", callbacks " << callbacksBefore << "->" << pendingGuestCallbacks.size()
+                          << ", idle " << (idleKnown ? "known" : "unknown") << " until " << idleUntil << std::endl;
+            }
+            if ((verifyChecks & ((1ull << 25u) - 1u)) == 0u)
+                std::cerr << "[iopverify] " << verifyChecks << " idle skips checked against the full loop, "
+                          << verifyMismatches << " differed" << std::endl;
         }
 
         ModuleLoadResult loadImage(std::string path, std::span<const uint8_t> image, const void *arguments, uint32_t argumentSize)
@@ -624,7 +989,8 @@ namespace ps2x::iop::detail
                     write8(args + argumentSize, 0u);
                 }
             }
-            const uint32_t startResult = callFunction(module.entry, argumentSize, args, 0u, 0u, module.gp);
+            const uint32_t startResult = callFunction(module.entry, argumentSize, args, 0u, 0u, module.gp,
+                                                      kMaxCallInstructions, 50u);
             if (args)
                 freeAllocation(args);
             module.resident = startResult == 0u || startResult == 2u;
@@ -655,7 +1021,8 @@ namespace ps2x::iop::detail
         ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
         {
             std::vector<uint8_t> image;
-            if (!IopModuleLoader::readElfFromGuest(host, guestAddress, image))
+            if (!IopModuleLoader::readElfFromGuest(host, guestAddress, image) &&
+                !IopModuleLoader::readElfFromIop(memory, guestAddress, image))
                 return {true, -1, -1};
             std::ostringstream tag;
             tag << "buffer@0x" << std::hex << guestAddress;
@@ -664,6 +1031,7 @@ namespace ps2x::iop::detail
 
         bool stopModule(int32_t moduleId, int32_t *result)
         {
+            idleKnown = false; // threads are ended here without running guest code
             auto it = modules.find(moduleId);
             if (it == modules.end())
                 return false;
@@ -696,10 +1064,35 @@ namespace ps2x::iop::detail
         IopLoadcore loadcore;
         std::map<int, Module> modules;
         std::map<int, uint64_t> pendingDmaInterrupts;
+        std::unordered_map<uint32_t, uint64_t> profileCounts;
+        uint64_t profileSamples = 0u;
+        uint64_t profileHostNs = 0u;
+        std::chrono::steady_clock::time_point profileWallStart{};
         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
+        // A lower bound of every completion cycle in pendingDmaInterrupts (UINT64_MAX: none due ever): kept by
+        // schedulePendingDma (min with each new one) and set exactly by each walk in servicePendingDmaInterrupts.
+        uint64_t dmaDueFloor = UINT64_MAX;
+        // The idle skip in runCycles. Set only by runCyclesFull's idle branch: then no thread was ready and nothing
+        // was due before idleUntil. Cleared by everything that can change that: each pass of runCyclesFull, runCpu
+        // (all guest code: threads, RPC servers, SIF command handlers, interrupt / timer / cdvd callbacks, module
+        // starts) on entry and exit, a new DMA (schedulePendingDma), a new cdvd callback, reset, stopModule, and
+        // every IopEmulator call from the EE side that changes IOP state.
+        bool idleKnown = false;
+        uint64_t idleUntil = 0u;
+        uint64_t runCalls = 0u;      // runCycles calls
+        uint64_t idleSkips = 0u;     // ... answered by the idle skip
+        uint64_t threadSlices = 0u;  // runCyclesFull passes that ran a thread
+        uint64_t loopPasses = 0u;    // runCyclesFull passes
+        uint64_t verifyChecks = 0u;
+        uint64_t verifyMismatches = 0u;
+        uint64_t profileRunCallsMark = 0u;
+        uint64_t profileIdleSkipsMark = 0u;
         uint32_t nextModuleId = 1;
         uint32_t moduleCursor = kModuleLoadBase;
+        uint64_t grantedCycles = 0;      // the cycles runCycles has handed the IOP so far (see there)
+        uint64_t cyclesAfterLastRun = 0; // totalCycles when runCycles last returned
         uint64_t totalCycles = 0;
+        std::vector<int16_t> soundOutput; // SPU2 frames not yet handed to the host
         uint64_t totalInstructions = 0;
         uint64_t eeCycleCarry = 0;
         CpuState *activeCpu = nullptr;
@@ -724,33 +1117,73 @@ namespace ps2x::iop::detail
         m_impl->reset();
     }
 
+    // Every call from the EE side that can change IOP state clears the idle skip first (Impl::idleKnown): most of
+    // them run guest code, which clears it anyway, but this way none can be missed.
     ModuleLoadResult IopEmulator::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
     {
+        m_impl->idleKnown = false;
         return m_impl->loadModule(path, arguments, argumentSize);
     }
 
     ModuleLoadResult IopEmulator::loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
     {
+        m_impl->idleKnown = false;
         return m_impl->loadModuleBuffer(guestAddress, arguments, argumentSize);
     }
 
     bool IopEmulator::stopModule(int32_t moduleId, int32_t *result)
     {
+        m_impl->idleKnown = false;
         return m_impl->stopModule(moduleId, result);
     }
 
     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
     {
+        // The EE hands its time over at every checkpoint, 8-32 EE cycles = 1-4 IOP cycles. While an IOP thread is
+        // ready, each such call is a whole pass of runCyclesFull (DMA and callback servicing, timers, picking a thread)
+        // for 1-4 instructions — the busier the EE, the finer the IOP's time is cut and the more it costs (a sound
+        // driver's 2 M instructions a second took 625,000 passes a second while the EE was busy, 3.3 instructions each,
+        // against ~20,000 when it idles), until a game thread that falls behind never catches up. So while the IOP has
+        // work, its time is handed over in batches of kIopBatchCycles (~14 us at 36.864 MHz — the EE and the IOP run side
+        // by side on the console, and nothing the EE can see is that fine); an IOP known to be idle through the cycles
+        // takes them at once (the idle skip, as cheap as before).
+        constexpr uint64_t kIopBatchCycles = 512u;
         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
         const uint64_t iopCycles = total / 8u;
+        if (!iopCycles)
+        {
+            m_impl->eeCycleCarry = total;
+            return;
+        }
+        if (iopCycles < kIopBatchCycles &&
+            !(m_impl->idleKnown && m_impl->totalCycles + iopCycles <= m_impl->idleUntil))
+        {
+            m_impl->eeCycleCarry = total;
+            return;
+        }
         m_impl->eeCycleCarry = total % 8u;
-        if (iopCycles)
+        static const bool profile = std::getenv("VENDETTA_IOPPROF") != nullptr;
+        if (!profile)
+        {
             m_impl->runCycles(iopCycles);
+            return;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        m_impl->runCycles(iopCycles);
+        m_impl->profileHostNs += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
     }
 
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
     {
+        m_impl->idleKnown = false;
         return m_impl->rpc.handleRpc(request, *m_impl);
+    }
+
+    bool IopEmulator::handleSifCommand(uint32_t commandId, const void *packet, size_t packetSize)
+    {
+        m_impl->idleKnown = false;
+        return m_impl->rpc.handleSifCommand(commandId, packet, packetSize, *m_impl);
     }
 
     bool IopEmulator::hasRpcServer(uint32_t sid) const noexcept
@@ -760,16 +1193,19 @@ namespace ps2x::iop::detail
 
     void IopEmulator::onSifTransfer(const SifTransfer &transfer)
     {
+        m_impl->idleKnown = false;
         m_impl->rpc.onSifTransfer(transfer);
     }
 
     uint32_t IopEmulator::allocateMemory(uint32_t size, uint32_t alignment)
     {
+        m_impl->idleKnown = false;
         return m_impl->memory.allocate(size, alignment);
     }
 
     bool IopEmulator::freeMemory(uint32_t address)
     {
+        m_impl->idleKnown = false;
         return m_impl->memory.freeAllocation(address);
     }
 
@@ -781,12 +1217,14 @@ namespace ps2x::iop::detail
 
     bool IopEmulator::writeMemory(uint32_t address, const void *source, size_t size)
     {
+        m_impl->idleKnown = false;
         return isMemoryRange(address, size) &&
                m_impl->memory.writeRam(address, source, size);
     }
 
     bool IopEmulator::zeroMemory(uint32_t address, size_t size)
     {
+        m_impl->idleKnown = false;
         return isMemoryRange(address, size) &&
                m_impl->memory.zeroRam(address, size);
     }
@@ -827,4 +1265,15 @@ namespace ps2x::iop::detail
         return static_cast<uint32_t>(m_impl->rpc.serverCount());
     }
 
+}
+
+namespace ps2x::iop
+{
+    void registerNativeHook(const NativeHook &hook)
+    {
+        detail::nativeHooks().push_back(hook);
+        const uint32_t phys = detail::physicalAddress(hook.address);
+        if (phys < detail::kRamSize)
+            detail::g_nativeHookPages[phys >> 12] = 1u;
+    }
 }

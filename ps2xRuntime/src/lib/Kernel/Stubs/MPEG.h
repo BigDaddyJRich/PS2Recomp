@@ -5,6 +5,7 @@
 namespace ps2_stubs
 {
     void resetMpegStubState();
+    void mpegIpuToDmaStart(uint8_t *rdram, uint32_t &chcr, uint32_t &madr, uint32_t &qwc, uint32_t &tadr);
     void enqueueMpegDecodedFrameForTesting(uint32_t mpegAddr);
     void notifyMpegCdStreamStart(PS2Runtime *runtime = nullptr);
     void notifyMpegCdStreamDataProduced(uint32_t byteCount, bool endOfStream);

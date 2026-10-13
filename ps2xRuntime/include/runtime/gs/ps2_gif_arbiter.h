@@ -23,7 +23,7 @@ struct GifArbiterPacket
 class GifArbiter
 {
 public:
-    using ProcessPacketFn = std::function<void(const uint8_t *, uint32_t)>;
+    using ProcessPacketFn = std::function<void(GifPathId, const uint8_t *, uint32_t)>;
 
     GifArbiter() = default;
     explicit GifArbiter(ProcessPacketFn processFn);

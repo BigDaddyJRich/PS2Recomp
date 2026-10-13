@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 #include "Common.h"
 #include "Thread.h"
 #include "runtime/ee_scheduler.h"
@@ -112,7 +114,12 @@ namespace ps2_syscalls
             const int priority = static_cast<int>(getRegU32(ctx, 5));
             int oldPriority = 0;
             const int result = ee.changePriority(id, priority, interruptSafe, oldPriority);
-            setReturnS32(ctx, result);
+            if (std::getenv("VENDETTA_WAITLOG"))
+                std::fprintf(stderr, "[chprio] id=%d (self %d) prio %d -> %d result=%d ra=0x%x%c", id, ee.currentThreadId(),
+                             oldPriority, priority, result, getRegU32(ctx, 31), 10);
+            // The EE kernel returns the PREVIOUS priority on success (CRI adxm_lock saves it and adxm_unlock restores it;
+            // returning KE_OK=0 left HCTP's main thread at priority 0, starving the CRI fs/vsync threads -> ADXF hang).
+            setReturnS32(ctx, result == KE_OK ? oldPriority : result);
             ee.transferIfRequested(interruptSafe);
         }
 
@@ -256,6 +263,10 @@ namespace ps2_syscalls
         const int id = static_cast<int>(getRegU32(ctx, 4));
         const uint32_t arg = getRegU32(ctx, 5);
         GuestThread *target = ee.thread(id);
+        if (std::getenv("VENDETTA_WAITLOG"))
+            std::fprintf(stderr, "[thstart] id=%d entry=0x%x prio=%d status=%d ra=0x%x%c", id, target ? target->entry : 0u,
+                         target ? static_cast<int>(target->currentPriority) : -1, target ? static_cast<int>(target->status) : -1,
+                         getRegU32(ctx, 31), 10);
         if (!target)
         {
             setReturnS32(ctx, KE_UNKNOWN_THID);
@@ -313,16 +324,22 @@ namespace ps2_syscalls
     void SuspendThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         EeScheduler &ee = scheduler(rdram, ctx, runtime);
-        const int result = ee.suspendThread(static_cast<int>(getRegU32(ctx, 4)), false);
-        setReturnS32(ctx, result);
+        const int tid = static_cast<int>(getRegU32(ctx, 4));
+        const int result = ee.suspendThread(tid, false);
+        // EE kernel ABI: success returns the thread id, not 0 (CRI ADXM wakes its MwIdle thread only if
+        // ResumeThread(tid) == tid; HCTP "THIDRET" fix, same as BT3's)
+        setReturnS32(ctx, result == KE_OK ? tid : result);
         ee.transferIfRequested(false);
     }
 
     void ResumeThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         EeScheduler &ee = scheduler(rdram, ctx, runtime);
-        const int result = ee.resumeThread(static_cast<int>(getRegU32(ctx, 4)), false);
-        setReturnS32(ctx, result);
+        const int tid = static_cast<int>(getRegU32(ctx, 4));
+        const int result = ee.resumeThread(tid, false);
+        // EE kernel ABI: success returns the thread id, not 0 (CRI ADXM wakes its MwIdle thread only if
+        // ResumeThread(tid) == tid; HCTP "THIDRET" fix, same as BT3's)
+        setReturnS32(ctx, result == KE_OK ? tid : result);
         ee.transferIfRequested(false);
     }
 

@@ -1,5 +1,9 @@
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cctype>
+#include <fstream>
+#include <mutex>
 
 namespace
 {
@@ -413,13 +417,26 @@ namespace
         }
 
         std::memset(dst, 0, byteCount);
-        std::ifstream file(path, std::ios::binary);
+        // The file stays open between reads: games read their loads a sector at a time, and opening the disc image
+        // for every 2 KB cost more than the read itself.
+        static std::mutex openFileMutex;
+        static std::filesystem::path openPath;
+        static std::ifstream file;
+        std::lock_guard<std::mutex> lock(openFileMutex);
+        if (!file.is_open() || openPath != path)
+        {
+            file.close();
+            file.clear();
+            file.open(path, std::ios::binary);
+            openPath = path;
+        }
         if (!file.is_open())
         {
             g_lastCdError = -1;
             return false;
         }
 
+        file.clear();
         file.seekg(static_cast<std::streamoff>(offsetBytes), std::ios::beg);
         if (!file.good())
         {
@@ -428,6 +445,7 @@ namespace
         }
 
         file.read(reinterpret_cast<char *>(dst), static_cast<std::streamsize>(byteCount));
+        file.clear(); // a read past the end leaves the rest zero, as before; the next read starts clean
         g_lastCdError = 0;
         return true;
     }
@@ -588,13 +606,13 @@ namespace
         std::ptrdiff_t offset = ptr_u8 - rdram;
 
         // Check if is in rdram range
-        if (offset >= 0 && static_cast<size_t>(offset) < PS2_RAM_SIZE)
+        if (offset >= 0 && static_cast<size_t>(offset) < PS2_RAM_BACKING_SIZE)
         {
             return PS2_RAM_BASE + static_cast<uint32_t>(offset);
         }
         else
         {
-            std::cerr << "Warning: hostPtrToPs2Addr failed - host pointer " << hostPtr << " is outside rdram range [" << static_cast<void *>(rdram) << ", " << static_cast<void *>(rdram + PS2_RAM_SIZE) << ")" << std::endl;
+            std::cerr << "Warning: hostPtrToPs2Addr failed - host pointer " << hostPtr << " is outside rdram range [" << static_cast<void *>(rdram) << ", " << static_cast<void *>(rdram + PS2_RAM_BACKING_SIZE) << ")" << std::endl;
             return 0;
         }
     }
@@ -773,6 +791,23 @@ namespace
         return out;
     }
 
+    // The EE calling convention (MIPS EABI with 64-bit registers): every argument takes one 64-bit slot — the eight
+    // argument registers a0-a3 / t0-t3 (r4-r11), then the caller's stack from its sp + 0 in 8-byte slots — and a
+    // soft-float double is one such slot. A va_list walks the same 8-byte slots (a variadic function spills t0..t3
+    // with sd next to the caller's stack arguments). (The O32 rules used before — 4-byte slots, doubles in two
+    // registers, stack arguments from sp + 0x10 — read the second of two va_list arguments as 0 / -1.)
+    // VENDETTA_GAMEPRINT=1: the game's own debug prints (printf / scePrintf) on stderr as "[game] ..." lines
+    inline void printGameText(const std::string &text)
+    {
+        static const bool enabled = std::getenv("VENDETTA_GAMEPRINT") != nullptr;
+        if (!enabled || text.empty())
+            return;
+        std::string line = "[game] " + text;
+        if (line.back() != '\n')
+            line.push_back('\n');
+        std::fwrite(line.data(), 1, line.size(), stderr);
+    }
+
     class Ps2VarArgCursor
     {
     public:
@@ -781,7 +816,7 @@ namespace
               m_ctx(ctx),
               m_runtime(runtime),
               m_fixedArgs(fixedArgs),
-              m_stackBase(getRegU32(ctx, 29) + 0x10)
+              m_stackBase(getRegU32(ctx, 29))
         {
             if (m_fixedArgs < 0)
             {
@@ -792,38 +827,31 @@ namespace
 
         uint32_t nextU32()
         {
-            const uint32_t value = readWordAtSlot(m_slotIndex);
-            ++m_slotIndex;
-            return value;
+            return static_cast<uint32_t>(nextU64());
         }
 
         uint64_t nextU64()
         {
-            // O32 ABI aligns 64-bit variadic values on even 32-bit slots.
-            if ((m_slotIndex & 1u) != 0u)
-            {
-                ++m_slotIndex;
-            }
-            const uint64_t low = readWordAtSlot(m_slotIndex);
-            const uint64_t high = readWordAtSlot(m_slotIndex + 1u);
-            m_slotIndex += 2u;
-            return low | (high << 32);
+            const uint64_t value = readSlot(m_slotIndex);
+            ++m_slotIndex;
+            return value;
         }
 
     private:
-        uint32_t readWordAtSlot(uint32_t slotIndex) const
+        uint64_t readSlot(uint32_t slotIndex) const
         {
             if (slotIndex < 8u)
             {
-                // EE calls use eight integer argument registers (a0-a3, t0-t3 / r4-r11).
-                return getRegU32(m_ctx, 4 + static_cast<int>(slotIndex));
+                const int reg = 4 + static_cast<int>(slotIndex);
+                return static_cast<uint64_t>(_mm_extract_epi64(m_ctx->r[reg], 0));
             }
 
-            const uint32_t stackIndex = slotIndex - 8u;
-            const uint32_t stackAddr = m_stackBase + stackIndex * 4u;
-            uint32_t value = 0;
-            (void)tryReadWordFromGuest(m_rdram, m_runtime, stackAddr, value);
-            return value;
+            const uint32_t stackAddr = m_stackBase + (slotIndex - 8u) * 8u;
+            uint32_t low = 0;
+            uint32_t high = 0;
+            (void)tryReadWordFromGuest(m_rdram, m_runtime, stackAddr, low);
+            (void)tryReadWordFromGuest(m_rdram, m_runtime, stackAddr + 4u, high);
+            return static_cast<uint64_t>(low) | (static_cast<uint64_t>(high) << 32);
         }
 
         uint8_t *m_rdram;
@@ -844,18 +872,17 @@ namespace
 
         uint32_t nextU32()
         {
-            uint32_t value = 0;
-            (void)tryReadWordFromGuest(m_rdram, m_runtime, m_curr, value);
-            m_curr += 4;
-            return value;
+            return static_cast<uint32_t>(nextU64());
         }
 
         uint64_t nextU64()
         {
-            m_curr = (m_curr + 7u) & ~7u;
-            const uint64_t low = nextU32();
-            const uint64_t high = nextU32();
-            return low | (high << 32);
+            uint32_t low = 0;
+            uint32_t high = 0;
+            (void)tryReadWordFromGuest(m_rdram, m_runtime, m_curr, low);
+            (void)tryReadWordFromGuest(m_rdram, m_runtime, m_curr + 4u, high);
+            m_curr += 8u;
+            return static_cast<uint64_t>(low) | (static_cast<uint64_t>(high) << 32);
         }
 
     private:
@@ -1793,6 +1820,44 @@ namespace
         if (!ptr)
             return false;
         std::memcpy(&out, ptr, sizeof(out));
+        return true;
+    }
+
+    // Real libgraph sceGsLoadImage (0x60 bytes): giftag0 (PACKED A+D, NLOOP=4), BITBLTBUF/TRXPOS/TRXREG/TRXDIR
+    // register pairs, giftag1 (IMAGE, EOP, NLOOP=image qwc). Games copy these qwords straight into their own
+    // DMA packets (HCTP CChar ctor memcpy's 0x50 bytes after a VIF DIRECT), so the layout must be exact.
+    static bool writeGsLoadImage(uint8_t *rdram, uint32_t addr, const GsImageMem &img, uint32_t imageBytes)
+    {
+        uint8_t *ptr = getMemPtr(rdram, addr);
+        if (!ptr)
+            return false;
+        const uint64_t imageQwc = (static_cast<uint64_t>(imageBytes) + 15u) / 16u;
+        const uint64_t q[12] = {
+            4ull | (1ull << 60), 0xEull,
+            (static_cast<uint64_t>(img.vram_addr & 0x3FFFu) << 32) | (static_cast<uint64_t>(img.vram_width & 0x3Fu) << 48) |
+                (static_cast<uint64_t>(img.psm & 0x3Fu) << 56), 0x50ull,
+            (static_cast<uint64_t>(img.x & 0x7FFu) << 32) | (static_cast<uint64_t>(img.y & 0x7FFu) << 48), 0x51ull,
+            static_cast<uint64_t>(img.width & 0xFFFu) | (static_cast<uint64_t>(img.height & 0xFFFu) << 32), 0x52ull,
+            0ull, 0x53ull,
+            (imageQwc & 0x7FFFu) | (1ull << 15) | (2ull << 58), 0ull};
+        std::memcpy(ptr, q, sizeof(q));
+        return true;
+    }
+
+    static bool readGsLoadImage(uint8_t *rdram, uint32_t addr, GsImageMem &out)
+    {
+        const uint8_t *ptr = getConstMemPtr(rdram, addr);
+        if (!ptr)
+            return false;
+        uint64_t q[12];
+        std::memcpy(q, ptr, sizeof(q));
+        out.vram_addr = static_cast<uint16_t>((q[2] >> 32) & 0x3FFFu);
+        out.vram_width = static_cast<uint8_t>((q[2] >> 48) & 0x3Fu);
+        out.psm = static_cast<uint8_t>((q[2] >> 56) & 0x3Fu);
+        out.x = static_cast<uint16_t>((q[4] >> 32) & 0x7FFu);
+        out.y = static_cast<uint16_t>((q[4] >> 48) & 0x7FFu);
+        out.width = static_cast<uint16_t>(q[6] & 0xFFFu);
+        out.height = static_cast<uint16_t>((q[6] >> 32) & 0xFFFu);
         return true;
     }
 

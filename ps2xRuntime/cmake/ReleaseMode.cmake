@@ -15,7 +15,7 @@ function(EnableFastReleaseMode TargetName)
                 /Gw # global data in COMDAT
                 /GF # string pooling
                 /Zc:inline # remove unreferenced inline
-                /fp:fast # fast math (graphics friendly)
+                /fp:precise # exact float maths: the game's float code and the VU model must not be reordered or fused
                 /DNDEBUG
                 /arch:AVX2 # Advanced Vector Extensions 2
                 /GS- # Disable Buffer Security Check (faster)

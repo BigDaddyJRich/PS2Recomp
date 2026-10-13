@@ -23,8 +23,15 @@
 
 class GS;
 
-constexpr uint32_t PS2_RAM_SIZE = 32u * 1024u * 1024u; // 32MB
-constexpr uint32_t PS2_RAM_MASK = PS2_RAM_SIZE - 1u;   // Mask for 32MB alignment
+constexpr uint32_t PS2_RAM_SIZE = 32u * 1024u * 1024u; // 32MB: the EE's RAM as the game sees it (stack, heap, GetMemorySize)
+// The host array behind guest RAM. Bigger than the PS2's 32 MB so the runtime (or game-specific code) can place data
+// at guest addresses above 32 MB that the game's own code reads like any other RAM. Only the first PS2_RAM_SIZE bytes
+// are committed at start; the rest is reserved and committed on request (PS2Memory::commitRam), so a guest access
+// above 32 MB that nothing asked for faults (and is reported) instead of silently reading zeros. A power of two at most
+// 0x10000000, where the I/O space starts: every RAM mirror (0x20000000, 0x30000000, 0x80000000, 0xA0000000) is a
+// multiple of it, so masking folds them as before.
+constexpr uint32_t PS2_RAM_BACKING_SIZE = 256u * 1024u * 1024u;
+constexpr uint32_t PS2_RAM_MASK = PS2_RAM_BACKING_SIZE - 1u;
 constexpr uint32_t PS2_RAM_BASE = 0x00000000;          // Physical base of RDRAM
 constexpr uint32_t PS2_SCRATCHPAD_BASE = 0x70000000;
 constexpr uint32_t PS2_SCRATCHPAD_ALIAS_BASE = 0xF0000000;
@@ -68,7 +75,10 @@ inline constexpr uint32_t PS2_FIO_S_IFDIR = 0x1000;
 inline constexpr uint32_t PS2_FIO_S_IFREG = 0x2000;
 
 static_assert((PS2_RAM_SIZE & (PS2_RAM_SIZE - 1u)) == 0u, "PS2_RAM_SIZE must be a power of two");
-static_assert(PS2_RAM_MASK == (PS2_RAM_SIZE - 1u), "PS2_RAM_MASK must match PS2_RAM_SIZE");
+static_assert((PS2_RAM_BACKING_SIZE & (PS2_RAM_BACKING_SIZE - 1u)) == 0u, "PS2_RAM_BACKING_SIZE must be a power of two");
+static_assert(PS2_RAM_BACKING_SIZE >= PS2_RAM_SIZE && PS2_RAM_BACKING_SIZE <= 0x10000000u,
+              "PS2_RAM_BACKING_SIZE must hold the PS2's RAM and stay below the I/O space");
+static_assert(PS2_RAM_MASK == (PS2_RAM_BACKING_SIZE - 1u), "PS2_RAM_MASK must match PS2_RAM_BACKING_SIZE");
 
 inline std::atomic<uint8_t *> &ps2ScratchpadHostPtrStorage()
 {
@@ -134,7 +144,7 @@ inline bool ps2ResolveGuestPointer(uint32_t addr, uint32_t &offset, bool &scratc
         phys = addr & 0x1FFFFFFFu;
     }
 
-    if (phys >= PS2_RAM_SIZE)
+    if (phys >= PS2_RAM_BACKING_SIZE)
     {
         phys &= PS2_RAM_MASK;
     }
@@ -258,6 +268,9 @@ struct JumpTable
     std::vector<uint32_t> targets; // Jump targets
 };
 
+class ChainWorker;
+enum class ChainFence : uint8_t;
+
 class PS2Memory
 {
 public:
@@ -270,7 +283,17 @@ public:
     PS2Memory &operator=(PS2Memory &&) = delete;
 
     // Initialize memory
-    bool initialize(size_t ramSize = PS2_RAM_SIZE);
+    bool initialize();
+
+    // Makes guest RAM [guestOffset, guestOffset + size) usable (above PS2_RAM_SIZE it is only reserved until then).
+    // Returns false if the range is outside PS2_RAM_BACKING_SIZE or the host refused.
+    bool commitRam(uint32_t guestOffset, uint32_t size);
+    // True if a host address lies in guest RAM's reserved range (for reporting a stray access above 32 MB).
+    bool isRamHostAddress(const void *host) const
+    {
+        const auto *p = static_cast<const uint8_t *>(host);
+        return m_rdram && p >= m_rdram && p < m_rdram + PS2_RAM_BACKING_SIZE;
+    }
 
     // Memory access methods
     uint8_t *getRDRAM() { return m_rdram; }
@@ -345,6 +368,15 @@ public:
     void processVIF1Data(const uint8_t *data, uint32_t sizeBytes);
     void processPendingTransfers();
     std::vector<uint32_t> consumeCompletedDmacCauses();
+    // The chain worker (runtime/ps2_chain.h): DMA kicks hand it their VIF1 / GIF bytes; reads of what it owns wait
+    // for it. Null = everything runs at once, as before.
+    void setChainWorker(ChainWorker *chain) { m_chain = chain; }
+    // A VIF1 register write's effect on the VIF1 state (the chain runs it in order with the VIF1 stream).
+    void applyVif1RegisterWrite(uint32_t address, uint32_t value);
+    // An IO register as stored, without readIORegister's side effects or the chain's state (debug readers, stubs).
+    uint32_t peekIORegister(uint32_t address) const;
+    // The game thread's CSR read at a site known to use only CSR.FIELD (the chain's exemption, set per read).
+    static void skipNextCsrFence() noexcept;
 
     int pollDmaRegisters();
 
@@ -399,6 +431,11 @@ public:
 
     GifPacketCallback m_gifPacketCallback;
     GifArbiter *m_gifArbiter = nullptr;
+    ChainWorker *m_chain = nullptr;
+    void fenceChain(ChainFence reason);
+    void fenceGsPrivAccess(uint32_t address);
+    void submitChainGif(const uint8_t *data, uint32_t sizeBytes);
+    void submitChainVif1(const uint8_t *data, uint32_t sizeBytes);
     Vu1MscalCallback m_vu1MscalCallback;
     Vu1MscntCallback m_vu1MscntCallback;
 
@@ -449,6 +486,23 @@ public:
     };
 
     std::array<EeTimer, 4> m_eeTimers{};
+    // EE time is handed to the timers at every checkpoint; between two timer events nothing can happen, so the cycles
+    // add up in m_eeTimerPending and the timers advance when the next event (m_eeTimerHorizon cycles after the last
+    // advance) is reached, or before a timer register is written (a read projects the count). Exact: the tick remainder
+    // carries, so one step of N cycles counts as N steps of one.
+    uint64_t m_eeTimerPending = 0;
+    uint64_t m_eeTimerHorizon = 0;
+    uint32_t m_eeTimerLateMask = 0;   // interrupts found by an advance before a register write (none expected)
+    bool m_eeTimerVerify = false;     // VENDETTA_EETIMER_VERIFY=1: the old per-checkpoint advance on a shadow, compared
+    std::array<EeTimer, 4> m_eeTimersShadow{};
+    uint64_t m_eeTimerVerifyChecks = 0;
+    uint64_t m_eeTimerVerifyMismatches = 0;
+    bool m_gifFqcMaybeSet = false;    // GIF_STAT's FIFO count may be non-zero (cleared at the next advance)
+    static uint32_t advanceEeTimer(EeTimer &timer, size_t index, uint64_t eeCycles) noexcept;
+    static void applyEeTimerWrite(EeTimer &timer, uint32_t timerOffset, uint32_t value) noexcept;
+    uint32_t advanceEeTimersNow(uint64_t eeCycles) noexcept;
+    void flushEeTimers() noexcept;
+    uint64_t cyclesUntilNextEeTimerEventNow() const noexcept;
     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
     void queueCompletedDmacCause(uint32_t cause);

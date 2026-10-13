@@ -82,7 +82,11 @@ public:
                              uint32_t a2,
                              uint32_t a3,
                              uint32_t *resultAddress) override;
+    bool findEeRpcServer(uint32_t sid, uint32_t &serverData, uint32_t &buffer, uint32_t &callbackBuffer) const override;
+    bool callEeRpcServer(uint32_t serverData, uint32_t function, uint32_t sendSize,
+                         std::function<void(uint32_t)> done) override;
     bool sendSifCommand(uint32_t commandId, const void *packet, size_t packetSize) override;
+    void submitAudio(const int16_t *frames, size_t frameCount) override;
 
     void log(ps2x::iop::LogLevel level, std::string_view message) override;
 

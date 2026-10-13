@@ -10,6 +10,8 @@
 class PS2AudioBackend
 {
 public:
+    struct Impl; // opaque (ps2_audio.cpp); public so the audio stream callback can reach it
+
     PS2AudioBackend();
     ~PS2AudioBackend();
 
@@ -25,6 +27,10 @@ public:
     void stopAll();
     void setAudioReady(bool ready) { m_audioReady = ready; }
 
+    // A 48 kHz 16-bit stereo stream (L/R interleaved): what the SPU2 plays by AutoDMA, e.g. a sound driver's own
+    // software mix. Buffered (~1/4 s at most) and played through one raylib audio stream.
+    void submitPcmStream(const int16_t *frames, size_t frameCount);
+
 private:
     struct DecodedSample
     {
@@ -32,7 +38,6 @@ private:
         uint32_t sampleRate = 44100;
     };
 
-    struct Impl;
     std::unique_ptr<Impl> m_impl;
     bool m_audioReady = false;
     uint32_t m_mostRecentSampleKey = 0;

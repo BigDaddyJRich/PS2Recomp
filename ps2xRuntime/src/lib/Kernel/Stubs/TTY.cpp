@@ -13,6 +13,7 @@ namespace ps2_stubs
         std::string rendered = formatPs2StringWithArgs(rdram, ctx, runtime, formatOwned.c_str(), 1);
         if (rendered.size() > 2048)
             rendered.resize(2048);
+        printGameText(rendered);
         PS2_IF_AGRESSIVE_LOGS({
             const std::string logLine = sanitizeForLog(rendered);
             uint32_t count = 0;

@@ -1,5 +1,8 @@
 #include "runtime/ps2_pad.h"
+#include "runtime/ps2_host_settings.h"
 #include "ps2_host_backend.h"
+#include "ps2_host_input.h"
+#include <cstdlib>
 #include <cstring>
 
 namespace
@@ -23,9 +26,122 @@ namespace
     constexpr uint16_t PAD_L1 = 0x0400u;
     constexpr uint16_t PAD_R2 = 0x0200u;
     constexpr uint16_t PAD_L2 = 0x0100u;
+
+    int multitapPort()
+    {
+        const int port = ps2_host_settings::get().multitapPort;
+        return (port >= 0 && port < ps2_pad_layout::kPortCount) ? port : -1;
+    }
+
+    // VENDETTA_PADS=<n>: the first n places count as plugged in (tests drive them with VENDETTA_PADSCRIPT)
+    int testPadCount()
+    {
+        static const int count = []
+        {
+            const char *value = std::getenv("VENDETTA_PADS");
+            return (value && *value) ? std::atoi(value) : 0;
+        }();
+        return count;
+    }
+
+    // VENDETTA_KEYBOARD=<player> (settings.toml [controls] keyboard): which player the keyboard plays as, 1-4, or 0 =
+    // nobody; that player's controller still works too. Unset: player 1. VENDETTA_NO_HOST_INPUT=1 (test runs): nobody.
+    int keyboardPadIndex()
+    {
+        static const int index = []
+        {
+            const char *ignored = std::getenv("VENDETTA_NO_HOST_INPUT");
+            if (ignored && ignored[0] != '0')
+                return -1;
+            const char *value = std::getenv("VENDETTA_KEYBOARD");
+            const int player = (value && *value) ? std::atoi(value) : 1;
+            return (player >= 1 && player <= 4) ? player - 1 : -1;
+        }();
+        return index;
+    }
 }
 
-bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
+namespace ps2_pad_layout
+{
+    int slotCount(int port)
+    {
+        return (port >= 0 && port == multitapPort()) ? kSlotCount : 1;
+    }
+
+    bool padPlace(int index, int &port, int &slot)
+    {
+        if (index < 0)
+            return false;
+        // port 1 (and its slots when the multitap is there), then port 2 (and its slots)
+        for (int p = 0; p < kPortCount; ++p)
+        {
+            const int slots = slotCount(p);
+            if (index < slots)
+            {
+                port = p;
+                slot = index;
+                return true;
+            }
+            index -= slots;
+        }
+        return false;
+    }
+
+    int padIndex(int port, int slot)
+    {
+        if (port < 0 || port >= kPortCount || slot < 0 || slot >= slotCount(port))
+            return -1;
+        int index = slot;
+        for (int p = 0; p < port; ++p)
+            index += slotCount(p);
+        return index;
+    }
+
+    int hostController(int port, int slot)
+    {
+        const int index = padIndex(port, slot);
+        if (index < 0 || !host_input::windowReady())
+            return -1;
+        for (int gamepad = 0, seen = 0; gamepad < 4; ++gamepad)
+        {
+            if (host_input::gamepadAvailable(gamepad) && seen++ == index)
+                return gamepad;
+        }
+        return -1;
+    }
+
+    bool connected(int port, int slot)
+    {
+        const int index = padIndex(port, slot);
+        if (index < 0)
+            return false;
+        return index < testPadCount() || index == keyboardPadIndex() || hostController(port, slot) >= 0;
+    }
+
+    int xinputOrder(int port, int slot, const char **name)
+    {
+        const int gamepad = hostController(port, slot);
+        if (name)
+            *name = gamepad >= 0 ? host_input::gamepadName(gamepad) : nullptr;
+        auto isXInput = [](int pad)
+        {
+            const char *padName = host_input::gamepadName(pad);
+            if (!padName)
+                return false;
+            return std::strcmp(padName, "Xbox Controller") == 0 || std::strcmp(padName, "Wireless Xbox Controller") == 0 ||
+                   std::strncmp(padName, "XInput ", 7) == 0 || std::strcmp(padName, "Unknown XInput Device") == 0;
+        };
+        if (gamepad < 0 || !isXInput(gamepad))
+            return -1;
+        int order = 0;
+        for (int pad = 0; pad < gamepad; ++pad)
+            if (host_input::gamepadAvailable(pad) && isXInput(pad))
+                ++order;
+        return order;
+    }
+}
+
+bool PSPadBackend::readState(int port, int slot, uint8_t *data, size_t size)
 {
     if (!data || size < 32)
         return false;
@@ -38,85 +154,96 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
 
     uint16_t btns = 0xFFFFu;
-    constexpr int kGamepad = 0;
-    const bool useGamepad = IsGamepadAvailable(kGamepad);
+    // Each pad has its own controller (ps2_pad_layout: the first in port 1, the next ones in port 2 / its multitap);
+    // the keyboard plays as one player too (keyboardPadIndex), with that player's controller. (One controller used to
+    // drive every port, so player 1 and player 2 moved together.)
+    const int kGamepad = ps2_pad_layout::hostController(port, slot);
+    const bool useGamepad = kGamepad >= 0;
     auto clearBit = [&btns](uint16_t mask)
     { btns &= ~mask; };
 
     if (useGamepad)
     {
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_UP))
+        if (host_input::gamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_UP))
             clearBit(PAD_UP);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN))
+        if (host_input::gamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN))
             clearBit(PAD_DOWN);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT))
+        if (host_input::gamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT))
             clearBit(PAD_LEFT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT))
+        if (host_input::gamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT))
             clearBit(PAD_RIGHT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
+        if (host_input::gamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
             clearBit(PAD_CROSS);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))
+        if (host_input::gamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))
             clearBit(PAD_CIRCLE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT))
+        if (host_input::gamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT))
             clearBit(PAD_SQUARE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP))
+        if (host_input::gamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP))
             clearBit(PAD_TRIANGLE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1))
+        if (host_input::gamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1))
             clearBit(PAD_L1);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1))
+        if (host_input::gamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1))
             clearBit(PAD_R1);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2))
+        if (host_input::gamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2))
             clearBit(PAD_L2);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2))
+        if (host_input::gamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2))
             clearBit(PAD_R2);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT))
+        if (host_input::gamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT))
             clearBit(PAD_START);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_LEFT))
+        if (host_input::gamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_LEFT))
             clearBit(PAD_SELECT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_THUMB))
+        if (host_input::gamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_THUMB))
             clearBit(PAD_L3);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_THUMB))
+        if (host_input::gamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_THUMB))
             clearBit(PAD_R3);
 
-        float lx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_X);
-        float ly = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_Y);
-        float rx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_X);
-        float ry = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_Y);
+        float lx = host_input::gamepadAxis(kGamepad, GAMEPAD_AXIS_LEFT_X);
+        float ly = host_input::gamepadAxis(kGamepad, GAMEPAD_AXIS_LEFT_Y);
+        float rx = host_input::gamepadAxis(kGamepad, GAMEPAD_AXIS_RIGHT_X);
+        float ry = host_input::gamepadAxis(kGamepad, GAMEPAD_AXIS_RIGHT_Y);
         data[6] = static_cast<uint8_t>(128 + lx * 127);
         data[7] = static_cast<uint8_t>(128 + ly * 127);
         data[4] = static_cast<uint8_t>(128 + rx * 127);
         data[5] = static_cast<uint8_t>(128 + ry * 127);
     }
-    else
+    if (ps2_pad_layout::padIndex(port, slot) == keyboardPadIndex() && host_input::windowReady())
     {
-        if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
+        if (host_input::keyDown(KEY_UP) || host_input::keyDown(KEY_W))
             clearBit(PAD_UP);
-        if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
+        if (host_input::keyDown(KEY_DOWN) || host_input::keyDown(KEY_S))
             clearBit(PAD_DOWN);
-        if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A))
+        if (host_input::keyDown(KEY_LEFT) || host_input::keyDown(KEY_A))
             clearBit(PAD_LEFT);
-        if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
+        if (host_input::keyDown(KEY_RIGHT) || host_input::keyDown(KEY_D))
             clearBit(PAD_RIGHT);
-        if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
+        if (host_input::keyDown(KEY_X) || host_input::keyDown(KEY_SPACE))
             clearBit(PAD_CROSS);
-        if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
+        if (host_input::keyDown(KEY_C) || host_input::keyDown(KEY_ESCAPE))
             clearBit(PAD_CIRCLE);
-        if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
+        if (host_input::keyDown(KEY_Z) || host_input::keyDown(KEY_KP_0))
             clearBit(PAD_SQUARE);
-        if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
+        if (host_input::keyDown(KEY_V) || host_input::keyDown(KEY_KP_1))
             clearBit(PAD_TRIANGLE);
-        if (IsKeyDown(KEY_Q))
+        if (host_input::keyDown(KEY_Q))
             clearBit(PAD_L1);
-        if (IsKeyDown(KEY_E))
+        if (host_input::keyDown(KEY_E))
             clearBit(PAD_R1);
-        if (IsKeyDown(KEY_LEFT_SHIFT))
+        if (host_input::keyDown(KEY_LEFT_SHIFT))
             clearBit(PAD_L2);
-        if (IsKeyDown(KEY_RIGHT_SHIFT))
+        if (host_input::keyDown(KEY_RIGHT_SHIFT))
             clearBit(PAD_R2);
-        if (IsKeyDown(KEY_ENTER))
+        if (host_input::keyDown(KEY_ENTER))
             clearBit(PAD_START);
-        if (IsKeyDown(KEY_TAB))
+        if (host_input::keyDown(KEY_TAB))
             clearBit(PAD_SELECT);
+        // the right stick (taunts, Blazin'): I J K L, all the way over while held
+        const int rx = (host_input::keyDown(KEY_L) ? 1 : 0) - (host_input::keyDown(KEY_J) ? 1 : 0);
+        const int ry = (host_input::keyDown(KEY_K) ? 1 : 0) - (host_input::keyDown(KEY_I) ? 1 : 0);
+        if (rx != 0 || ry != 0)
+        {
+            data[4] = static_cast<uint8_t>(rx > 0 ? 0xFF : (rx < 0 ? 0x00 : kPadStickCenter));
+            data[5] = static_cast<uint8_t>(ry > 0 ? 0xFF : (ry < 0 ? 0x00 : kPadStickCenter));
+        }
     }
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);

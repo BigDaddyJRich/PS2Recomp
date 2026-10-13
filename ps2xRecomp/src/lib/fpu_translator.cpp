@@ -53,12 +53,15 @@ namespace ps2recomp
             case COP1_S_MUL:
                 return fmt::format("ctx->f[{}] = FPU_MUL_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
             case COP1_S_DIV:
-                return fmt::format("if (ctx->f[{}] == 0.0f) {{ ctx->fcr31 |= 0x100000; /* DZ flag */ "
-                                   "ctx->f[{}] = copysignf(INFINITY, ctx->f[{}] * 0.0f); }} "
-                                   "else ctx->f[{}] = ctx->f[{}] / ctx->f[{}];",
-                                   ft, fd, fs, fd, fs, ft);
+                // HCTP: PS2 / PCSX2 (FPU.cpp checkDivideByZero): x/0 and 0/0 give +-Fmax (sign = sign(fs) ^ sign(ft)),
+                // never Inf/NaN (an Inf here became NaN downstream: CSprAnim::GetKeyLerp 0/0 -> endless SeikikaRadian)
+                return fmt::format("{{ const float __n = ctx->f[{}], __d = ctx->f[{}]; if (__d == 0.0f) {{ ctx->fcr31 |= 0x100000; /* DZ flag */ "
+                                   "ctx->f[{}] = (std::signbit(__n) != std::signbit(__d)) ? -3.4028234663852886e+38f : 3.4028234663852886e+38f; }} "
+                                   "else ctx->f[{}] = FPU_DIV_S(__n, __d); }}",
+                                   fs, ft, fd, fd);
             case COP1_S_SQRT:
-                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, fs);
+                // EE: sqrt.s fd, ft — the source is the ft field (fs is 0); a negative input gives sqrt(|ft|)
+                return fmt::format("ctx->f[{}] = FPU_SQRT_S(fabsf(ctx->f[{}]));", fd, ft);
             case COP1_S_ABS:
                 return fmt::format("ctx->f[{}] = FPU_ABS_S(ctx->f[{}]);", fd, fs);
             case COP1_S_MOV:
@@ -76,7 +79,9 @@ namespace ps2recomp
             case COP1_S_CVT_W:
                 return fmt::format("{{ int32_t tmp = FPU_CVT_W_S(ctx->f[{}]); std::memcpy(&ctx->f[{}], &tmp, sizeof(tmp)); }}", fs, fd);
             case COP1_S_RSQRT:
-                return fmt::format("ctx->f[{}] = 1.0f / sqrtf(ctx->f[{}]);", fd, fs);
+                // EE: rsqrt.s fd, fs, ft = fs / sqrt(|ft|); a zero divisor gives ±max
+                return fmt::format("{{ const float d = sqrtf(fabsf(ctx->f[{}])); ctx->f[{}] = (d != 0.0f) ? ctx->f[{}] / d : copysignf(3.402823466e+38f, ctx->f[{}]); }}",
+                                   ft, fd, fs, fs);
             case COP1_S_ADDA:
                 return fmt::format("FPU_SET_ACC(ctx, FPU_ADD_S(ctx->f[{}], ctx->f[{}]));", fs, ft);
             case COP1_S_SUBA:

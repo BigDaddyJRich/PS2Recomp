@@ -8,7 +8,10 @@ namespace ps2_stubs
     {
         const uint32_t count = getRegU32(ctx, 5); // $a1
         const uint32_t size = getRegU32(ctx, 6);  // $a2
-        const uint32_t guestAddr = runtime ? runtime->guestCalloc(count, size) : 0u;
+        // as newlib: a zero count or size still gets a valid minimum block
+        const uint32_t guestAddr = runtime ? (count != 0u && size != 0u ? runtime->guestCalloc(count, size)
+                                                                         : runtime->guestCalloc(1u, 1u))
+                                           : 0u;
         setReturnU32(ctx, guestAddr);
     }
 
@@ -58,7 +61,8 @@ namespace ps2_stubs
     void malloc_r(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t size = getRegU32(ctx, 5); // $a1
-        const uint32_t guestAddr = runtime ? runtime->guestMalloc(size) : 0u;
+        // newlib's malloc(0) returns a valid minimum block, not NULL
+        const uint32_t guestAddr = runtime ? runtime->guestMalloc(size != 0u ? size : 1u) : 0u;
         setReturnU32(ctx, guestAddr);
     }
 

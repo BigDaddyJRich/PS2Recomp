@@ -1,4 +1,6 @@
 #include "ps2_runtime.h"
+#include "runtime/ps2_host_settings.h"
+#include "runtime/ps2_host_update.h"
 #include "games_database.h"
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
 #include "ps2_debug_panel.h"
@@ -14,6 +16,7 @@
 #include <exception>
 #include <algorithm>
 #include <cstdlib>
+#include <cstdio>
 
 #if defined(__ANDROID__)
 #include <android/log.h>
@@ -157,19 +160,60 @@ namespace
         {
             return configuredPath;
         }
-        return (std::filesystem::current_path() / configuredPath).lexically_normal();
+        // relative: from the current folder, else from the program's own folder (started from a shortcut elsewhere)
+        const std::filesystem::path fromCurrent = (std::filesystem::current_path() / configuredPath).lexically_normal();
+        std::error_code error;
+        if (!std::filesystem::exists(fromCurrent, error) && argc > 0 && argv[0] && argv[0][0] != '\0')
+        {
+            const std::filesystem::path fromProgram =
+                (std::filesystem::absolute(argv[0], error).parent_path() / configuredPath).lexically_normal();
+            if (std::filesystem::exists(fromProgram, error))
+                return fromProgram;
+        }
+        return fromCurrent;
 #else
         throw std::runtime_error("Unable to determine executable path. Pass the guest ELF as argv[1] or define PS2X_DEFAULT_BOOT_ELF.");
 #endif
     }
 }
 
+#if defined(_WIN32)
+namespace
+{
+    // A windowed build (PS2X_SHOW_WINDOWS_CONSOLE=OFF) started from a shortcut has nowhere to print: then its output
+    // goes to logs\game.log and logs\game.log.err beside the program, as when a launcher redirects it there.
+    void sendUnseenOutputToLogs(const char *argv0)
+    {
+        if (_fileno(stderr) >= 0)
+            return; // a console, or a launcher's redirection
+        std::error_code error;
+        std::filesystem::path logs = std::filesystem::path(argv0 ? argv0 : "").parent_path() / "logs";
+        std::filesystem::create_directories(logs, error);
+        FILE *out = nullptr;
+        _wfreopen_s(&out, (logs / L"game.log").c_str(), L"w", stdout);
+        _wfreopen_s(&out, (logs / L"game.log.err").c_str(), L"w", stderr);
+    }
+}
+#endif
+
 int main(int argc, char *argv[])
 {
 #if defined(__ANDROID__)
     redirectStdioToLogcat();
 #endif
+#if defined(_WIN32)
+    sendUnseenOutputToLogs(argc > 0 ? argv[0] : nullptr);
+#endif
     setupTerminateLogger();
+    // before anything reads a VENDETTA_* switch: the settings fill in the ones the environment doesn't set
+    ps2_host_settings::load(argc > 0 ? argv[0] : nullptr);
+    // a newer release: Update (the launcher takes over, the game ends) or Play; before the window opens
+    if (!ps2_host_update::checkAtStart())
+    {
+        std::cout.flush();
+        std::cerr.flush();
+        std::_Exit(0);
+    }
 
     try
     {

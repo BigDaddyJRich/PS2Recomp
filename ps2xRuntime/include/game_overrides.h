@@ -32,6 +32,9 @@ namespace ps2_game_overrides
     // Runtime helper for game-specific modules:
     // bind an address to an existing syscall/stub handler by name.
     bool bindAddressHandler(PS2Runtime &runtime, uint32_t address, std::string_view handlerName);
+
+    // Runtime helper for game-specific modules: the host window's title (the default is "PS2-Recomp | <ELF name>").
+    void setWindowTitle(PS2Runtime &runtime, std::string_view title);
 }
 
 #define PS2_GAME_OVERRIDE_JOIN2(a, b) a##b

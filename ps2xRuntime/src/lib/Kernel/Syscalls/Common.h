@@ -45,7 +45,7 @@ inline bool resolveEeGuestRange(uint32_t address, size_t size, uint32_t &offset,
         return size <= PS2_SCRATCHPAD_SIZE && offset <= PS2_SCRATCHPAD_SIZE - size;
     }
 
-    if (address < PS2_RAM_SIZE)
+    if (address < PS2_RAM_BACKING_SIZE)
     {
         offset = address;
     }
@@ -58,7 +58,7 @@ inline bool resolveEeGuestRange(uint32_t address, size_t size, uint32_t &offset,
     {
         return false;
     }
-    return size <= PS2_RAM_SIZE && offset <= PS2_RAM_SIZE - size;
+    return size <= PS2_RAM_BACKING_SIZE && offset <= PS2_RAM_BACKING_SIZE - size;
 }
 
 template <typename T>

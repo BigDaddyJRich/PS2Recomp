@@ -39,7 +39,7 @@ namespace ps2_stubs
     void scePadStateIntToStr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 
     static constexpr size_t kPadDebugPortCount = 2u;
-    static constexpr size_t kPadDebugSlotCount = 1u;
+    static constexpr size_t kPadDebugSlotCount = 4u;
     static constexpr size_t kPadDebugDataSize = 32u;
 
     struct PadDebugPortSnapshot

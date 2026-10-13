@@ -1,6 +1,12 @@
 // Based on Blackline Interactive implementation
+#include "runtime/ps2_host_profile.h"
+#include <cstdlib>
+#include <cstdio>
+#include <set>
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_vu_code_log.h"
 #include <cstring>
+#include <vector>
 
 enum VIFCmd : uint8_t
 {
@@ -83,12 +89,12 @@ namespace
 
 void PS2Memory::processVIF0Data(uint32_t srcPhys, uint32_t sizeBytes)
 {
-    if (sizeBytes == 0u || srcPhys >= PS2_RAM_SIZE)
+    if (sizeBytes == 0u || srcPhys >= PS2_RAM_BACKING_SIZE)
         return;
 
     const uint64_t requestedEnd = static_cast<uint64_t>(srcPhys) + static_cast<uint64_t>(sizeBytes);
-    if (requestedEnd > static_cast<uint64_t>(PS2_RAM_SIZE))
-        sizeBytes = PS2_RAM_SIZE - srcPhys;
+    if (requestedEnd > static_cast<uint64_t>(PS2_RAM_BACKING_SIZE))
+        sizeBytes = PS2_RAM_BACKING_SIZE - srcPhys;
 
     processVIF0Data(m_rdram + srcPhys, sizeBytes);
 }
@@ -285,12 +291,12 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
 
 void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
 {
-    if (sizeBytes == 0u || srcPhys >= PS2_RAM_SIZE)
+    if (sizeBytes == 0u || srcPhys >= PS2_RAM_BACKING_SIZE)
         return;
 
     const uint64_t requestedEnd = static_cast<uint64_t>(srcPhys) + static_cast<uint64_t>(sizeBytes);
-    if (requestedEnd > static_cast<uint64_t>(PS2_RAM_SIZE))
-        sizeBytes = PS2_RAM_SIZE - srcPhys;
+    if (requestedEnd > static_cast<uint64_t>(PS2_RAM_BACKING_SIZE))
+        sizeBytes = PS2_RAM_BACKING_SIZE - srcPhys;
 
     processVIF1Data(m_rdram + srcPhys, sizeBytes);
 }
@@ -476,8 +482,37 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     copyBytes = PS2_VU1_CODE_SIZE - destAddr;
                 if (pos + copyBytes <= sizeBytes)
                 {
-                    std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
-                    markVU1CodeModified();
+                    // VENDETTA_VULOG=1: each distinct VU1 microprogram upload (MPG) — where it came from in EE RAM,
+                    // where it goes in VU1 code memory, its size and a hash (are the programs in the executable?)
+                    static const bool vuLog = std::getenv("VENDETTA_VULOG") != nullptr;
+                    if (vuLog)
+                    {
+                        static std::set<uint64_t> seen;
+                        uint64_t hash = 1469598103934665603ull;
+                        for (uint32_t i = 0; i < copyBytes; ++i)
+                            hash = (hash ^ data[pos + i]) * 1099511628211ull;
+                        const uint8_t *rdram = m_rdram;
+                        const uint64_t source = (data + pos >= rdram && data + pos < rdram + PS2_RAM_BACKING_SIZE)
+                                                    ? static_cast<uint64_t>(data + pos - rdram)
+                                                    : ~0ull;
+                        if (seen.insert(hash ^ (static_cast<uint64_t>(destAddr) << 48)).second)
+                            std::fprintf(stderr, "[vulog] MPG src=0x%llx dest=0x%x bytes=%u hash=%016llx%c",
+                                         static_cast<unsigned long long>(source), destAddr, copyBytes,
+                                         static_cast<unsigned long long>(hash), 10);
+                    }
+                    // The game sends its programs again and again; bytes that are already there change nothing, and
+                    // marking them modified made the VU1 decode cache re-decode all of code memory each time.
+                    ps2_host_profile::count(ps2_host_profile::Vu1CodeUploads);
+                    if (std::memcmp(m_vu1Code + destAddr, data + pos, copyBytes) != 0)
+                    {
+                        std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
+                        ps2_vu_code_log::record(this, getVU1CodeGeneration() + 1u, destAddr, destAddr + copyBytes);
+                        markVU1CodeModified();
+                    }
+                    else
+                    {
+                        ps2_host_profile::count(ps2_host_profile::Vu1CodeUploadsSame);
+                    }
                 }
             }
             pos += mpgBytes;
@@ -498,14 +533,12 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             if (qwCount > 0)
             {
                 const bool directHl = (opcode == VIF_DIRECTHL);
+                // An IMAGE tag whose data comes in a later DIRECT is continued by the GS's per-path GIF tag state
+                // (GS::processGIFPacket). The VIF used to wrap the next bytes of its own stream in a new IMAGE tag
+                // instead — before decoding them, so the next DMA tag's VIFcodes (TTE) went to the GS as pixels and
+                // the stream fell out of step (Def Jam Vendetta's font: a glyph quadword read as a GIF tag with
+                // NLOOP 0x7FFF then swallowed every later frame's text).
                 submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
-
-                const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);
-                if (pendingImageQw != 0u)
-                {
-                    m_vif1PendingPath2ImageQwc = pendingImageQw;
-                    m_vif1PendingPath2DirectHl = directHl;
-                }
             }
 
             pos += qwCount * 16;
@@ -576,7 +609,77 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             {
                 const uint8_t *srcBase = data + pos;
                 uint32_t srcIndex = 0u;
-                for (uint32_t writeIndex = 0; writeIndex < writeVectorCount; ++writeIndex)
+                // The common case written straight (the same writes as the general loop below): no MASK, no row add
+                // (MODE 0 / 3), no fill cycles (CL >= WL), a decoded format. Every write vector then has a source
+                // vector; its fields replace those lanes of the VU word and the other lanes stay as they are.
+                // VENDETTA_VIF1_VERIFY=1 runs the general loop too, keeps its result and compares the two.
+                const uint32_t addMode = vif1_regs.mode & 3u;
+                const bool plain = !maskEnable && addMode != 1u && addMode != 2u && cl >= wl && (vl != 3u || vn == 3u);
+                static const bool verifyPlain = std::getenv("VENDETTA_VIF1_VERIFY") != nullptr;
+                static thread_local std::vector<uint8_t> verifyBefore, verifyPlainResult;
+                if (plain && verifyPlain)
+                    verifyBefore.assign(m_vu1Data, m_vu1Data + PS2_VU1_DATA_SIZE);
+                if (plain)
+                {
+                    const auto extend16 = [zeroExtend](const uint8_t *raw) -> uint32_t
+                    {
+                        uint16_t value = 0;
+                        std::memcpy(&value, raw, sizeof(value));
+                        return zeroExtend ? static_cast<uint32_t>(value)
+                                          : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(value)));
+                    };
+                    const auto extend8 = [zeroExtend](uint8_t raw) -> uint32_t
+                    {
+                        return zeroExtend ? static_cast<uint32_t>(raw)
+                                          : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(raw)));
+                    };
+                    const uint32_t sourceLanes = static_cast<uint32_t>(components); // vn + 1, 1..4
+                    uint32_t cyclePos = 0u;
+                    uint32_t blockBase = vuAddr;
+                    for (uint32_t writeIndex = 0; writeIndex < writeVectorCount; ++writeIndex)
+                    {
+                        uint8_t *const dest = m_vu1Data + ((blockBase + cyclePos) & 0x3FFu) * 16u;
+                        const uint8_t *const src = srcBase + writeIndex * bytesPerVector;
+                        if (++cyclePos == wl)
+                        {
+                            cyclePos = 0u;
+                            blockBase += cl;
+                        }
+                        if (vl == 3u) // V4-5
+                        {
+                            uint16_t packed = 0;
+                            std::memcpy(&packed, src, sizeof(packed));
+                            const uint32_t fields[4] = {packed & 0x1Fu, (packed >> 5) & 0x1Fu, (packed >> 10) & 0x1Fu,
+                                                        (packed >> 15) & 0x01u};
+                            std::memcpy(dest, fields, sizeof(fields));
+                            continue;
+                        }
+                        if (vl == 0u && sourceLanes > 1u) // V2 / V3 / V4-32: the fields as they are
+                        {
+                            std::memcpy(dest, src, sourceLanes * 4u);
+                            continue;
+                        }
+                        uint32_t fields[4];
+                        for (uint32_t c = 0; c < sourceLanes; ++c)
+                        {
+                            if (vl == 0u)
+                                std::memcpy(&fields[c], src + c * 4u, 4u);
+                            else if (vl == 1u)
+                                fields[c] = extend16(src + c * 2u);
+                            else
+                                fields[c] = extend8(src[c]);
+                        }
+                        if (sourceLanes == 1u) // S-32 / 16 / 8: the one field in every lane
+                            fields[1] = fields[2] = fields[3] = fields[0];
+                        std::memcpy(dest, fields, (sourceLanes == 1u ? 4u : sourceLanes) * 4u);
+                    }
+                }
+                if (plain && verifyPlain)
+                {
+                    verifyPlainResult.assign(m_vu1Data, m_vu1Data + PS2_VU1_DATA_SIZE);
+                    std::memcpy(m_vu1Data, verifyBefore.data(), PS2_VU1_DATA_SIZE);
+                }
+                for (uint32_t writeIndex = 0; (!plain || verifyPlain) && writeIndex < writeVectorCount; ++writeIndex)
                 {
                     const uint32_t cyclePos = writeIndex % wl;
                     const bool sourceAvailable = (cl >= wl) || (cyclePos < cl);
@@ -767,6 +870,21 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     }
 
                     std::memcpy(m_vu1Data + destOff, lanes, sizeof(lanes));
+                }
+                if (plain && verifyPlain)
+                {
+                    static uint64_t checked = 0u, differed = 0u;
+                    ++checked;
+                    if (std::memcmp(verifyPlainResult.data(), m_vu1Data, PS2_VU1_DATA_SIZE) != 0)
+                    {
+                        if (++differed <= 20u)
+                            std::fprintf(stderr, "[vif1verify] UNPACK vn=%u vl=%u num=%u cl=%u wl=%u mode=%u: differs\n",
+                                         static_cast<unsigned>(vn), static_cast<unsigned>(vl), writeVectorCount, cl, wl,
+                                         static_cast<unsigned>(vif1_regs.mode));
+                    }
+                    if ((checked % 100000u) == 0u)
+                        std::fprintf(stderr, "[vif1verify] %llu plain unpacks checked, %llu differed\n",
+                                     static_cast<unsigned long long>(checked), static_cast<unsigned long long>(differed));
                 }
             }
             pos += totalBytes;

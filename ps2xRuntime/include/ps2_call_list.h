@@ -91,6 +91,8 @@
     X(SifRemoveRpc)            \
     X(sceSifCallRpc)           \
     X(sceSifSendCmd)           \
+    X(isceSifSendCmd)          \
+    X(_sceSifSendCmd)          \
     X(sceRpcGetPacket)         \
                                \
     X(fioOpen)                 \

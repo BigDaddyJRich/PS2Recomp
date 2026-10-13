@@ -37,26 +37,16 @@ void GifArbiter::drain()
     if (!m_processFn)
         return;
 
-    std::stable_sort(m_queue.begin(), m_queue.end(),
-                     [](const GifArbiterPacket &a, const GifArbiterPacket &b)
-                     {
-                         // DIRECTHL cannot preempt PATH3 IMAGE transfers.
-                         if (a.path2DirectHl != b.path2DirectHl || a.path3Image != b.path3Image)
-                         {
-                             if (a.path3Image && b.path2DirectHl)
-                                 return true;
-                             if (a.path2DirectHl && b.path3Image)
-                                 return false;
-                         }
-                         return pathPriority(a.pathId) < pathPriority(b.pathId);
-                     });
-
+    // The GIF serves the paths in the order their data arrives; path priority (PATH1 > PATH2 > PATH3) only decides
+    // between transfers that are ready at the same moment, which the queue cannot tell. Sorting the batch by path
+    // moved PATH3 packets behind PATH1 / PATH2 ones queued after them — Def Jam Vendetta's notice box (drawn later)
+    // then landed on top of its text. Keep the submission order.
     for (size_t i = 0; i < m_queue.size(); ++i)
     {
         auto &pkt = m_queue[i];
         if (!pkt.data.empty())
         {
-            m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+            m_processFn(pkt.pathId, pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
         }
     }
     m_queue.clear();

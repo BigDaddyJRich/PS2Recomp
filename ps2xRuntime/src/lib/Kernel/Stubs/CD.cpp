@@ -1,3 +1,5 @@
+#include <chrono>
+#include <cstdio>
 #include "Common.h"
 #include "CD.h"
 #include "MPEG.h"
@@ -30,6 +32,110 @@ namespace ps2_stubs
 
         uint32_t g_cdStReadTraceCount = 0u;
         CdStreamTimingState g_cdStreamTiming;
+
+        // sceCdCallback: the guest function libcdvd calls when an N-command (read, seek, stop, ...) ends, with
+        // a0 = the command's function code. Games that read asynchronously (sceCdRead, then wait on a semaphore
+        // the callback signals) hang without it. The data is copied at once, but the callback comes after a
+        // drive-like delay (an alarm): games order their bookkeeping around a real drive being slow — Def Jam
+        // Vendetta files a request in its queue only after registering the "done" handler, so an instant
+        // callback finds no queue entry to clear and the game waits on it forever.
+        constexpr uint32_t kCdFuncRead = 1u;
+        constexpr uint32_t kCdFuncSeek = 4u;
+        constexpr uint32_t kCdFuncStandby = 5u;
+        constexpr uint32_t kCdFuncStop = 6u;
+        constexpr uint32_t kCdFuncPause = 7u;
+        // The callback still comes after a short delay (an alarm; ticks are 64 us), so a read is never "done" before the
+        // game has filed it, but no longer at a drive's speed: the disc image is read from the PC's memory / disk. The
+        // old 4x-DVD model (16 ticks + 6 a sector) only added waiting — Def Jam Vendetta reads its loads mostly one 2 KB
+        // sector at a time, paced by its own request loop. VENDETTA_CD_DELAY=16,6 brings the drive model back.
+        constexpr uint32_t kCdCallbackBaseTicks = 4u;
+        constexpr uint32_t kCdCallbackTicksPerSector = 0u;
+        uint32_t g_cdCallbackFunc = 0u;
+        // VENDETTA_CDLOG: host time in microseconds since the first log line (where a load's time goes)
+        long long cdLogMicros()
+        {
+            static const auto start = std::chrono::steady_clock::now();
+            return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
+        }
+
+        // VENDETTA_CDLOG=summary: one line a second (reads, sectors, time inside sceCdRead, time from a read's
+        // callback being queued to the next read) instead of a line per call, which itself slows a load down
+        bool cdLogLines()
+        {
+            static const bool on = []
+            {
+                const char *value = std::getenv("VENDETTA_CDLOG");
+                return value && std::strcmp(value, "summary") != 0;
+            }();
+            return on;
+        }
+        bool cdLogSummary()
+        {
+            static const bool on = []
+            {
+                const char *value = std::getenv("VENDETTA_CDLOG");
+                return value && std::strcmp(value, "summary") == 0;
+            }();
+            return on;
+        }
+        struct CdSummary
+        {
+            long long windowStart = 0;
+            uint32_t reads = 0;
+            uint64_t sectors = 0;
+            long long insideMicros = 0;
+            long long gapMicros = 0;
+            uint32_t gaps = 0;
+            long long lastCallbackQueued = -1;
+        } g_cdSummary;
+        void cdSummaryRead(long long startMicros, long long endMicros, uint32_t sectors)
+        {
+            CdSummary &sum = g_cdSummary;
+            if (sum.lastCallbackQueued >= 0)
+            {
+                sum.gapMicros += startMicros - sum.lastCallbackQueued;
+                ++sum.gaps;
+            }
+            sum.lastCallbackQueued = endMicros;
+            ++sum.reads;
+            sum.sectors += sectors;
+            sum.insideMicros += endMicros - startMicros;
+            if (endMicros - sum.windowStart >= 1000000)
+            {
+                std::fprintf(stderr, "[cdlog] %.1fs: %u reads, %llu sectors, %.0f us inside a read, %.0f us from one read's end to the next%c",
+                             static_cast<double>(endMicros) / 1e6, sum.reads, static_cast<unsigned long long>(sum.sectors),
+                             sum.reads ? static_cast<double>(sum.insideMicros) / sum.reads : 0.0,
+                             sum.gaps ? static_cast<double>(sum.gapMicros) / sum.gaps : 0.0, 10);
+                sum = CdSummary{};
+                sum.windowStart = endMicros;
+                sum.lastCallbackQueued = endMicros;
+            }
+        }
+        uint32_t g_cdCallbackGp = 0u;
+
+        void queueCdCallback(R5900Context *ctx, PS2Runtime *runtime, uint32_t function, uint32_t sectors = 0u)
+        {
+            if (g_cdCallbackFunc == 0u || runtime == nullptr || !runtime->hasFunction(g_cdCallbackFunc))
+            {
+                if (cdLogLines()) std::cerr << "[cdlog] callback skipped func=" << function << " cb=0x" << std::hex << g_cdCallbackFunc << std::dec << std::endl;
+                return;
+            }
+            // VENDETTA_CD_DELAY=base,perSector (alarm ticks) overrides the drive model (a test switch)
+            static const std::pair<uint64_t, uint64_t> delay = []()
+            {
+                std::pair<uint64_t, uint64_t> value{kCdCallbackBaseTicks, kCdCallbackTicksPerSector};
+                if (const char *text = std::getenv("VENDETTA_CD_DELAY"))
+                {
+                    unsigned base = 0u, perSector = 0u;
+                    if (std::sscanf(text, "%u,%u", &base, &perSector) == 2)
+                        value = {base, perSector};
+                }
+                return value;
+            }();
+            const uint64_t ticks = std::min<uint64_t>(0xFFFFu, delay.first + static_cast<uint64_t>(sectors) * delay.second);
+            if (cdLogLines()) std::cerr << "[cdlog] " << cdLogMicros() << "us callback in " << ticks << " ticks func=" << function << " cb=0x" << std::hex << g_cdCallbackFunc << std::dec << std::endl;
+            runtime->eeScheduler().setAlarm(static_cast<uint16_t>(ticks), g_cdCallbackFunc, function, g_cdCallbackGp, 0u, true);
+        }
 
         uint64_t currentCdStreamTick(PS2Runtime *runtime)
         {
@@ -209,6 +315,8 @@ namespace ps2_stubs
         const uint32_t a0 = getRegU32(ctx, 4); // usually lbn
         const uint32_t a1 = getRegU32(ctx, 5); // usually sector count
         const uint32_t a2 = getRegU32(ctx, 6); // usually destination buffer
+        const long long readStartMicros = cdLogSummary() ? cdLogMicros() : 0;
+        if (cdLogLines()) std::cerr << "[cdlog] " << cdLogMicros() << "us sceCdRead lbn=0x" << std::hex << a0 << " n=" << std::dec << a1 << " buf=0x" << std::hex << a2 << " ra=0x" << getRegU32(ctx, 31) << std::dec << " tick=" << (runtime ? runtime->eeScheduler().currentVSyncTick() : 0u) << std::endl;
 
         struct CdReadArgs
         {
@@ -226,7 +334,7 @@ namespace ps2_stubs
                 return 0;
             }
 
-            const uint64_t maxBytes = static_cast<uint64_t>(PS2_RAM_SIZE - offset);
+            const uint64_t maxBytes = static_cast<uint64_t>(PS2_RAM_BACKING_SIZE - offset);
             const uint64_t clamped = std::min<uint64_t>(requested, maxBytes);
             return static_cast<size_t>(clamped);
         };
@@ -317,6 +425,9 @@ namespace ps2_stubs
         {
             g_cdStreamingLbn = selected.lbn + selected.sectors;
             setReturnS32(ctx, 1); // command accepted/success
+            queueCdCallback(ctx, runtime, kCdFuncRead, selected.sectors);
+            if (cdLogSummary())
+                cdSummaryRead(readStartMicros, cdLogMicros(), selected.sectors);
             return;
         }
 
@@ -355,7 +466,12 @@ namespace ps2_stubs
 
     void sceCdCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx, 0);
+        // returns the previous callback, like libcdvd
+        const uint32_t previous = g_cdCallbackFunc;
+        if (cdLogLines()) std::cerr << "[cdlog] sceCdCallback 0x" << std::hex << getRegU32(ctx, 4) << " ra=0x" << getRegU32(ctx, 31) << std::dec << std::endl;
+        g_cdCallbackFunc = getRegU32(ctx, 4);
+        g_cdCallbackGp = getRegU32(ctx, 28);
+        setReturnS32(ctx, static_cast<int32_t>(previous));
     }
 
     void sceCdChangeThreadPriority(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -445,6 +561,7 @@ namespace ps2_stubs
     void sceCdPause(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnS32(ctx, 1);
+        queueCdCallback(ctx, runtime, kCdFuncPause);
     }
 
     void sceCdPosToInt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -489,7 +606,7 @@ namespace ps2_stubs
 
             uint32_t offset = buf & PS2_RAM_MASK;
             size_t bytes = static_cast<size_t>(sectors) * kCdSectorSize;
-            const size_t maxBytes = PS2_RAM_SIZE - offset;
+            const size_t maxBytes = PS2_RAM_BACKING_SIZE - offset;
             if (bytes > maxBytes)
             {
                 bytes = maxBytes;
@@ -652,11 +769,13 @@ namespace ps2_stubs
     {
         restartCdStreamAt(getRegU32(ctx, 4), runtime);
         setReturnS32(ctx, 1);
+        queueCdCallback(ctx, runtime, kCdFuncSeek);
     }
 
     void sceCdStandby(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnS32(ctx, 1);
+        queueCdCallback(ctx, runtime, kCdFuncStandby);
     }
 
     void sceCdStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -689,6 +808,7 @@ namespace ps2_stubs
     void sceCdStop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnS32(ctx, 1);
+        queueCdCallback(ctx, runtime, kCdFuncStop);
     }
 
     void sceCdStPause(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -796,7 +916,7 @@ namespace ps2_stubs
                 const uint64_t destination64 = static_cast<uint64_t>(state.buffer) + static_cast<uint64_t>(state.sectorsRead) * kCdSectorSize;
                 const uint32_t destination = static_cast<uint32_t>(destination64);
                 const uint32_t offset = destination & PS2_RAM_MASK;
-                const size_t maxBytes = PS2_RAM_SIZE - offset;
+                const size_t maxBytes = PS2_RAM_BACKING_SIZE - offset;
                 sectors = std::min<uint32_t>(sectors, static_cast<uint32_t>(maxBytes / kCdSectorSize));
 
                 if (sectors == 0u)

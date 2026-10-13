@@ -154,7 +154,7 @@ static inline uint32_t ps2_plzcw32(uint32_t x)
 
 static inline bool Ps2FastRangeIsContiguous(uint32_t offset, uint32_t bytes)
 {
-    return offset <= (PS2_RAM_SIZE - bytes);
+    return offset <= (PS2_RAM_BACKING_SIZE - bytes);
 }
 
 static inline uint8_t Ps2FastRead8(const uint8_t *rdram, uint32_t addr)
@@ -605,10 +605,22 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 
 // FPU (COP1) operations
 #define FPU_SET_ACC(ctx, res) (ctx->f_acc = res)
-#define FPU_ADD_S(a, b) ((float)(a) + (float)(b))
-#define FPU_SUB_S(a, b) ((float)(a) - (float)(b))
-#define FPU_MUL_S(a, b) ((float)(a) * (float)(b))
-#define FPU_DIV_S(a, b) ((float)(a) / (float)(b))
+// HCTP "fpsat": the PS2 FPU has no Inf/NaN - an overflowing result is +-Fmax (PCSX2 FPU.cpp checkOverflow)
+static inline float ps2FpuSat(float r)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &r, sizeof(bits));
+    if ((bits & 0x7F800000u) == 0x7F800000u)
+    {
+        bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
+        std::memcpy(&r, &bits, sizeof(r));
+    }
+    return r;
+}
+#define FPU_ADD_S(a, b) ps2FpuSat((float)(a) + (float)(b))
+#define FPU_SUB_S(a, b) ps2FpuSat((float)(a) - (float)(b))
+#define FPU_MUL_S(a, b) ps2FpuSat((float)(a) * (float)(b))
+#define FPU_DIV_S(a, b) ps2FpuSat((float)(a) / (float)(b))
 #define FPU_SQRT_S(a) sqrtf((float)(a))
 #define FPU_ABS_S(a) fabsf((float)(a))
 #define FPU_MOV_S(a) ((float)(a))
@@ -623,7 +635,17 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
 #define FPU_CVT_S_W(a) ((float)(int32_t)(a))
 #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
-#define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
+// EE cvt.w.s ignores the FCR31 rounding mode and always truncates toward zero; a value whose magnitude is 2^31 or more
+// (including infinities / NaN bit patterns) saturates to 0x7FFFFFFF or 0x80000000 by its sign bit.
+static inline int32_t ps2FpuCvtWS(float value)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    if ((bits & 0x7F800000u) <= 0x4E800000u)
+        return static_cast<int32_t>(value);
+    return (bits & 0x80000000u) ? INT32_MIN : INT32_MAX;
+}
+#define FPU_CVT_W_S(a) ps2FpuCvtWS((float)(a))
 #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
 #define FPU_C_F_S(a, b) (0)
 #define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))

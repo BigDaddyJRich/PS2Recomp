@@ -1,10 +1,20 @@
+#include <set>
+#include <tuple>
+#include <thread>
+#include <cstdio>
+#include "runtime/ps2_host_profile.h"
 #include "runtime/ee_scheduler.h"
 
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
 
 #include <algorithm>
+#include <chrono>
+#include <unordered_map>
+#include <variant>
 #include <cassert>
+#include <cstdlib>
+#include <iostream>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -33,12 +43,36 @@ namespace
     constexpr uint32_t WEF_CLEAR_ALL = 0x20u;
     constexpr auto kVBlankPeriod = std::chrono::microseconds(16667);
     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
+    // how far the VBlank schedule may fall behind real time before it restarts from now (see processDueDeadlines)
+    constexpr auto kVBlankResync = std::chrono::milliseconds(100);
     constexpr uint64_t kAlarmTickMicroseconds = 64u;
     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
 
     constexpr uint64_t microsecondsToEeCycles(uint64_t microseconds)
     {
         return (microseconds * EeScheduler::kEeClockHz + 999999ull) / 1000000ull;
+    }
+
+    // Waits on cv until pred() or the deadline. A short wait (under 2 ms) is timed by yielding instead of sleeping: the
+    // OS rounds a sleep up to its timer tick (1 ms or more), and an event due in a quarter of a millisecond (a disc
+    // read's completion alarm, 64 us ticks) then costs a whole tick — a game that loads one 2 KB sector per alarm
+    // loaded several times slower than its alarms ask for. Longer waits (the next vblank) sleep as before.
+    template <typename Pred>
+    bool waitUntilPrecise(std::condition_variable &cv, std::unique_lock<std::mutex> &lock,
+                          std::chrono::steady_clock::time_point deadline, Pred pred)
+    {
+        constexpr auto kPreciseWait = std::chrono::milliseconds(2);
+        if (deadline == std::chrono::steady_clock::time_point::max() ||
+            deadline - std::chrono::steady_clock::now() > kPreciseWait)
+            return cv.wait_until(lock, deadline, pred);
+        bool done = false;
+        while (!(done = pred()) && std::chrono::steady_clock::now() < deadline)
+        {
+            lock.unlock();
+            std::this_thread::yield();
+            lock.lock();
+        }
+        return done;
     }
 
     std::chrono::nanoseconds eeCyclesToHostDuration(uint64_t cycles)
@@ -51,6 +85,57 @@ namespace
     }
 
     constexpr uint64_t kVBlankPeriodCycles = microsecondsToEeCycles(16667u);
+
+    // VENDETTA_HOSTPROF: when the scheduler is about to sleep 30 ms or more, print why — every pending deadline with how
+    // far away it is in EE time and in real time ("[sleep]"); a sleep that long holds a vblank up (a hitch on screen)
+    bool sleepLogEnabled()
+    {
+        static const bool enabled = std::getenv("VENDETTA_HOSTPROF") != nullptr;
+        return enabled;
+    }
+
+    const char *eventTypeName(EeEventType type)
+    {
+        switch (type)
+        {
+        case EeEventType::Stop: return "stop";
+        case EeEventType::VBlankStart: return "vblank";
+        case EeEventType::VBlankEnd: return "vblank-end";
+        case EeEventType::Dmac: return "dmac";
+        case EeEventType::ExternalWake: return "wake";
+        case EeEventType::Alarm: return "alarm";
+        }
+        return "?";
+    }
+
+    struct SleepDiary
+    {
+        std::vector<std::string> entries;
+        std::chrono::steady_clock::time_point lastVBlank{};
+    };
+
+    SleepDiary &sleepDiary()
+    {
+        static SleepDiary diary;
+        return diary;
+    }
+
+    template <typename Deadlines>
+    std::string describeDeadlines(const Deadlines &deadlines, uint64_t eeCycle, std::chrono::steady_clock::time_point now)
+    {
+        std::string text;
+        char item[128];
+        for (const auto &scheduled : deadlines)
+        {
+            const double eeMs = static_cast<double>(static_cast<int64_t>(scheduled.deadlineCycle - eeCycle)) /
+                                static_cast<double>(EeScheduler::kEeClockHz / 1000u);
+            const double realMs = std::chrono::duration<double, std::milli>(scheduled.hostDeadline - now).count();
+            std::snprintf(item, sizeof(item), " | %s %u: EE %+.1f ms, real %+.1f ms", eventTypeName(scheduled.event.type),
+                          static_cast<unsigned>(scheduled.event.id), eeMs, realMs);
+            text += item;
+        }
+        return text;
+    }
     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
 
@@ -112,6 +197,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_insideInterrupt = false;
     m_pendingEeTimerInterrupts = 0u;
     m_eeCycle = 0u;
+    m_iopPendingCycles = 0u;
     m_sliceEndCycle = kDefaultTimeSliceCycles;
     m_stopRequested.store(false, std::memory_order_release);
     m_checkpointPending.store(false, std::memory_order_release);
@@ -124,6 +210,14 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     }
     m_eventSequence = 0;
     m_invocationSequence = 0;
+    m_presentDue = false;
+    m_presentTick = 0;
+    m_presentDueVblanks = 0;
+    m_vsyncHandlerSeqs.clear();
+    {
+        const char *mode = std::getenv("VENDETTA_GS_PRESENT");
+        m_presentMode = (mode && std::strcmp(mode, "vblank") == 0) ? PresentMode::VBlank : PresentMode::Settle;
+    }
     m_vsyncTick = 0;
     m_vsyncFlagAddress = 0;
     m_vsyncTickAddress = 0;
@@ -152,6 +246,10 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     publishSnapshot();
 }
 
+void ps2RecordDispatch(char what, uint32_t pc, uint32_t sp, uint32_t ra, int thread); // ps2_runtime.cpp
+std::string ps2FormatDispatchRecords();
+bool ps2DispatchRecording() noexcept; // ps2_runtime.cpp: VENDETTA_DISPATCHLOG
+
 void EeScheduler::run()
 {
     assertExecutor();
@@ -160,6 +258,7 @@ void EeScheduler::run()
     while (!m_stopRequested.load(std::memory_order_acquire))
     {
         processPendingEvents();
+        maybePresent();
         if (m_stopRequested.load(std::memory_order_acquire))
         {
             break;
@@ -244,7 +343,33 @@ void EeScheduler::run()
                     {
                     }
                 }
+                if (!m_vsyncHandlerSeqs.empty())
+                {
+                    const auto handler = std::find(m_vsyncHandlerSeqs.begin(), m_vsyncHandlerSeqs.end(), completed.sequence);
+                    if (handler != m_vsyncHandlerSeqs.end())
+                    {
+                        m_vsyncHandlerSeqs.erase(handler);
+                        maybePresent();
+                    }
+                }
                 continue;
+            }
+            // pc 0 with no callback = the thread left its entry function (or jumped through a null pointer): it
+            // ends. Say so — a thread that loops forever only gets here by a bug.
+            if (running->id > 0) // not the runtime's own invocation threads (negative ids), which end here normally
+                std::cerr << "[ee] thread " << running->id << " (entry 0x" << std::hex << running->entry << ") ended at pc 0: ra=0x"
+                      << getRegU32(&context, 31) << " sp=0x" << getRegU32(&context, 29) << " trace=" << m_runtime.dispatchTrace()
+                      << " records:" << ps2FormatDispatchRecords() << std::dec << std::endl;
+            if (running->id > 0 && m_rdram)
+            {
+                // the thread's stack around sp (zeroed save slots show which frame was overwritten)
+                const uint32_t sp = getRegU32(&context, 29) & 0x01FFFFF0u;
+                for (uint32_t row = (sp >= 0x100u ? sp - 0x100u : 0u); row < sp + 0x400u && row + 16u <= PS2_RAM_SIZE; row += 16u)
+                {
+                    uint32_t w[4];
+                    std::memcpy(w, m_rdram + row, sizeof(w));
+                    std::fprintf(stderr, "[ee]   %08x: %08x %08x %08x %08x%c", row, w[0], w[1], w[2], w[3], 10);
+                }
             }
             makeDormant(*running);
             m_currentThreadId = 0;
@@ -254,7 +379,9 @@ void EeScheduler::run()
             continue;
         }
 
-        if (!m_pendingInvocations.empty() && running->invocations.empty())
+        if (!m_pendingInvocations.empty() &&
+            (running->invocations.empty() ||
+             running->invocations.back().kind == GuestInvocationKind::ThreadCallback))
         {
             GuestInvocation invocation = std::move(m_pendingInvocations.front());
             m_pendingInvocations.pop_front();
@@ -296,6 +423,8 @@ void EeScheduler::run()
         {
             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
             m_guestExecuting.store(true, std::memory_order_release);
+            if (ps2DispatchRecording())
+                ps2RecordDispatch('D', context.pc, getRegU32(&context, 29), getRegU32(&context, 31), running->id);
             function(m_rdram, &context, &m_runtime);
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
@@ -354,9 +483,140 @@ void EeScheduler::postEvent(EeEvent event)
     m_eventCv.notify_one();
 }
 
+// The EE accounts a small fixed number of cycles per dispatch / checkpoint, far less than the real time a busy
+// guest loop takes on the host, so while the guest is busy EE time (timers, alarms, the IOP — a sound driver's
+// 48 kHz stream) fell behind real time: Def Jam Vendetta's movie player polled at ~half speed and its sound
+// stuttered. Every 1024 checkpoints, catch EE time up with the host clock — at most 1 ms at a time, so a timer
+// compare is never jumped by a whole period (interrupts are taken at the next checkpoint); re-anchor after a long
+// stall (> 100 ms) instead of racing through it. When EE time is ahead, the VBlank / timer pacing waits hold it.
+void EeScheduler::catchUpWithHostClock() noexcept
+{
+    constexpr uint32_t kCheckInterval = 1024u;
+    constexpr uint64_t kMaxStepCycles = EeScheduler::kEeClockHz / 1000u;    // 1 ms
+    constexpr uint64_t kResyncCycles = EeScheduler::kEeClockHz / 10u;       // 100 ms
+    if (m_hostClockCheckCountdown != 0u)
+    {
+        --m_hostClockCheckCountdown;
+        return;
+    }
+    m_hostClockCheckCountdown = kCheckInterval;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (m_hostClockOrigin == std::chrono::steady_clock::time_point{})
+    {
+        m_hostClockOrigin = now;
+        m_hostClockOriginCycle = m_eeCycle;
+        return;
+    }
+    const uint64_t elapsedNs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now - m_hostClockOrigin).count());
+    const uint64_t hostCycle = m_hostClockOriginCycle + elapsedNs / 1000u * (EeScheduler::kEeClockHz / 1000000u);
+    if (hostCycle <= m_eeCycle)
+    {
+        return;
+    }
+    const uint64_t behind = hostCycle - m_eeCycle;
+    if (behind > kResyncCycles)
+    {
+        m_hostClockOrigin = now;
+        m_hostClockOriginCycle = m_eeCycle;
+        return;
+    }
+    // Never onto an event that is not due yet in real time: its pace hold would stop the guest until that moment.
+    // The anchor and the VBlank schedule can disagree by up to the resync limit (the schedule restarts from now after a
+    // stall, the anchor only past 100 ms behind); then every step here pushed EE time straight to the next VBlank and
+    // the guest waited out the rest of the frame in the hold: between VBlanks it ran only the few checkpoints until the
+    // next step, and Def Jam Vendetta's main thread finished no frame for seconds while the PC slept (a 4-player match
+    // after a slow patch). Stop one cycle short: the guest keeps running, and once the event is due in real time the next
+    // check here (or the guest's own cycles) reaches it.
+    uint64_t step = std::min(behind, kMaxStepCycles);
+    {
+        std::lock_guard lock(m_eventMutex);
+        for (const ScheduledEvent &scheduled : m_deadlines)
+        {
+            if (scheduled.deadlineCycle > m_eeCycle && scheduled.hostDeadline > now &&
+                scheduled.deadlineCycle - m_eeCycle <= step)
+            {
+                step = scheduled.deadlineCycle - m_eeCycle - 1u;
+            }
+        }
+    }
+    if (step == 0u)
+    {
+        return;
+    }
+    accountCycles(static_cast<uint32_t>(step));
+}
+
+// Before a new deadline is set from EE time (an alarm): if EE time has fallen behind the real clock — the guest kept
+// waiting on host work its cycle count does not show — catch it up. Behind = a pending event whose real-time moment has
+// passed while its EE deadline has not (or EE time behind the host-clock anchor of catchUpWithHostClock). EE time moves
+// up to the latest such deadline, but never past an event not yet due in real time, nor past a timer compare (they keep
+// their order, and a handler that re-arms with "target += period - count" its one period), and not across a stall of
+// over 100 ms (re-anchor instead, as catchUpWithHostClock). catchUpWithHostClock alone needs 1024 checkpoints per
+// millisecond, and a guest that mostly waits makes too few. Def Jam Vendetta reads its loads one 2 KB sector at a time,
+// each read opening the disc image on the PC (~1 ms of real time) against the 0.25 ms its completion alarm adds to EE
+// time: EE time crawled at a quarter of real speed through a load, and the next vblank, due in EE time, came 60-90 ms
+// late — a hitch on screen as a match loads and starts (and, with the old vblank catch-up, a fast-forward after it).
+void EeScheduler::catchUpBeforeDeadline() noexcept
+{
+    constexpr uint64_t kResyncCycles = EeScheduler::kEeClockHz / 10u; // 100 ms
+    const auto now = std::chrono::steady_clock::now();
+    uint64_t target = m_eeCycle;
+    if (m_hostClockOrigin != std::chrono::steady_clock::time_point{})
+    {
+        const uint64_t elapsedNs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now - m_hostClockOrigin).count());
+        const uint64_t hostCycle = m_hostClockOriginCycle + elapsedNs / 1000u * (EeScheduler::kEeClockHz / 1000000u);
+        if (hostCycle > m_eeCycle)
+        {
+            if (hostCycle - m_eeCycle > kResyncCycles)
+            {
+                m_hostClockOrigin = now;
+                m_hostClockOriginCycle = m_eeCycle;
+            }
+            else
+            {
+                target = hostCycle;
+            }
+        }
+    }
+    uint64_t barrier = m_eeCycle + m_runtime.memory().cyclesUntilNextEeTimerInterrupt();
+    if (barrier < m_eeCycle)
+    {
+        barrier = std::numeric_limits<uint64_t>::max(); // no timer compare pending (the sum wrapped)
+    }
+    {
+        std::lock_guard lock(m_eventMutex);
+        for (const ScheduledEvent &scheduled : m_deadlines)
+        {
+            if (scheduled.deadlineCycle <= m_eeCycle)
+            {
+                continue;
+            }
+            if (scheduled.hostDeadline <= now)
+            {
+                target = std::max(target, scheduled.deadlineCycle); // overdue in real time: EE time is behind
+            }
+            else
+            {
+                // not due yet: stop short of it (reaching it would hold the guest until its moment — catchUpWithHostClock)
+                barrier = std::min(barrier, scheduled.deadlineCycle - 1u);
+            }
+        }
+    }
+    target = std::min({target, barrier, m_eeCycle + kResyncCycles});
+    while (target > m_eeCycle)
+    {
+        const uint32_t chunk = static_cast<uint32_t>(std::min<uint64_t>(target - m_eeCycle, std::numeric_limits<uint32_t>::max()));
+        accountCycles(chunk);
+    }
+}
+
 bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 {
     accountCycles(cycles);
+    catchUpWithHostClock();
 
     if (m_checkpointPending.load(std::memory_order_acquire) ||
         m_stopRequested.load(std::memory_order_acquire))
@@ -393,7 +653,16 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
     const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
     m_eeCycle += elapsed;
     m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
-    m_runtime.advanceIopEeCycles(elapsed);
+    // The IOP gets the EE's time in batches of 4096 EE cycles (512 IOP cycles, ~14 us): handing it over at every
+    // checkpoint (8-32 cycles) was a call chain and a profiler mark millions of times a second for an IOP that runs
+    // its own work in such batches anyway (IopEmulator::runEeCycles). Nothing the EE can see is that fine.
+    constexpr uint64_t kIopHandOverCycles = 4096u;
+    m_iopPendingCycles += elapsed;
+    if (m_iopPendingCycles >= kIopHandOverCycles)
+    {
+        m_runtime.advanceIopEeCycles(m_iopPendingCycles);
+        m_iopPendingCycles = 0u;
+    }
     if (m_pendingEeTimerInterrupts != 0u)
     {
         m_checkpointPending.store(true, std::memory_order_release);
@@ -423,8 +692,11 @@ void EeScheduler::setupCurrentThread(uint32_t stack, uint32_t stackSize, uint32_
 int EeScheduler::createThread(const EeThreadCreateParams &params)
 {
     assertExecutor();
-    if (params.priority < 1 || params.priority >= kPriorityCount)
+    // EE kernel: priorities 0..127 (0 = highest). HCTP's CRI ADX threads ask for 0; refusing it left them uncreated
+    // and the main thread asleep forever in ADXM_WaitVsync (first loading screen).
+    if (params.priority < 0 || params.priority >= kPriorityCount)
     {
+        std::fprintf(stderr, "[thread] CreateThread refused: priority %d%c", params.priority, 10);
         return KE_ILLEGAL_PRIORITY;
     }
 
@@ -701,7 +973,7 @@ int EeScheduler::cancelWakeup(int id)
 int EeScheduler::changePriority(int id, int priority, bool interruptSafe, int &oldPriority)
 {
     assertExecutor();
-    if (priority < 1 || priority >= kPriorityCount)
+    if (priority < 0 || priority >= kPriorityCount)
     {
         return KE_ILLEGAL_PRIORITY;
     }
@@ -1061,7 +1333,8 @@ int EeScheduler::setAlarm(uint16_t ticks,
                           uint32_t handler,
                           uint32_t argument,
                           uint32_t gp,
-                          uint32_t sp)
+                          uint32_t sp,
+                          bool argumentInA0)
 {
     assertExecutor();
     if (handler == 0u || !m_runtime.hasFunction(handler))
@@ -1073,7 +1346,8 @@ int EeScheduler::setAlarm(uint16_t ticks,
     {
         return KE_ERROR;
     }
-    m_alarms.emplace(id, EeAlarm{id, ticks, handler, argument, gp, sp});
+    m_alarms.emplace(id, EeAlarm{id, ticks, handler, argument, gp, sp, argumentInA0});
+    catchUpBeforeDeadline();
     const uint64_t tickCount = ticks == 0u ? 1u : static_cast<uint64_t>(ticks);
     scheduleEvent(m_eeCycle + tickCount * kAlarmTickCycles,
                   std::chrono::steady_clock::now() + std::chrono::microseconds(tickCount * kAlarmTickMicroseconds),
@@ -1170,13 +1444,15 @@ uint32_t EeScheduler::invocationStackTop()
     {
         return existing->second;
     }
-    constexpr uint32_t kInvocationStackSize = 0x4000u;
+    constexpr uint32_t kInvocationStackSize = 0x4000u; // in kernel RAM (0x48000-0x80000), 14 of them
     const uint32_t top = m_runtime.reserveAsyncCallbackStack(kInvocationStackSize, 16u);
     if (top == 0u)
     {
         throw std::runtime_error("EE invocation stack space exhausted");
     }
     m_invocationStackTops.emplace(key, top);
+    std::cerr << "[ee] callback stack " << m_invocationStackTops.size() << " for thread " << owner->id << " depth " << depth
+              << " at 0x" << std::hex << top << std::dec << std::endl;
     return top;
 }
 
@@ -1258,6 +1534,9 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
     const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
     if (cause < 32u && (mask & (1u << cause)) == 0u)
     {
+        if (std::getenv("VENDETTA_IRQLOG"))
+            std::cerr << "[irqlog] dropped " << (dmac ? "DMAC" : "INTC") << " cause " << cause << " (masked, mask=0x"
+                      << std::hex << mask << std::dec << ")" << std::endl;
         return;
     }
     const auto &handlers = dmac ? m_dmacHandlers : m_intcHandlers;
@@ -1296,7 +1575,7 @@ void EeScheduler::setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress)
     if (tickAddress != 0u)
     {
         const uint32_t physical = tickAddress & 0x1FFFFFFFu;
-        if (m_rdram && physical <= PS2_RAM_SIZE - sizeof(uint64_t))
+        if (m_rdram && physical <= PS2_RAM_BACKING_SIZE - sizeof(uint64_t))
         {
             const uint64_t zero = 0u;
             std::memcpy(m_rdram + physical, &zero, sizeof(zero));
@@ -1339,6 +1618,26 @@ void EeScheduler::completeVSync(uint64_t tick)
             std::get<EeVSyncWait>(candidate.wait.payload).afterTick < tick)
         {
             completed.push_back(id);
+        }
+    }
+    // HCTP diag (VENDETTA_WAITLOG): every 300 vsyncs, every thread that is not running/ready and why
+    static const bool dumpBlocked = std::getenv("VENDETTA_WAITLOG") != nullptr;
+    if (dumpBlocked && tick % 300u == 0u)
+    {
+        for (auto &[id, candidate] : m_threads)
+        {
+            int waitId = 0;
+            if (const auto *sema = std::get_if<EeSemaphoreWait>(&candidate.wait.payload))
+                waitId = sema->id;
+            else if (const auto *flag = std::get_if<EeEventFlagWait>(&candidate.wait.payload))
+                waitId = flag->id;
+            else if (const auto *external = std::get_if<EeExternalWait>(&candidate.wait.payload))
+                waitId = static_cast<int>(external->type);
+            std::fprintf(stderr, "[thdump] tick %llu thread %d status %d reason %d id %d ra 0x%x pc 0x%x prio %d inv %d%c",
+                         static_cast<unsigned long long>(tick), id, static_cast<int>(candidate.status),
+                         static_cast<int>(candidate.wait.reason), waitId,
+                         getRegU32(&candidate.activeContext(), 31), candidate.activeContext().pc,
+                         candidate.currentPriority, static_cast<int>(candidate.invocations.size()), 10);
         }
     }
     std::sort(completed.begin(), completed.end());
@@ -1680,10 +1979,76 @@ void EeScheduler::removeFromWaitObject(GuestThread &item)
     item.wait = {};
 }
 
+namespace
+{
+    // VENDETTA_WAITLOG=<ms> (1 = 50): every guest wait that lasts longer (host time) — what it waited on, from where,
+    // and what woke it (finding what a pause on screen is waiting for). Executor thread only.
+    struct BlockedSince
+    {
+        std::chrono::steady_clock::time_point at;
+        EeWaitReason reason;
+        int id;
+        uint32_t ra;
+    };
+    long long waitLogThresholdMs()
+    {
+        static const long long threshold = []() -> long long
+        {
+            const char *text = std::getenv("VENDETTA_WAITLOG");
+            if (!text)
+                return -1;
+            const long long value = std::atoll(text);
+            return value > 1 ? value : 50;
+        }();
+        return threshold;
+    }
+    bool waitLogEnabled()
+    {
+        return waitLogThresholdMs() >= 0;
+    }
+    std::unordered_map<int, BlockedSince> &blockedSince()
+    {
+        static std::unordered_map<int, BlockedSince> map;
+        return map;
+    }
+    const char *waitReasonName(EeWaitReason reason)
+    {
+        switch (reason)
+        {
+        case EeWaitReason::Sleep: return "sleep";
+        case EeWaitReason::Semaphore: return "semaphore";
+        case EeWaitReason::EventFlag: return "event flag";
+        case EeWaitReason::VSync: return "vsync";
+        case EeWaitReason::External: return "external";
+        case EeWaitReason::Mpeg: return "mpeg";
+        default: return "none";
+        }
+    }
+}
+
 void EeScheduler::blockCurrent(EeWaitState wait)
 {
     GuestThread *self = currentThread();
     assert(self != nullptr);
+    if (waitLogEnabled())
+    {
+        int id = 0;
+        if (const auto *sema = std::get_if<EeSemaphoreWait>(&wait.payload))
+            id = sema->id;
+        else if (const auto *flag = std::get_if<EeEventFlagWait>(&wait.payload))
+            id = flag->id;
+        else if (const auto *external = std::get_if<EeExternalWait>(&wait.payload))
+            id = static_cast<int>(external->type);
+        blockedSince()[self->id] = BlockedSince{std::chrono::steady_clock::now(), wait.reason, id,
+                                                getRegU32(&self->activeContext(), 31)};
+        {
+            // HCTP diag: each new (thread, reason, id, ra) the first time - a wait that never ends is the last new line
+            static std::set<std::tuple<int, int, int, uint32_t>> seen;
+            const uint32_t ra = getRegU32(&self->activeContext(), 31);
+            if (seen.insert({self->id, static_cast<int>(wait.reason), id, ra}).second)
+                std::fprintf(stderr, "[waitnew] thread %d blocks on %s %d (ra 0x%x)%c", self->id, waitReasonName(wait.reason), id, ra, 10);
+        }
+    }
     self->wait = std::move(wait);
     self->status = self->suspendCount == 0 ? EeThreadStatus::Waiting : EeThreadStatus::WaitingSuspended;
     m_currentThreadId = 0;
@@ -1693,6 +2058,24 @@ void EeScheduler::blockCurrent(EeWaitState wait)
 
 void EeScheduler::makeReady(GuestThread &item, int result, bool interruptSafe)
 {
+    if (waitLogEnabled())
+    {
+        auto &map = blockedSince();
+        if (auto found = map.find(item.id); found != map.end())
+        {
+            const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - found->second.at).count();
+            if (waited > waitLogThresholdMs())
+            {
+                const GuestThread *waker = currentThread();
+                std::fprintf(stderr, "[waitlog] thread %d waited %lld ms on %s %d (ra 0x%x); woken by %s%d ra 0x%x tick %llu%c",
+                             item.id, static_cast<long long>(waited), waitReasonName(found->second.reason), found->second.id,
+                             found->second.ra, m_insideInterrupt ? "interrupt / thread " : "thread ",
+                             waker ? waker->id : 0, waker ? getRegU32(&const_cast<GuestThread *>(waker)->activeContext(), 31) : 0u,
+                             static_cast<unsigned long long>(currentVSyncTick()), 10);
+            }
+            map.erase(found);
+        }
+    }
     auto completion = std::move(item.wait.completion);
     item.wait = {};
     setReturnS32(&item.activeContext(), result);
@@ -1800,9 +2183,16 @@ void EeScheduler::processDueDeadlines()
 
             if (now < pacingDeadline)
             {
-                m_eventCv.wait_until(lock, pacingDeadline, [this]()
-                                     { return !m_events.empty() ||
-                                              m_stopRequested.load(std::memory_order_acquire); });
+                if (sleepLogEnabled() && sleepDiary().entries.size() < 64u)
+                {
+                    char head[64];
+                    std::snprintf(head, sizeof(head), "pace hold %.1f ms:", std::chrono::duration<double, std::milli>(pacingDeadline - now).count());
+                    sleepDiary().entries.push_back(head + describeDeadlines(m_deadlines, m_eeCycle, now));
+                }
+                ps2_host_profile::Scope pace(ps2_host_profile::Pace);
+                waitUntilPrecise(m_eventCv, lock, pacingDeadline, [this]()
+                                 { return !m_events.empty() ||
+                                          m_stopRequested.load(std::memory_order_acquire); });
                 if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
                 {
                     updateNextDeadline();
@@ -1847,11 +2237,49 @@ void EeScheduler::processDueDeadlines()
         {
             if (scheduled.event.type == EeEventType::VBlankStart)
             {
+                // A VBlank comes every 16.7 ms of real time whatever the game is doing. When the runtime has fallen
+                // far behind (a stall of over 100 ms: a long load step, the drawing thread busy with a big upload),
+                // the missed VBlanks must not be delivered afterwards at full speed: the game ran fast-forward until
+                // the schedule caught up with the clock (Def Jam Vendetta: about a second at up to double speed after
+                // loading a match, and again as the match starts). The schedule restarts from now instead, as the EE
+                // clock does (catchUpWithHostClock); a smaller lag still catches up, so the rate stays 60 Hz.
+                // VENDETTA_VBLANK_CATCHUP=1 restores the old catch-up.
+                if (sleepLogEnabled())
+                {
+                    SleepDiary &diary = sleepDiary();
+                    const auto at = std::chrono::steady_clock::now();
+                    if (diary.lastVBlank != std::chrono::steady_clock::time_point{} && at - diary.lastVBlank > std::chrono::milliseconds(50))
+                    {
+                        std::string text;
+                        for (const std::string &entry : diary.entries)
+                            text += "\n[sleep]   " + entry;
+                        std::fprintf(stderr, "[sleep] %.1f ms between vblanks %llu and %llu (%zu sleeps):%s\n",
+                                     std::chrono::duration<double, std::milli>(at - diary.lastVBlank).count(),
+                                     static_cast<unsigned long long>(m_vsyncTick), static_cast<unsigned long long>(m_vsyncTick + 1u),
+                                     diary.entries.size(), text.c_str());
+                    }
+                    diary.lastVBlank = at;
+                    diary.entries.clear();
+                }
+                static const bool catchUp = std::getenv("VENDETTA_VBLANK_CATCHUP") != nullptr;
+                auto hostDeadline = scheduled.hostDeadline;
+                const auto now = std::chrono::steady_clock::now();
+                if (!catchUp && now - hostDeadline > kVBlankResync)
+                {
+                    static const bool log = std::getenv("VENDETTA_HOSTPROF") != nullptr;
+                    if (log)
+                    {
+                        std::fprintf(stderr, "[vblank] %lld ms behind real time at tick %llu: the schedule restarts from now\n",
+                                     static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(now - hostDeadline).count()),
+                                     static_cast<unsigned long long>(m_vsyncTick));
+                    }
+                    hostDeadline = now;
+                }
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
-                              scheduled.hostDeadline + kVBlankDuration,
+                              hostDeadline + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
                 scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
-                              scheduled.hostDeadline + kVBlankPeriod,
+                              hostDeadline + kVBlankPeriod,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);
@@ -1867,6 +2295,7 @@ void EeScheduler::processEvent(const EeEvent &event)
         requestStop();
         break;
     case EeEventType::VBlankStart:
+    {
         ++m_vsyncTick;
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)
@@ -1881,7 +2310,7 @@ void EeScheduler::processEvent(const EeEvent &event)
         if (m_vsyncTickAddress != 0u)
         {
             const uint32_t physical = m_vsyncTickAddress & 0x1FFFFFFFu;
-            if (m_rdram && physical <= PS2_RAM_SIZE - sizeof(uint64_t))
+            if (m_rdram && physical <= PS2_RAM_BACKING_SIZE - sizeof(uint64_t))
             {
                 std::memcpy(m_rdram + physical, &m_vsyncTick, sizeof(m_vsyncTick));
             }
@@ -1889,6 +2318,7 @@ void EeScheduler::processEvent(const EeEvent &event)
         m_vsyncFlagAddress = 0u;
         m_vsyncTickAddress = 0u;
         completeVSync(m_vsyncTick);
+        const uint64_t firstHandlerSeq = m_invocationSequence + 1u;
         if (m_gsVSyncCallback != 0u && m_runtime.hasFunction(m_gsVSyncCallback))
         {
             GuestInvocation invocation{};
@@ -1901,7 +2331,18 @@ void EeScheduler::processEvent(const EeEvent &event)
             queueInvocation(std::move(invocation));
         }
         dispatchIrq(false, 2u);
+        for (uint64_t seq = firstHandlerSeq; seq <= m_invocationSequence; ++seq)
+            m_vsyncHandlerSeqs.push_back(seq);
+        if (m_presentDue)
+            ++m_presentDueVblanks;
+        else
+        {
+            m_presentDue = true;
+            m_presentTick = m_vsyncTick;
+            m_presentDueVblanks = 1u;
+        }
         break;
+    }
     case EeEventType::ExternalWake:
         completeExternalWait(event.id, event.value, KE_OK);
         break;
@@ -1922,9 +2363,9 @@ void EeScheduler::processEvent(const EeEvent &event)
         GuestInvocation invocation{};
         invocation.kind = GuestInvocationKind::Alarm;
         invocation.context.pc = alarm.handler;
-        SET_GPR_U32(&invocation.context, 4, static_cast<uint32_t>(alarm.id));
-        SET_GPR_U32(&invocation.context, 5, static_cast<uint32_t>(alarm.ticks));
-        SET_GPR_U32(&invocation.context, 6, alarm.argument);
+        SET_GPR_U32(&invocation.context, 4, alarm.argumentInA0 ? alarm.argument : static_cast<uint32_t>(alarm.id));
+        SET_GPR_U32(&invocation.context, 5, alarm.argumentInA0 ? 0u : static_cast<uint32_t>(alarm.ticks));
+        SET_GPR_U32(&invocation.context, 6, alarm.argumentInA0 ? 0u : alarm.argument);
         SET_GPR_U32(&invocation.context, 28, alarm.gp);
         SET_GPR_U32(&invocation.context, 29, 0u);
         SET_GPR_U32(&invocation.context, 31, 0u);
@@ -1987,15 +2428,46 @@ void EeScheduler::writeGuestU32(uint32_t address, uint32_t value)
         return;
     }
     const uint32_t physical = address & 0x1FFFFFFFu;
-    if (!m_rdram || physical > PS2_RAM_SIZE - sizeof(value))
+    if (!m_rdram || physical > PS2_RAM_BACKING_SIZE - sizeof(value))
     {
         return;
     }
     std::memcpy(m_rdram + physical, &value, sizeof(value));
 }
 
+void EeScheduler::maybePresent()
+{
+    if (!m_presentDue)
+        return;
+    const bool forced = m_presentDueVblanks >= 2u;
+    if (m_presentMode != PresentMode::VBlank && !m_vsyncHandlerSeqs.empty() && !forced)
+        return;
+    m_presentDue = false;
+    if (forced && !m_vsyncHandlerSeqs.empty())
+    {
+        ps2_host_profile::count(ps2_host_profile::GsPresentForced);
+        m_vsyncHandlerSeqs.clear();
+    }
+    // the display registers as they are now; the chain presents in order with the drawing it was given
+    m_runtime.chain().present(GS::captureDisplayRegs(m_runtime.memory().gs()), m_presentTick);
+}
+
 void EeScheduler::waitForEvent()
 {
+    {
+        // The EE is idle: if the chain worker is more than 2 vblanks behind, then if the GS thread is more than 2 flips
+        // behind, let them catch up first (no EE time is lost: an overdue host deadline below returns at once and EE
+        // time jumps to the event).
+        static const uint32_t chainLag = []
+        {
+            const char *lag = std::getenv("VENDETTA_CHAIN_LAG");
+            return lag && *lag ? static_cast<uint32_t>(std::strtoul(lag, nullptr, 10)) : 2u;
+        }();
+        m_runtime.chain().waitBacklog(chainLag, m_stopRequested);
+        ps2_host_profile::Scope throttle(ps2_host_profile::GsWait);
+        m_runtime.gs().waitFlipBacklog(2u, m_stopRequested);
+    }
+    ps2_host_profile::Scope profile(ps2_host_profile::Wait);
     std::unique_lock lock(m_eventMutex);
     if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
     {
@@ -2028,17 +2500,38 @@ void EeScheduler::waitForEvent()
     }
     if (hasTimerDeadline)
     {
+        // Advance EE time only to whichever event comes first in EE time. Choosing by host deadline let an
+        // overdue VBlank (its host deadline already passed while the runtime runs behind real time) jump EE time
+        // past a timer compare: the timer interrupt then arrived over a period late, and a handler that re-arms
+        // with "target += period - count" (Def Jam Vendetta's 100 Hz tick) wrapped its 16-bit target and fell to
+        // ~9 Hz. Sleep until the earlier host deadline, so a runtime that is behind does not wait.
+        const uint64_t timerDeadlineCycle = m_eeCycle + timerCycles;
         const auto timerHostDeadline = std::chrono::steady_clock::now() + eeCyclesToHostDuration(timerCycles);
-        if (timerHostDeadline < hostDeadline)
+        if (m_deadlines.empty() || timerDeadlineCycle < deadlineCycle)
         {
-            deadlineCycle = m_eeCycle + timerCycles;
-            hostDeadline = timerHostDeadline;
+            deadlineCycle = timerDeadlineCycle;
         }
+        hostDeadline = std::min(hostDeadline, timerHostDeadline);
     }
 
-    const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
-                                               { return !m_events.empty() ||
-                                                        m_stopRequested.load(std::memory_order_acquire); });
+    if (sleepLogEnabled())
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (sleepDiary().entries.size() < 64u)
+        {
+            char head[96];
+            std::snprintf(head, sizeof(head), "idle %.1f ms (to EE %+.1f ms; timer in EE %+.1f ms):",
+                          hostDeadline == std::chrono::steady_clock::time_point::max()
+                              ? -1.0
+                              : std::chrono::duration<double, std::milli>(hostDeadline - now).count(),
+                          static_cast<double>(static_cast<int64_t>(deadlineCycle - m_eeCycle)) / static_cast<double>(kEeClockHz / 1000u),
+                          hasTimerDeadline ? static_cast<double>(timerCycles) / static_cast<double>(kEeClockHz / 1000u) : -1.0);
+            sleepDiary().entries.push_back(head + describeDeadlines(m_deadlines, m_eeCycle, now));
+        }
+    }
+    const auto woken = [this]()
+    { return !m_events.empty() || m_stopRequested.load(std::memory_order_acquire); };
+    const bool signaled = waitUntilPrecise(m_eventCv, lock, hostDeadline, woken);
     if (!signaled)
     {
         const uint64_t elapsed = deadlineCycle > m_eeCycle ? deadlineCycle - m_eeCycle : 0u;

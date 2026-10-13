@@ -3,6 +3,7 @@
 #include "ps2x/iop/iop_types.h"
 
 #include <array>
+#include <functional>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -128,6 +129,34 @@ namespace ps2x::iop
             (void)packet;
             (void)packetSize;
             return false;
+        }
+
+        // IOP -> EE RPC: an IRX binding to / calling a server the EE registered with sceSifRegisterRpc (real hardware:
+        // SIF commands 0x80000009/0x8000000A served by the EE kernel's RPC loop). findEeRpcServer fills the client's
+        // server/buf/cbuf words; callEeRpcServer runs the server function (fno, buf, sendSize) on the EE and calls
+        // done(result address) when it returns. Hosts without an EE side return false.
+        virtual bool findEeRpcServer(uint32_t sid, uint32_t &serverData, uint32_t &buffer, uint32_t &callbackBuffer) const
+        {
+            (void)sid;
+            serverData = buffer = callbackBuffer = 0u;
+            return false;
+        }
+        virtual bool callEeRpcServer(uint32_t serverData, uint32_t function, uint32_t sendSize,
+                                     std::function<void(uint32_t)> done)
+        {
+            (void)serverData;
+            (void)function;
+            (void)sendSize;
+            (void)done;
+            return false;
+        }
+
+        // Sound the SPU2 plays straight from IOP memory (AutoDMA): 16-bit stereo frames, L/R interleaved, 48 kHz,
+        // handed over as the transfer starts. Hosts without audio output ignore it.
+        virtual void submitAudio(const int16_t *frames, size_t frameCount)
+        {
+            (void)frames;
+            (void)frameCount;
         }
 
         virtual void log(LogLevel level, std::string_view message) = 0;

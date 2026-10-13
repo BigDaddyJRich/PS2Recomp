@@ -320,10 +320,11 @@ namespace ps2x::iop::detail
         return ok;
     }
 
-    bool IopModuleLoader::readElfFromGuest(IopHost &host, uint32_t guestAddress, std::vector<uint8_t> &bytes)
+    template <typename Read>
+    static bool readElfWith(Read &&readAt, uint32_t guestAddress, std::vector<uint8_t> &bytes)
     {
         Elf32Ehdr header{};
-        if (!host.readGuest(guestAddress, &header, sizeof(header)) || !validElfHeader(header))
+        if (!readAt(guestAddress, &header, sizeof(header)) || !validElfHeader(header))
             return false;
 
         uint64_t required = sizeof(header);
@@ -334,7 +335,7 @@ namespace ps2x::iop::detail
             return false; // Should we log an error here? TODO check later
 
         bytes.resize(static_cast<size_t>(required));
-        if (!host.readGuest(guestAddress, bytes.data(), bytes.size()))
+        if (!readAt(guestAddress, bytes.data(), bytes.size()))
             return false;
 
         if (header.shnum != 0u && header.shentsize >= sizeof(Elf32Shdr))
@@ -364,7 +365,19 @@ namespace ps2x::iop::detail
             return false;
 
         bytes.resize(static_cast<size_t>(required));
-        return host.readGuest(guestAddress, bytes.data(), bytes.size());
+        return readAt(guestAddress, bytes.data(), bytes.size());
+    }
+
+    bool IopModuleLoader::readElfFromGuest(IopHost &host, uint32_t guestAddress, std::vector<uint8_t> &bytes)
+    {
+        return readElfWith([&](uint32_t a, void *d, size_t n) { return host.readGuest(a, d, n); }, guestAddress, bytes);
+    }
+
+    // sceSifLoadModuleBuffer's address is an IOP address: games (HCTP) sceSifSetDma the IRX into an IOP heap block
+    // first, then pass that block's address.
+    bool IopModuleLoader::readElfFromIop(const IopMemory &memory, uint32_t iopAddress, std::vector<uint8_t> &bytes)
+    {
+        return readElfWith([&](uint32_t a, void *d, size_t n) { return memory.readRam(a & 0x1FFFFFu, d, n); }, iopAddress, bytes);
     }
 
     IopImageLoadResult IopModuleLoader::load(std::span<const uint8_t> image, IopMemory &memory, uint32_t moduleCursor)

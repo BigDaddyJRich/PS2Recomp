@@ -3,9 +3,17 @@
 
 #include <array>
 #include <cstdint>
+#include <vector>
 
 class GS;
 class PS2Memory;
+class VU1Interpreter;
+
+// VU1 code recompiled ahead of time (runtime/ps2_vu1_compiled.h)
+enum class Vu1CompiledResult : uint8_t;
+using Vu1CompiledFn = Vu1CompiledResult (*)(VU1Interpreter &vu, uint64_t budgetEnd, uint64_t &pairsRun);
+struct Vu1Compiled;
+struct Vu1CompiledPiece;
 
 struct VU1State
 {
@@ -37,6 +45,8 @@ struct VU1State
 
 class VU1Interpreter
 {
+    friend struct Vu1Compiled; // the compiled VU1 code's access (runtime/ps2_vu1_compiled.h)
+
 public:
     enum class Unit : uint8_t
     {
@@ -115,8 +125,26 @@ private:
         bool tBit = false;
         uint8_t upperVfShadowReg = 0;
         uint8_t suppressedLowerVf = 0;
+        uint8_t lowerViWriteReg = 0; // the lowest VI register the lower instruction writes (0 = none)
+
+        // Precomputed from the two usages for the stall check and the write marking (same rules, no loops over
+        // every register / lane per pair).
+        std::array<VfAccess, 4> stallReads{}; // VF reads of both halves (vf0 left out: it is never written)
+        uint8_t stallReadCount = 0;
+        uint16_t stallViReads = 0;   // VI registers 1-15 read by either half
+        uint8_t stallAccReads = 0;   // ACC lanes read by either half
+        VfAccess markLowerVf{};      // the lower VF write (not when the upper's write to the same register wins)
+        uint8_t markLowerVfLatency = 0;
+        VfAccess markUpperVf{};
+        uint8_t markUpperVfLatency = 0;
+        uint16_t markViWrites = 0;   // VI registers 1-15 the lower writes
+        uint8_t markViLatency = 0;
+        uint8_t markAccWrites = 0;   // ACC lanes the upper writes
     };
 
+    // The pipeline entries are cleared field by field with clear(): `entry = {}` builds a zeroed temporary and copies
+    // it, and the copy's wide reads of fresh narrow stores stall (for XgkickPipeline it was a 64 KB memset + memcpy on
+    // every XGKICK).
     struct FlagPipelineEntry
     {
         uint64_t readyCycle = 0;
@@ -130,6 +158,21 @@ private:
         bool writesStatus = false;
         bool writesSticky = false;
         bool writesClip = false;
+
+        void clear() noexcept
+        {
+            readyCycle = 0;
+            issueCycle = 0;
+            mac = 0;
+            status = 0;
+            extraSticky = 0;
+            clip = 0;
+            valid = false;
+            writesMac = false;
+            writesStatus = false;
+            writesSticky = false;
+            writesClip = false;
+        }
     };
 
     struct ScalarPipelineEntry
@@ -138,6 +181,14 @@ private:
         float value = 0.0f;
         uint32_t statusDi = 0;
         bool valid = false;
+
+        void clear() noexcept
+        {
+            readyCycle = 0;
+            value = 0.0f;
+            statusDi = 0;
+            valid = false;
+        }
     };
 
     struct PendingStore
@@ -147,6 +198,15 @@ private:
         std::array<uint32_t, 4> words{};
         uint8_t laneMask = 0;
         bool valid = false;
+
+        void clear() noexcept
+        {
+            readyCycle = 0;
+            address = 0;
+            words[0] = words[1] = words[2] = words[3] = 0u;
+            laneMask = 0;
+            valid = false;
+        }
     };
 
     struct PendingVfWrite
@@ -157,6 +217,16 @@ private:
         uint8_t reg = 0;
         uint8_t laneMask = 0;
         bool valid = false;
+
+        void clear() noexcept
+        {
+            readyCycle = 0;
+            sequence = 0;
+            value[0] = value[1] = value[2] = value[3] = 0.0f;
+            reg = 0;
+            laneMask = 0;
+            valid = false;
+        }
     };
 
     struct PendingViWrite
@@ -166,6 +236,15 @@ private:
         int32_t value = 0;
         uint8_t reg = 0;
         bool valid = false;
+
+        void clear() noexcept
+        {
+            readyCycle = 0;
+            sequence = 0;
+            value = 0;
+            reg = 0;
+            valid = false;
+        }
     };
 
     struct PendingAccWrite
@@ -175,6 +254,15 @@ private:
         std::array<float, 4> value{};
         uint8_t laneMask = 0;
         bool valid = false;
+
+        void clear() noexcept
+        {
+            readyCycle = 0;
+            sequence = 0;
+            value[0] = value[1] = value[2] = value[3] = 0.0f;
+            laneMask = 0;
+            valid = false;
+        }
     };
 
     struct XgkickPipeline
@@ -189,6 +277,19 @@ private:
         uint64_t issueCycle = 0;
         bool active = false;
         bool currentTagEop = false;
+
+        // the packet bytes are left as they are: only the bytes copied in since the XGKICK are ever read
+        void clear() noexcept
+        {
+            sourceAddress = 0;
+            totalBytes = 0;
+            copiedBytes = 0;
+            currentTagEnd = 0;
+            cycleCredit = 0;
+            issueCycle = 0;
+            active = false;
+            currentTagEop = false;
+        }
     };
 
     static constexpr uint32_t kFmacLatency = 4u;
@@ -208,11 +309,28 @@ private:
     uint32_t m_cachedCodeSize = 0;
     uint64_t m_cachedCodeGeneration = 0;
     bool m_decodedCodeCacheValid = false;
+    bool m_codeReadsMacStatus = true; // the decoded code has FSEQ / FSAND / FSOR / FMEQ / FMAND / FMOR
+    // Compiled VU1 code (runtime/ps2_vu1_compiled.h): per pair, the compiled function to enter there for the code
+    // now in VU memory (nullptr = interpret); refreshed with the decode cache.
+    std::array<Vu1CompiledFn, kMaxDecodedPairs> m_compiledFnAt{};
+    bool m_compiledEnabled = true; // VENDETTA_VU1_COMPILED=0 turns the compiled VU1 code off
+    void refreshCompiledEntries(const uint8_t *vuCode, uint32_t codeSize);
+    bool compiledShapesMatch(const Vu1CompiledPiece &piece, uint32_t &badPair) const;
+    // the decode cache for the code in VU memory, rebuilt if the code changed; false = untracked code memory
+    bool ensureDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory);
 
     std::array<FlagPipelineEntry, kMaxFlagEntries> m_flagPipeline{};
     ScalarPipelineEntry m_fdiv{};
     std::array<ScalarPipelineEntry, 2> m_efu{};
     std::array<PendingStore, kMaxPendingStores> m_storePipeline{};
+    // Which slots of m_flagPipeline / m_storePipeline hold an entry (bit i = slot i, kept in every mode). Fast mode
+    // allocates and commits by them; the original model scans every slot as before (VENDETTA_VU1_VERIFY compares
+    // the two).
+    uint8_t m_flagSlotsUsed = 0;
+    uint8_t m_storeSlotsUsed = 0;
+    static_assert(kMaxFlagEntries <= 8u && kMaxPendingStores <= 8u);
+    template <typename Entry, size_t N>
+    Entry *takeFreeSlot(std::array<Entry, N> &slots, uint8_t &used);
     std::array<PendingVfWrite, kMaxPendingVfWrites> m_vfWritePipeline{};
     std::array<PendingViWrite, kMaxPendingViWrites> m_viWritePipeline{};
     std::array<PendingAccWrite, kMaxPendingAccWrites> m_accWritePipeline{};
@@ -227,6 +345,20 @@ private:
     uint64_t m_cycle = 0;
     uint64_t m_nextWriteSequence = 0;
     uint64_t m_efuResourceReady = 0;
+    // The earliest readyCycle of any queued pipeline result (0 = unknown, scan next cycle). Lets
+    // commitReadyPipelines() skip its scan of every pipeline slot on cycles where nothing is due.
+    uint64_t m_nextCommitCycle = 0;
+    void noteReadyCycle(uint64_t cycle) noexcept
+    {
+        if (cycle < m_nextCommitCycle)
+            m_nextCommitCycle = cycle;
+    }
+    // an address in the active VU data memory (a power-of-two size wraps with a mask, not a division)
+    uint32_t wrapVuDataAddress(uint32_t address) const noexcept
+    {
+        const uint32_t size = m_activeVuDataSize;
+        return (size & (size - 1u)) == 0u ? (address & (size - 1u)) : (address % size);
+    }
     uint32_t m_workingClip = 0;
     uint32_t m_currentUpperInstruction = 0;
     int32_t m_viBranchBackupValue = 0;
@@ -243,6 +375,23 @@ private:
     void run(uint8_t *vuCode, uint32_t codeSize,
              uint8_t *vuData, uint32_t dataSize,
              GS &gs, PS2Memory *memory, uint32_t maxCycles);
+    void runLoop(uint8_t *vuCode, uint32_t codeSize,
+                 uint8_t *vuData, uint32_t dataSize,
+                 GS &gs, PS2Memory *memory, uint32_t maxCycles);
+    void runVerified(uint8_t *vuCode, uint32_t codeSize,
+                     uint8_t *vuData, uint32_t dataSize,
+                     GS &gs, PS2Memory *memory, uint32_t maxCycles);
+    void drainRegisterWrites();
+
+    // Fast mode (default; VENDETTA_VU1_FAST=0 = off): results are written to the registers when the instruction
+    // runs, not queued and replayed when their latency is up. Equivalent because every reader of a pending result
+    // stalls until it is ready (m_vfReady / m_viReady / m_accReady are still kept); Q, P, the flags, stores and
+    // XGKICK keep their timed pipelines. VENDETTA_VU1_VERIFY=1 runs every program both ways and compares.
+    bool m_fastMode = true;
+    bool m_verifying = false;
+    uint64_t m_registerWritesSettleCycle = 0; // fast mode: when the last register write would have landed
+    std::vector<std::vector<uint8_t>> *m_kickCapture = nullptr; // XGKICK packets go here instead of to the GS
+    DecodedInstructionPair m_decodeScratch{};
 
     InstructionUsage decodeUpperUsage(uint32_t upper) const;
     InstructionUsage decodeLowerUsage(uint32_t lower) const;
@@ -250,10 +399,18 @@ private:
     static void addVfWrite(InstructionUsage &usage, uint8_t reg, uint8_t lanes);
     static uint8_t vfReadLanes(const InstructionUsage &usage, uint8_t reg);
     DecodedInstructionPair decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const;
-    DecodedInstructionPair getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc);
+    const DecodedInstructionPair &getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc);
     void rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory, uint64_t generation);
 
     void execUpper(uint32_t instr);
+    // Fast mode: the common upper instructions without the MAC / status flag work (only when the code in VU
+    // memory never reads those flags) and with only the lanes they use; false = not handled, use execUpper.
+    bool execUpperFast(uint32_t instr);
+    void runUpper(uint32_t instr)
+    {
+        if (!(m_fastMode && m_decodedCodeCacheValid && !m_codeReadsMacStatus && execUpperFast(instr)))
+            execUpper(instr);
+    }
     void execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr);
 
     void applyDest(float *dst, const float *result, uint8_t dest);
@@ -278,6 +435,7 @@ private:
 
     void resetScheduler();
     void commitReadyPipelines();
+    void commitReadyPipelinesScan(); // the original model's commit: every slot scanned
     void advanceOneCycle();
     void advanceTo(uint64_t targetCycle);
     void flushPipelines();

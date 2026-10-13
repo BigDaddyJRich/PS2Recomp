@@ -95,6 +95,11 @@ namespace ps2recomp
                 std::unique(config.entryPointHints.begin(), config.entryPointHints.end()),
                 config.entryPointHints.end());
 
+            if (general.contains("game_code") && general.at("game_code").is_array())
+            {
+                config.gameCodeFunctions = toml::find<std::vector<std::string>>(general, "game_code");
+            }
+
             if (general.contains("skip") && general.at("skip").is_array())
             {
                 config.skipFunctions = toml::find<std::vector<std::string>>(general, "skip");

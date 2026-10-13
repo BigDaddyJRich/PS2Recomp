@@ -58,9 +58,13 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool setInternalEventFlag(int id, uint32_t bits);
 
         void sleepCurrent(IopCpuState &cpu);
+        [[nodiscard]] int currentThreadId() const noexcept { return m_currentThread ? m_currentThread->id : 0; }
+        void wakeSleeping(int id); // Sleep -> Ready only (no wakeup count): ends a host-side wait such as an EE RPC
         void delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu);
 
-        [[nodiscard]] IopThread *beginNextReady(uint64_t currentCycle);
+        // nextDelayWake (optional): the earliest wake cycle of the threads still delayed after this call, the
+        // same value nextWakeCycle(UINT64_MAX) would return right after it.
+        [[nodiscard]] IopThread *beginNextReady(uint64_t currentCycle, uint64_t *nextDelayWake = nullptr);
         [[nodiscard]] uint64_t nextWakeCycle(uint64_t fallback) const;
         void endTimeslice(IopThread &thread, uint32_t returnSentinel);
         void cleanupDeadThreads();
@@ -99,5 +103,8 @@ namespace ps2x::iop::detail
         uint32_t m_nextSemaphoreId = 1;
         uint32_t m_nextEventFlagId = 1;
         IopThread *m_currentThread = nullptr;
+        // Set whenever a thread is made Dead (ExitDeleteThread, terminateThreadsInRange - the only two places),
+        // cleared by the walk in cleanupDeadThreads; while it is clear there is no Dead thread to erase.
+        bool m_deadPending = false;
     };
 }

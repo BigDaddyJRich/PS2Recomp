@@ -504,3 +504,221 @@ void VU1Interpreter::execUpper(uint32_t instr)
         return;
     }
 }
+
+// ============================================================================
+// Fast mode upper instructions (see execUpperFast in ps2_vu1.h)
+// ============================================================================
+namespace
+{
+    // = VU1Interpreter::normalizeOperand: denormals -> signed zero, Inf / NaN -> signed max
+    inline float fastOperand(float value)
+    {
+        uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        const uint32_t exponent = bits & 0x7F800000u;
+        if (exponent == 0u)
+            bits &= 0x80000000u;
+        else if (exponent == 0x7F800000u)
+            bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
+
+    // A sum / difference / product of two VU floats: clamping the float result gives the same value as the
+    // interpreter's exact (long double) check — the result is zero / denormal / overflowing exactly when the exact
+    // one is, with the same sign (round toward zero).
+    inline float fastPlainResult(float value)
+    {
+        return fastOperand(value);
+    }
+
+    // acc ± a·b: the float result can differ from the exact one near zero, so decide as
+    // normalizeFmacExactResult does, on the exact value (long double = double here).
+    inline float fastExactResult(float value, double exact)
+    {
+        uint32_t bits;
+        const double magnitude = exact < 0.0 ? -exact : exact;
+        const uint32_t sign = std::signbit(exact) ? 0x80000000u : 0u;
+        if (magnitude == 0.0 || magnitude < static_cast<double>(std::numeric_limits<float>::min()))
+            bits = sign;
+        else if (magnitude > static_cast<double>(std::numeric_limits<float>::max()))
+            bits = sign | 0x7F7FFFFFu;
+        else
+            return value;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
+}
+
+bool VU1Interpreter::execUpperFast(uint32_t instr)
+{
+    const uint8_t op = instr & 0x3Fu;
+    const uint8_t dest = DEST(instr);
+    const uint8_t fs = FS(instr);
+    const uint8_t ft = FT(instr);
+    const uint8_t fd = FD(instr);
+
+    enum Kind
+    {
+        Add,
+        Sub,
+        Madd,
+        Msub,
+        Mul,
+        Max,
+        Mini
+    };
+    enum Source
+    {
+        Lane,      // vt[c]
+        Broadcast, // vt[bc]
+        FromQ,
+        FromI
+    };
+    Kind kind = Add;
+    Source source = Lane;
+    uint8_t bc = 0;
+    bool toAcc = false;
+
+    if (op < 0x3Cu)
+    {
+        if (op <= 0x1Bu)
+        {
+            static constexpr Kind kinds[7] = {Add, Sub, Madd, Msub, Max, Mini, Mul};
+            kind = kinds[op >> 2];
+            source = Broadcast;
+            bc = op & 3u;
+        }
+        else
+        {
+            switch (op)
+            {
+            case 0x1C: kind = Mul; source = FromQ; break;
+            case 0x1D: kind = Max; source = FromI; break;
+            case 0x1E: kind = Mul; source = FromI; break;
+            case 0x1F: kind = Mini; source = FromI; break;
+            case 0x20: kind = Add; source = FromQ; break;
+            case 0x21: kind = Madd; source = FromQ; break;
+            case 0x22: kind = Add; source = FromI; break;
+            case 0x23: kind = Madd; source = FromI; break;
+            case 0x24: kind = Sub; source = FromQ; break;
+            case 0x25: kind = Msub; source = FromQ; break;
+            case 0x26: kind = Sub; source = FromI; break;
+            case 0x27: kind = Msub; source = FromI; break;
+            case 0x28: kind = Add; break;
+            case 0x29: kind = Madd; break;
+            case 0x2A: kind = Mul; break;
+            case 0x2B: kind = Max; break;
+            case 0x2C: kind = Sub; break;
+            case 0x2D: kind = Msub; break;
+            case 0x2F: kind = Mini; break;
+            default: return false; // OPMSUB and the rest: the interpreter
+            }
+        }
+    }
+    else
+    {
+        const uint8_t special = static_cast<uint8_t>((instr & 3u) | ((instr >> 4) & 0x7Cu));
+        if (special == 0x2Fu)
+            return true; // NOP
+        if (special == 0x14u || special == 0x15u || special == 0x16u || special == 0x17u)
+        {
+            // FTOI0 / 4 / 12 / 15 -> vt
+            static constexpr float scales[4] = {1.0f, 16.0f, 4096.0f, 32768.0f};
+            const float scale = scales[special & 3u];
+            float *vt = m_state.vf[ft];
+            const float *vs = m_state.vf[fs];
+            int32_t out[4];
+            for (uint32_t c = 0; c < 4u; ++c)
+                if (dest & (0x8u >> c))
+                    out[c] = vuFloatToInt(fastOperand(vs[c]), scale);
+            for (uint32_t c = 0; c < 4u; ++c)
+                if (dest & (0x8u >> c))
+                    std::memcpy(&vt[c], &out[c], sizeof(out[c]));
+            return true;
+        }
+        if (special == 0x1Fu)
+            return false; // CLIP: the interpreter (it queues the clip flags)
+        if (special <= 0x0Fu)
+        {
+            static constexpr Kind kinds[4] = {Add, Sub, Madd, Msub};
+            kind = kinds[special >> 2];
+            source = Broadcast;
+            bc = special & 3u;
+        }
+        else if (special >= 0x18u && special <= 0x1Bu)
+        {
+            kind = Mul;
+            source = Broadcast;
+            bc = special & 3u;
+        }
+        else
+        {
+            switch (special)
+            {
+            case 0x1C: kind = Mul; source = FromQ; break;
+            case 0x1E: kind = Mul; source = FromI; break;
+            case 0x20: kind = Add; source = FromQ; break;
+            case 0x21: kind = Madd; source = FromQ; break;
+            case 0x22: kind = Add; source = FromI; break;
+            case 0x23: kind = Madd; source = FromI; break;
+            case 0x24: kind = Sub; source = FromQ; break;
+            case 0x25: kind = Msub; source = FromQ; break;
+            case 0x26: kind = Sub; source = FromI; break;
+            case 0x27: kind = Msub; source = FromI; break;
+            case 0x28: kind = Add; break;
+            case 0x29: kind = Madd; break;
+            case 0x2A: kind = Mul; break;
+            case 0x2C: kind = Sub; break;
+            case 0x2D: kind = Msub; break;
+            default: return false;
+            }
+        }
+        toAcc = true;
+    }
+
+    m_currentUpperInstruction = instr;
+    const float *vs = m_state.vf[fs];
+    const float *vt = m_state.vf[ft];
+    float scalar = 0.0f;
+    if (source == Broadcast)
+        scalar = fastOperand(vt[bc]);
+    else if (source == FromQ)
+        scalar = fastOperand(m_state.q);
+    else if (source == FromI)
+        scalar = fastOperand(m_state.i);
+
+    float result[4];
+    for (uint32_t c = 0; c < 4u; ++c)
+    {
+        if (!(dest & (0x8u >> c)))
+            continue;
+        const float a = fastOperand(vs[c]);
+        const float b = source == Lane ? fastOperand(vt[c]) : scalar;
+        switch (kind)
+        {
+        case Add: result[c] = fastPlainResult(a + b); break;
+        case Sub: result[c] = fastPlainResult(a - b); break;
+        case Mul: result[c] = fastPlainResult(a * b); break;
+        case Max: result[c] = (a > b) ? a : b; break;
+        case Mini: result[c] = (a < b) ? a : b; break;
+        case Madd:
+        {
+            const float acc = fastOperand(m_state.acc[c]);
+            result[c] = fastExactResult(acc + a * b, static_cast<double>(acc) + static_cast<double>(a) * static_cast<double>(b));
+            break;
+        }
+        case Msub:
+        {
+            const float acc = fastOperand(m_state.acc[c]);
+            result[c] = fastExactResult(acc - a * b, static_cast<double>(acc) - static_cast<double>(a) * static_cast<double>(b));
+            break;
+        }
+        }
+    }
+    float *target = toAcc ? m_state.acc : m_state.vf[fd];
+    for (uint32_t c = 0; c < 4u; ++c)
+        if (dest & (0x8u >> c))
+            target[c] = result[c];
+    return true;
+}

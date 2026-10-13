@@ -1,6 +1,7 @@
 #ifndef PS2_RUNTIME_H
 #define PS2_RUNTIME_H
 
+#include <map>
 #include <cstring>
 #include <cstdint>
 #include <vector>
@@ -29,6 +30,7 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_vu1.h"
+#include "runtime/ps2_chain.h"
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_pad.h"
 #include "runtime/ps2_rom_device.h"
@@ -379,7 +381,11 @@ public:
     uint32_t guestMalloc(uint32_t size, uint32_t alignment = 16u);
     uint32_t guestCalloc(uint32_t count, uint32_t size, uint32_t alignment = 16u);
     uint32_t guestRealloc(uint32_t guestAddr, uint32_t newSize, uint32_t alignment = 16u);
-    void guestFree(uint32_t guestAddr);
+    void guestFree(uint32_t guestAddr); // also frees kernelMalloc blocks
+    // The runtime's own small guest buffers (packets, callback data) in kernel RAM, apart from the game's heap;
+    // falls back to guestMalloc when the area is full.
+    uint32_t kernelMalloc(uint32_t size, uint32_t alignment = 16u);
+    std::string dispatchTrace() const; // the last guest functions dispatched (for crash / exit reports)
     uint32_t guestHeapBase() const;
     uint32_t guestHeapEnd() const;
     uint32_t guestHeapLimit() const;
@@ -446,6 +452,9 @@ public:
     inline const VU1Interpreter &vu0() const { return m_vu0; }
     inline VU1Interpreter &vu1() { return m_vu1; }
     inline const VU1Interpreter &vu1() const { return m_vu1; }
+    inline ChainWorker &chain() { return m_chain; }
+    // The EE context the game thread is running (the scheduler's current thread, else the main context).
+    R5900Context *currentEeContext();
 
     inline PS2AudioBackend &audioBackend() { return m_audioBackend; }
     inline const PS2AudioBackend &audioBackend() const { return m_audioBackend; }
@@ -480,6 +489,7 @@ private:
     [[nodiscard]] ps2x::iop::RpcAbi selectIopRpcAbi(const ps2x::iop::RpcAbiRequest &request) const;
     [[nodiscard]] bool canBindIopRpc(uint32_t sid) const noexcept;
     [[nodiscard]] ps2x::iop::RpcResult handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request);
+    [[nodiscard]] bool sendIopSifCommand(uint8_t *rdram, R5900Context *ctx, uint32_t commandId, const void *packet, size_t packetSize);
     void notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer);
     void advanceIopEeCycles(uint64_t eeCycles) noexcept;
     void resetIop();
@@ -501,6 +511,10 @@ private:
     VU1Interpreter m_vu1{VU1Interpreter::Unit::VU1};
     R5900Context m_cpuContext;
     std::unique_ptr<EeScheduler> m_eeScheduler;
+    // after VU1, the GS, memory and the scheduler: destroyed (its thread stopped) before what it uses
+    ChainWorker m_chain{*this};
+    template <typename T, typename Read>
+    T loadCsrExempt(Read read);
     mutable std::mutex m_eeKernelStateMutex;
     std::unordered_map<int, std::vector<EeExitHandlerRegistration>> m_eeExitHandlers;
     std::unordered_map<uint32_t, uint32_t> m_eeSyscallOverrides;
@@ -513,8 +527,10 @@ private:
     uint32_t m_guestHeapLimit = PS2_RAM_SIZE;
     uint32_t m_guestHeapSuggestedBase = 0x00100000u;
     bool m_guestHeapConfigured = false;
-    uint32_t m_asyncCallbackStackFloor = 0x01F00000u;
-    uint32_t m_asyncCallbackStackTop = PS2_RAM_SIZE;
+    uint32_t m_asyncCallbackStackFloor = 0x00048000u;
+    uint32_t m_asyncCallbackStackTop = 0x00080000u;
+    std::mutex m_kernelArenaMutex;
+    std::map<uint32_t, uint32_t> m_kernelArenaBlocks; // address -> size, kernelMalloc's blocks
 
     std::atomic<uint32_t> m_missingFunctionPolicy{static_cast<uint32_t>(MissingFunctionPolicy::ContinueToTarget)};
     std::atomic<bool> m_missingFunctionReported{false};

@@ -6,6 +6,7 @@
 #include "runtime/ee_scheduler.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -24,31 +25,7 @@ namespace ps2_stubs
 
     void sceSifSendCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t srcAddr = getRegU32(ctx, 7); // $a3
-        const uint32_t dstAddr = readStackU32(rdram, ctx, 16);
-        const uint32_t size = readStackU32(rdram, ctx, 20);
-        if (size != 0u && srcAddr != 0u && dstAddr != 0u)
-        {
-            std::vector<uint8_t> payload(size);
-            bool valid = runtime != nullptr;
-            for (uint32_t i = 0; i < size; ++i)
-            {
-                const uint8_t *src = getConstMemPtr(rdram, srcAddr + i);
-                if (!src)
-                {
-                    valid = false;
-                    break;
-                }
-                payload[i] = *src;
-            }
-            if (!valid || !runtime->writeIopMemory(dstAddr, payload.data(), payload.size()))
-            {
-                setReturnS32(ctx, 0);
-                return;
-            }
-        }
-
-        setReturnS32(ctx, 1);
+        ps2_syscalls::sceSifSendCmd(rdram, ctx, runtime);
     }
 
     namespace
@@ -232,22 +209,41 @@ namespace ps2_stubs
                             const void *packet,
                             size_t packetSize) noexcept
     {
+        static const bool trace = std::getenv("VENDETTA_IOPLOG") != nullptr;
         if (!rdram || !runtime || !packet || packetSize < 16u || packetSize > 112u)
+        {
+            if (trace)
+                std::cerr << "[sif-cmd] IOP->EE cid=0x" << std::hex << commandId << " dropped: bad packet size 0x" << packetSize << std::dec << std::endl;
             return false;
+        }
 
         SifCmdHandler registered{};
         {
             std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
             const auto handler = g_sifCmdHandlers.find(commandId);
             if (handler == g_sifCmdHandlers.end() || handler->second.function == 0u)
+            {
+                if (trace)
+                    std::cerr << "[sif-cmd] IOP->EE cid=0x" << std::hex << commandId << " dropped: no EE handler" << std::dec << std::endl;
                 return false;
+            }
             registered = handler->second;
         }
 
         if (!runtime->hasFunction(registered.function))
+        {
+            if (trace)
+                std::cerr << "[sif-cmd] IOP->EE cid=0x" << std::hex << commandId << " dropped: no code at 0x" << registered.function << std::dec << std::endl;
             return false;
+        }
+        if (trace)
+        {
+            const uint32_t *words = static_cast<const uint32_t *>(packet);
+            std::cerr << "[sif-cmd] IOP->EE cid=0x" << std::hex << commandId << " -> 0x" << registered.function
+                      << " packet " << words[3] << ' ' << words[4] << ' ' << words[5] << ' ' << words[6] << std::dec << std::endl;
+        }
 
-        const uint32_t packetAddress = runtime->guestMalloc(static_cast<uint32_t>(packetSize), 16u);
+        const uint32_t packetAddress = runtime->kernelMalloc(static_cast<uint32_t>(packetSize), 16u);
         if (packetAddress == 0u)
             return false;
 
@@ -294,6 +290,8 @@ namespace ps2_stubs
         const uint32_t cid = getRegU32(ctx, 4);
         const uint32_t handler = getRegU32(ctx, 5);
         const uint32_t argument = getRegU32(ctx, 6);
+        if (std::getenv("VENDETTA_IOPLOG"))
+            std::cerr << "[sif-cmd] EE handler cid=0x" << std::hex << cid << " -> 0x" << handler << " arg=0x" << argument << std::dec << std::endl;
         std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
         g_sifCmdHandlers[cid] = SifCmdHandler{handler, argument};
         setReturnS32(ctx, 0);

@@ -41,7 +41,7 @@ namespace ps2_stubs
                 constexpr uint32_t kClutQwc = 4u;
                 constexpr uint32_t kHeaderQwc = 6u;
                 constexpr uint32_t kTotalQwc = kHeaderQwc + kClutQwc;
-                uint32_t pktAddr = runtime->guestMalloc(kTotalQwc * 16u, 16u);
+                uint32_t pktAddr = runtime->kernelMalloc(kTotalQwc * 16u, 16u);
                 if (pktAddr != 0u)
                 {
                     uint8_t *pkt = getMemPtr(rdram, pktAddr);
@@ -122,7 +122,7 @@ namespace ps2_stubs
         int qwc = (fontDataSz >= 0) ? (fontDataSz >> 4) : ((fontDataSz + 0xf) >> 4);
 
         uint32_t glyphSrc = fontDataAddr + static_cast<uint32_t>(fontDataSz) + 0x10u;
-        uint32_t glyphAlloc = runtime->guestMalloc(0x2010u, 0x40u);
+        uint32_t glyphAlloc = runtime->kernelMalloc(0x2010u, 0x40u);
         if (uint8_t *p = getMemPtr(rdram, kFontBase + fontOff))
             *reinterpret_cast<uint32_t *>(p) = glyphAlloc;
 
@@ -140,7 +140,7 @@ namespace ps2_stubs
         if (isDoubleByte == 0u)
         {
             uint32_t kernSrc = glyphSrc + 0x2010u;
-            uint32_t kernAlloc = runtime->guestMalloc(0xc400u, 0x40u);
+            uint32_t kernAlloc = runtime->kernelMalloc(0xc400u, 0x40u);
             if (glyphAlloc != 0u)
                 *reinterpret_cast<uint32_t *>(getMemPtr(rdram, glyphAlloc + 0x2000u)) = kernAlloc;
             if (kernAlloc != 0u)
@@ -180,7 +180,7 @@ namespace ps2_stubs
             const uint32_t headerQwc = 12u;
             const uint32_t imageQwc = static_cast<uint32_t>(qwc);
             const uint32_t totalQwc = headerQwc + imageQwc;
-            uint32_t pktAddr = runtime->guestMalloc(totalQwc * 16u, 16u);
+            uint32_t pktAddr = runtime->kernelMalloc(totalQwc * 16u, 16u);
             if (pktAddr != 0u)
             {
                 uint8_t *pkt = getMemPtr(rdram, pktAddr);

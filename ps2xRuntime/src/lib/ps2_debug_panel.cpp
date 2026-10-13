@@ -14,12 +14,21 @@
 #include "imgui.h"
 #include "rlImGui.h"
 #include "raylib.h"
+#include "ps2_host_input.h"
+#if defined(PS2X_HAS_GLFW)
+#define GLFW_INCLUDE_NONE
+#include <GLFW/glfw3.h>
+#include "imgui_impl_glfw.h"
+#include "gs/gs_vulkan_present.h"
+#define PS2X_PANEL_ON_VULKAN 1
+#endif
 #endif
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -1512,6 +1521,80 @@ namespace
         ImGui::TextUnformatted("bits: Select,L3,R3,Start,Up,Right,Down,Left,L2,R2,L1,R1,Triangle,Circle,Cross,Square");
     }
 
+    // The picture: which renderer draws it, how it is scaled to the window, and (on the graphics card) the detail and
+    // what the card's thread is doing. Changes take effect at the next frame.
+    void drawGraphicsTab(PS2Runtime &runtime)
+    {
+        GS &gs = runtime.gs();
+        GSGpuRenderer *gpu = gs.gpuRendererForSettings();
+        const GSRendererMode mode = gs.rendererMode();
+
+        ImGui::SeparatorText("Renderer");
+        if (gpu)
+            ImGui::Text("Graphics card: %s (paraLLEl-GS, Vulkan)", gpu->deviceName());
+        else
+            ImGui::TextUnformatted("CPU renderer (PS2Recomp's software GS) at the PS2's own resolution");
+        if (mode == GSRendererMode::Both)
+        {
+            int show = gs.showsGpuPicture() ? 0 : 1;
+            ImGui::TextUnformatted("Show:");
+            ImGui::SameLine();
+            if (ImGui::RadioButton("graphics card", show == 0))
+                gs.setShowGpuPicture(true);
+            ImGui::SameLine();
+            if (ImGui::RadioButton("CPU renderer", show == 1))
+                gs.setShowGpuPicture(false);
+        }
+        else
+            ImGui::TextDisabled("To compare with the CPU renderer live, start with VENDETTA_GS=both (VENDETTA_GS=cpu: "
+                                "the CPU renderer only).");
+
+        ImGui::SeparatorText("Scaling to the window");
+        const GSPresentFilter filter = gs.presentFilter();
+        if (gpu && ImGui::RadioButton("FSR (sharp)", filter == GSPresentFilter::Fsr))
+            gs.setPresentFilter(GSPresentFilter::Fsr);
+        if (gpu)
+            ImGui::SameLine();
+        if (ImGui::RadioButton("Bilinear (smooth)", filter == GSPresentFilter::Bilinear))
+            gs.setPresentFilter(GSPresentFilter::Bilinear);
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Nearest (blocky)", filter == GSPresentFilter::Nearest))
+            gs.setPresentFilter(GSPresentFilter::Nearest);
+
+        if (!gpu)
+            return;
+        const GSGpuStatus status = gpu->status();
+        if (filter == GSPresentFilter::Fsr)
+        {
+            float sharpness = status.sharpness;
+            if (ImGui::SliderFloat("Sharpening (0 = most)", &sharpness, 0.0f, 2.0f, "%.2f"))
+                gpu->setSharpness(sharpness);
+        }
+
+        ImGui::SeparatorText("Detail (super-sampling)");
+        static const uint32_t kRates[] = {1u, 2u, 4u, 8u, 16u};
+        for (size_t i = 0; i < std::size(kRates); ++i)
+        {
+            char label[8];
+            std::snprintf(label, sizeof(label), "%ux", kRates[i]);
+            if (i != 0)
+                ImGui::SameLine();
+            if (ImGui::RadioButton(label, status.superSampling == kRates[i]))
+                gpu->setSuperSampling(kRates[i]);
+        }
+        bool hires = status.highResolution;
+        if (ImGui::Checkbox("Double resolution (4x and up)", &hires))
+            gpu->setHighResolution(hires);
+
+        ImGui::SeparatorText("Now");
+        ImGui::Text("Picture %u x %u%s%s", status.pictureWidth, status.pictureHeight,
+                    status.highResolution ? ", double resolution" : "", status.fsr ? ", FSR to the window's size" : "");
+        ImGui::Text("Graphics card thread %.0f%% busy, %.0f pictures/s, %.1f MB/s of GS data, %.0f render passes/s",
+                    status.busyPercent, status.presentsPerSecond, status.gifMegabytesPerSecond,
+                    status.renderPassesPerSecond);
+        ImGui::TextDisabled("F1 hides this panel.");
+    }
+
     void drawGsTab(PS2Runtime &runtime)
     {
         GSRegisters &regs = runtime.memory().gs();
@@ -2176,12 +2259,34 @@ namespace
 
 #endif
 }
+#if defined(PS2X_PANEL_ON_VULKAN)
+namespace
+{
+    // the game's window is the Vulkan one: the panel takes its input there and the presenter
+    // draws it
+    GLFWwindow *g_panelWindow = nullptr;
+}
+#endif
+
 void PS2DebugPanel::initialize()
 {
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
     if (!m_initialized)
     {
-        rlImGuiSetup(true);
+#if defined(PS2X_PANEL_ON_VULKAN)
+        g_panelWindow = host_input::window();
+        if (g_panelWindow)
+        {
+            ImGui::CreateContext();
+            ImGui::StyleColorsDark();
+            ImGuiIO &io = ImGui::GetIO();
+            io.BackendRendererName = "vulkan_presenter";
+            io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures; // the presenter makes the textures
+            ImGui_ImplGlfw_InitForOther(g_panelWindow, true);
+        }
+        else
+#endif
+            rlImGuiSetup(true);
         m_initialized = true;
     }
 #endif
@@ -2192,7 +2297,17 @@ void PS2DebugPanel::shutdown()
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
     if (m_initialized)
     {
-        rlImGuiShutdown();
+#if defined(PS2X_PANEL_ON_VULKAN)
+        if (g_panelWindow)
+        {
+            setPresentUi(nullptr);
+            ImGui_ImplGlfw_Shutdown();
+            ImGui::DestroyContext();
+            g_panelWindow = nullptr;
+        }
+        else
+#endif
+            rlImGuiShutdown();
         m_initialized = false;
     }
 #endif
@@ -2206,17 +2321,83 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
         return;
     }
 
-    if (IsKeyPressed(KEY_F1))
+    // hidden by default (F1); VENDETTA_DEBUG_TAB=<tab> opens the panel on that tab at start
+    static bool startChecked = false;
+    if (!startChecked)
     {
+        startChecked = true;
+        if (std::getenv("VENDETTA_DEBUG_TAB") != nullptr)
+            m_visible = true;
+    }
+
+    bool f1 = false;
+#if defined(PS2X_PANEL_ON_VULKAN)
+    if (g_panelWindow)
+    {
+        static bool f1Before = false;
+        const bool f1Down = host_input::keyDown(KEY_F1);
+        f1 = f1Down && !f1Before;
+        f1Before = f1Down;
+    }
+    else
+#endif
+        f1 = IsKeyPressed(KEY_F1);
+    if (f1)
+    {
+        // the pointer, hidden in fullscreen, while the panel is open
+        bool wasHidden = false;
+#if defined(PS2X_PANEL_ON_VULKAN)
+        if (g_panelWindow)
+            wasHidden = glfwGetInputMode(g_panelWindow, GLFW_CURSOR) == GLFW_CURSOR_HIDDEN;
+        else
+#endif
+            wasHidden = IsCursorHidden();
         toggleVisible();
+        static bool hiddenBeforePanel = false;
+        auto showPointer = [](bool show)
+        {
+#if defined(PS2X_PANEL_ON_VULKAN)
+            if (g_panelWindow)
+            {
+                glfwSetInputMode(g_panelWindow, GLFW_CURSOR, show ? GLFW_CURSOR_NORMAL : GLFW_CURSOR_HIDDEN);
+                return;
+            }
+#endif
+            if (show)
+                ShowCursor();
+            else
+                HideCursor();
+        };
+        if (m_visible && wasHidden)
+        {
+            hiddenBeforePanel = true;
+            showPointer(true);
+        }
+        else if (!m_visible && hiddenBeforePanel)
+        {
+            hiddenBeforePanel = false;
+            showPointer(false);
+        }
     }
 
     if (!m_visible)
     {
+#if defined(PS2X_PANEL_ON_VULKAN)
+        if (g_panelWindow)
+            setPresentUi(nullptr);
+#endif
         return;
     }
 
-    rlImGuiBegin();
+#if defined(PS2X_PANEL_ON_VULKAN)
+    if (g_panelWindow)
+    {
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+    }
+    else
+#endif
+        rlImGuiBegin();
 
     ImGui::SetNextWindowSize(ImVec2(780.0f, 620.0f), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Runtime Debugger", &m_visible, ImGuiWindowFlags_MenuBar))
@@ -2229,57 +2410,72 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
 
         if (ImGui::BeginTabBar("debug-tabs"))
         {
-            if (ImGui::BeginTabItem("CPU"))
+            // VENDETTA_DEBUG_TAB=<name>: that tab open at start (e.g. Graphics)
+            static const char *startTab = std::getenv("VENDETTA_DEBUG_TAB");
+            static int startFrames = 2;
+            auto tabFlags = [&](const char *name) -> ImGuiTabItemFlags
+            {
+                return (startFrames > 0 && startTab && std::strcmp(startTab, name) == 0) ? ImGuiTabItemFlags_SetSelected
+                                                                                          : ImGuiTabItemFlags_None;
+            };
+            if (startFrames > 0)
+                --startFrames;
+            if (ImGui::BeginTabItem("CPU", nullptr, tabFlags("CPU")))
             {
                 drawCpuTab(runtime, m_showRegisters);
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("Threads"))
+            if (ImGui::BeginTabItem("Threads", nullptr, tabFlags("Threads")))
             {
                 drawThreadsTab(runtime);
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("Kernel"))
+            if (ImGui::BeginTabItem("Kernel", nullptr, tabFlags("Kernel")))
             {
                 drawKernelTab(runtime);
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("IOP/SIF"))
+            if (ImGui::BeginTabItem("IOP/SIF", nullptr, tabFlags("IOP/SIF")))
             {
                 drawIopTab(runtime);
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("RPC History"))
+            if (ImGui::BeginTabItem("RPC History", nullptr, tabFlags("RPC History")))
             {
                 drawRpcHistoryTab(runtime);
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("PAD"))
+            if (ImGui::BeginTabItem("PAD", nullptr, tabFlags("PAD")))
             {
                 drawPadTab();
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("File/CD"))
+            if (ImGui::BeginTabItem("File/CD", nullptr, tabFlags("File/CD")))
             {
                 drawFileCdTab(runtime);
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("GS"))
+            if (ImGui::BeginTabItem("Graphics", nullptr, tabFlags("Graphics")))
+            {
+                drawGraphicsTab(runtime);
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("GS", nullptr, tabFlags("GS")))
             {
                 drawGsTab(runtime);
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("DMA/IO"))
+            if (ImGui::BeginTabItem("DMA/IO", nullptr, tabFlags("DMA/IO")))
             {
                 drawIoTab(runtime);
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("Logs"))
+            if (ImGui::BeginTabItem("Logs", nullptr, tabFlags("Logs")))
             {
                 drawLogsTab();
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("Memory"))
+            if (ImGui::BeginTabItem("Memory", nullptr, tabFlags("Memory")))
             {
                 uint32_t bytes = m_memoryBytes;
                 ImGui::InputScalar("Address", ImGuiDataType_U32, &m_memoryAddress, nullptr, nullptr, "%08X", ImGuiInputTextFlags_CharsHexadecimal);
@@ -2303,7 +2499,15 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
     }
     ImGui::End();
 
-    rlImGuiEnd();
+#if defined(PS2X_PANEL_ON_VULKAN)
+    if (g_panelWindow)
+    {
+        ImGui::Render();
+        setPresentUi(ImGui::GetDrawData()); // drawn over the picture at the next present
+    }
+    else
+#endif
+        rlImGuiEnd();
 #else
     (void)runtime;
 #endif

@@ -1,5 +1,7 @@
 #include "Common.h"
 #include "System.h"
+#include <cstdio>
+#include <cstdlib>
 
 namespace ps2_syscalls
 {
@@ -17,6 +19,16 @@ namespace ps2_syscalls
                 ((static_cast<uint64_t>(frameMode) & 0x1ull) << 1);
 
             gs.smode2 = smode2;
+            // the BIOS programs SMODE1 for the mode, as the PS2SDK's graph library does: the video clock (RC 4, LC 32,
+            // T1248 1 ...) and CMOD 2 NTSC / 3 PAL. A GS emulation that models the video circuit needs all of it.
+            if (videoMode == 2)
+                gs.smode1 = 0x740834504ull;
+            else if (videoMode == 3)
+                gs.smode1 = 0x740836504ull;
+            static const bool gsLog = std::getenv("VENDETTA_GSLOG") != nullptr;
+            if (gsLog)
+                std::fprintf(stderr, "[gslog] SetGsCrt interlaced=%d mode=%d ffmd=%d -> smode2=0x%llx ra=0x%x%c", interlaced, videoMode, frameMode,
+                             static_cast<unsigned long long>(smode2), getRegU32(ctx, 31), 10);
 
             // Keep CRT1 enabled after the BIOS syscall selects a display mode.
             if ((gs.pmode & 0x3ull) == 0ull)
@@ -491,22 +503,10 @@ namespace ps2_syscalls
                                        : 0u;
         if (stack == 0xFFFFFFFFu)
         {
-            if (stackSizeSigned > 0)
-            {
-                const uint32_t requestedSize = static_cast<uint32_t>(stackSizeSigned);
-                if (requestedSize < PS2_RAM_SIZE)
-                {
-                    sp = PS2_RAM_SIZE - requestedSize;
-                }
-                else
-                {
-                    sp = PS2_RAM_SIZE;
-                }
-            }
-            else
-            {
-                sp = PS2_RAM_SIZE;
-            }
+            // -1 = the stack sits at the top of RAM: [RAM end - size, RAM end), and the thread starts at its TOP.
+            // (This returned RAM end - size — the stack's bottom — so the main thread's stack grew down into the
+            // game's heap: Def Jam Vendetta's heap blocks and other threads' saved registers were overwritten.)
+            sp = PS2_RAM_SIZE;
         }
         else if (stack != 0u)
         {
@@ -523,7 +523,7 @@ namespace ps2_syscalls
         sp &= ~0xFu;
         if (stack == 0xFFFFFFFFu)
         {
-            initialStack = sp;
+            initialStack = (stackSize != 0u && stackSize < PS2_RAM_SIZE) ? PS2_RAM_SIZE - stackSize : 0u;
         }
         else if (stack != 0u)
         {

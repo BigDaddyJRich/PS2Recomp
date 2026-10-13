@@ -2,13 +2,16 @@
 #define PS2_GS_FRONTEND_H
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #include "runtime/gs/gs_backend.h"
+#include "runtime/gs/gs_gpu.h"
 
 struct GSDebugSnapshot
 {
@@ -104,9 +107,12 @@ public:
 
     void init(uint8_t *vram, uint32_t vramSize, struct GSRegisters *privRegs = nullptr);
     void reset();
+    // Before the game runs, or from the thread that feeds the GS.
     void setRasterBackend(std::unique_ptr<GSRasterBackend> backend);
 
-    void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
+    // path: the GIF path the packet came by (1 = VU1 XGKICK, 2 = VIF1, 3 = GIF DMA) — an unfinished tag continues
+    // only with more data from the same path.
+    void processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint8_t path = 3u);
     bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     void uploadImageNative(uint64_t bitbltbuf,
                            uint64_t trxpos,
@@ -115,6 +121,14 @@ public:
                            const uint8_t *data,
                            uint32_t sizeBytes);
     void writeRegister(uint8_t regAddr, uint64_t value);
+
+    // Widescreen (runtime/ps2_widescreen.h): the game's rule for its 2-D layer (a HUD drawn over the 3-D scene). In a
+    // wide frame those primitives are held until the picture is shown, grouped into elements (primitives that touch)
+    // and each squeezed back to its 4:3 shape around the screen's left edge, right edge or centre, by the third of the
+    // screen it sits in - so the HUD keeps its shape and its corners. The graphics card's renderer only (the held GIF
+    // packets are patched where each vertex's X sits).
+    using OverlayRule = bool (*)(const struct GSDrawState &state);
+    void setWidescreenOverlayRule(OverlayRule rule) { m_overlayRule = rule; }
 
     const uint8_t *lockDisplaySnapshot(uint32_t &outSize);
     void unlockDisplaySnapshot();
@@ -129,6 +143,54 @@ public:
     bool isDebugHistoryPaused() const;
     void setDebugHistoryPaused(bool paused);
     bool getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const;
+
+    // Presentation. The game thread hands the renderer "copy GS memory for the screen" at the EE scheduler's settle
+    // point after each vblank's handlers (skipped when the picture cannot have changed); the renderer publishes the
+    // copy in a mailbox, and the main thread converts the newest one (takePresentedFrame). The renderer may be on its
+    // own thread (the default; VENDETTA_GS_ASYNC=0 = inline): the main thread never calls it.
+    void presentAtSettlePoint(uint64_t vsyncTick);
+    // The same with display registers captured earlier (the chain worker presents in order with the drawing it was
+    // given; the game thread captured the registers at the settle point).
+    void presentCaptured(const GSDisplayRegs &regs, uint64_t vsyncTick);
+    static GSDisplayRegs captureDisplayRegs(const struct GSRegisters &regs);
+    // Called before every entry point that changes GS state, outside the GS lock (the chain worker installs a fence
+    // here: a call from another thread waits until the worker has finished what it was given).
+    void setForeignCallGate(void (*gate)(void *), void *context)
+    {
+        m_gateContext = context;
+        m_gate.store(gate, std::memory_order_release);
+    }
+    // The main thread: the newest presentation, converted to 640-wide rows packed to outWidth, when one newer than
+    // lastSeq was published (true; outWidth / outHeight 0 = no picture: the display is not set up).
+    bool takePresentedFrame(uint64_t &lastSeq,
+                            std::vector<uint8_t> &outPixels,
+                            uint32_t &outWidth,
+                            uint32_t &outHeight,
+                            uint32_t *outDisplayFbp = nullptr,
+                            uint32_t *outSourceFbp = nullptr,
+                            bool *outUsedPreferred = nullptr);
+    // The flip throttle (the game thread, holding no lock): wait while the renderer is more than maxAhead flips behind.
+    bool waitFlipBacklog(uint32_t maxAhead, const std::atomic<bool> &stop);
+    void wakeRasterWaiters();  // requestStop
+    void shutdownRasterThread(); // after the game thread has ended
+    void shutdownGpu();          // after the GS thread (the graphics card renderer's thread owns its Vulkan objects)
+    GSRendererMode rendererMode() const { return m_rendererMode; }
+    const GSGpuRenderer *gpuRenderer() const { return m_gpu.get(); }
+    // The main thread: whether the window shows the graphics card's picture, and the newest one (null: none newer).
+    bool showsGpuPicture() const { return m_showGpu; }
+    // VENDETTA_GS=both: which renderer's picture the window shows (the debug panel switches it live)
+    void setShowGpuPicture(bool show) { m_showGpu = show && m_gpu != nullptr; }
+    GSGpuRenderer *gpuRendererForSettings() { return m_gpu.get(); }
+    // The main thread (window, debug panel): how the picture is scaled to the window.
+    GSPresentFilter presentFilter() const { return m_presentFilter; }
+    void setPresentFilter(GSPresentFilter filter)
+    {
+        m_presentFilter = filter;
+        if (m_gpu)
+            m_gpu->setFsr(filter == GSPresentFilter::Fsr);
+    }
+    const GSGpuFrame *takeGpuFrame(uint64_t &lastSeq) { return m_gpu ? m_gpu->takeFrame(lastSeq) : nullptr; }
+    // Present now and convert it (tests and tools; the game uses the two above).
     void latchHostPresentationFrame();
     bool copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t &outWidth,
@@ -172,7 +234,27 @@ private:
     bool tryProcessNativeImageUploadPacket(const uint8_t *data, uint32_t sizeBytes);
     GSPrimitiveBatch buildDrawBatch(int vertexCount) const;
     void updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch);
-    GSPresentationRequest buildPresentationRequestUnlocked() const;
+    GSPresentationRequest completePresentationRequestUnlocked(const GSDisplayRegs &regs, uint64_t vsyncTick) const;
+    void presentUnlocked(const GSDisplayRegs &regs, uint64_t vsyncTick, bool force);
+    void gateForeignCall() const
+    {
+        if (void (*gate)(void *) = m_gate.load(std::memory_order_acquire))
+            gate(m_gateContext);
+    }
+    std::atomic<void (*)(void *)> m_gate{nullptr};
+    void *m_gateContext = nullptr;
+    bool takePresentation(uint64_t &lastSeq, PresentationFrame &frame);
+
+    // At the end of every entry point that hands the renderer work (declared after the lock, so it runs holding it):
+    // the renderer may start on what it was given.
+    struct KickGuard
+    {
+        GS &gs;
+        explicit KickGuard(GS &owner) : gs(owner) {}
+        ~KickGuard();
+        KickGuard(const KickGuard &) = delete;
+        KickGuard &operator=(const KickGuard &) = delete;
+    };
 
 
     GSContext &activeContext();
@@ -191,6 +273,20 @@ private:
 
     uint8_t m_curR = 0x80, m_curG = 0x80, m_curB = 0x80, m_curA = 0x80;
     float m_curQ = 1.0f;
+    // A GIF tag whose data did not fit in the packet that carried it: on hardware the GIF keeps the tag and goes on
+    // with the next data on the path (games send an IMAGE tag and its pixels as separate DMA transfers).
+    struct GifContinuation
+    {
+        bool active = false;
+        uint8_t flg = 0;
+        uint32_t loopsLeft = 0;  // PACKED / REGLIST: whole loops still to come (after the current one)
+        uint32_t nreg = 0;
+        uint8_t regs[16] = {};
+        uint32_t regIndex = 0;   // PACKED / REGLIST: next register within the current loop
+        uint32_t imageBytesLeft = 0;
+        uint32_t regListWords = 0; // REGLIST: 64-bit words consumed, for the odd-count padding
+    } m_gifContinuation[4];     // per GIF path (index 1..3)
+    uint32_t continueGifTag(GifContinuation &tag, const uint8_t *data, uint32_t sizeBytes);
     float m_curS = 0.0f, m_curT = 0.0f;
     uint16_t m_curU = 0, m_curV = 0;
     uint8_t m_curFog = 0;
@@ -213,6 +309,50 @@ private:
 
     static constexpr int kMaxVerts = 6;
     GSVertex m_vtxQueue[kMaxVerts];
+
+    // Widescreen overlay (setWidescreenOverlayRule): where each queued vertex's XYZ sits (packet serial, byte offset;
+    // serial 0 = not in a packet that can be held), the packets held for the graphics card, the 2-D layer's primitives.
+    struct VertexSource
+    {
+        uint64_t packet = 0;
+        uint32_t offset = 0;
+    };
+    struct HeldGpuData
+    {
+        uint64_t packet = 0; // 0 = a register write
+        uint8_t path = 0;
+        uint8_t regAddr = 0;
+        uint64_t regValue = 0;
+        std::vector<uint8_t> bytes;
+    };
+    struct OverlayPrimitive
+    {
+        float minX = 0.0f, minY = 0.0f, maxX = 0.0f, maxY = 0.0f; // screen pixels (after XYOFFSET)
+        float ofx = 0.0f;                                          // XYOFFSET's X, pixels
+        float width = 512.0f;                                      // the frame buffer's width
+        uint8_t count = 0;
+        VertexSource vertices[3];
+    };
+    OverlayRule m_overlayRule = nullptr;
+    VertexSource m_vtxSource[kMaxVerts];
+    const uint8_t *m_packetData = nullptr; // the packet being read when it may be held, else null
+    const uint8_t *m_regSource = nullptr;  // the register write being read (inside m_packetData)
+    uint64_t m_packetSerial = 0;
+    bool m_holding = false;
+    size_t m_heldBytes = 0;
+    std::vector<HeldGpuData> m_held;
+    std::vector<OverlayPrimitive> m_overlay;
+    bool beginOverlayPacket(const uint8_t *data);
+    void forwardGpuGif(uint8_t path, const uint8_t *data, uint32_t sizeBytes);
+    void forwardGpuReg(uint8_t regAddr, uint64_t value);
+    void recordOverlayPrimitive(const struct GSPrimitiveBatch &batch, int vertexCount);
+    void flushOverlayUnlocked();
+    VertexSource currentVertexSource() const
+    {
+        if (!m_packetData || !m_regSource)
+            return {};
+        return {m_packetSerial, static_cast<uint32_t>(m_regSource - m_packetData)};
+    }
     int m_vtxCount = 0;
     int m_vtxIndex = 0;
 
@@ -241,7 +381,30 @@ private:
     uint64_t m_debugLastVsyncTick = UINT64_MAX;
     bool m_debugHistoryPaused = true;
 
+    // presentation state (the producer: whoever holds m_stateMutex)
+    bool m_vramWrittenSincePresent = true;
+    bool m_hasPresented = false;
+    GSPresentationRequest m_lastPresentRequest{};
+    GSDisplayRegs m_lastPresentedRegs{};
+    uint64_t m_presentSeq = 0;
+    uint64_t m_latchedSeq = ~0ull;
+    std::thread::id m_lastProducer{};
+
+    // The graphics card renderer (VENDETTA_GS=gpu / both), or null: the CPU renderer alone.
+    GSRendererMode m_rendererMode = GSRendererMode::Cpu;
+    bool m_showGpu = false;
+    GSPresentFilter m_presentFilter = GSPresentFilter::Bilinear;
+    bool m_warnedGpuUnmirrored = false;
+    uint32_t m_gpuVerifyEvery = 0;   // VENDETTA_GPU_VERIFY=1[,N] (needs VENDETTA_GS=both): compare GS memory every N
+    uint64_t m_gpuVerifyPresents = 0;
+    void verifyGpuMemoryUnlocked(uint64_t vsyncTick);
+    std::unique_ptr<GSGpuRenderer> m_gpu;
+    void warnGpuUnmirrored(const char *what);
+    // Declared before m_backend: a renderer thread may write it until m_backend is destroyed.
+    GSPresentMailbox m_presentation;
     std::unique_ptr<GSRasterBackend> m_backend;
+    // The same renderer, for the calls made without m_stateMutex (the flip throttle, waking, stopping).
+    std::atomic<GSRasterBackend *> m_backendRaw{nullptr};
 };
 
 #endif
