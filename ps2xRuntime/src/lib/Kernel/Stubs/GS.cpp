@@ -609,6 +609,31 @@ namespace ps2_stubs
             setReturnS32(ctx, -1);
             return;
         }
+        // HCTP diag HCTP_GSIMG_DUMP=1: each 4-bit upload (fonts) as a PGM in F:\hctp-newbase\logs\gsimg\ (first 400)
+        {
+            static const bool dump = std::getenv("HCTP_GSIMG_DUMP") != nullptr;
+            static int dumped = 0;
+            const uint8_t *srcPix = getConstMemPtr(rdram, srcAddr);
+            if (dump && img.psm == 0x14 && srcPix && dumped < 400)
+            {
+                char name[200];
+                std::snprintf(name, sizeof(name), "F:/hctp-newbase/logs/gsimg/%03d_dbp%x_x%d_y%d_%dx%d_ra%x.pgm", dumped++,
+                              (unsigned)img.vram_addr, img.x, img.y, img.width, img.height, getRegU32(ctx, 31));
+                if (FILE *f = std::fopen(name, "wb"))
+                {
+                    std::fprintf(f, "P5 %d %d 255\n", img.width, img.height);
+                    for (int yy = 0; yy < img.height; ++yy)
+                        for (int xx = 0; xx < img.width; ++xx)
+                        {
+                            const uint32_t idx = static_cast<uint32_t>(yy * img.width + xx);
+                            const uint8_t b = srcPix[idx >> 1];
+                            const uint8_t v = static_cast<uint8_t>(((idx & 1u) ? (b >> 4) : (b & 15u)) * 17u);
+                            std::fputc(v, f);
+                        }
+                    std::fclose(f);
+                }
+            }
+        }
 
         uint32_t fbw = img.vram_width ? img.vram_width : std::max<uint32_t>(1, (img.width + 63) / 64);
         const uint32_t totalImageBytes = rowBytes * static_cast<uint32_t>(img.height);
@@ -810,9 +835,10 @@ namespace ps2_stubs
                 return;
             }
 
-            g_gparam.interlace = static_cast<uint8_t>(interlace & 0x1);
-            g_gparam.omode = static_cast<uint8_t>(omode & 0xFF);
-            g_gparam.ffmode = static_cast<uint8_t>(ffmode & 0x1);
+            g_gparam.interlace = static_cast<uint16_t>(interlace & 0x1);
+            g_gparam.omode = static_cast<uint16_t>(omode & 0xFF);
+            g_gparam.ffmode = static_cast<uint16_t>(ffmode & 0x1);
+            { static int n = 0; if (n++ < 10) std::fprintf(stderr, "[gsenv] ResetGraph mode=%u inter=%u omode=%u ffmode=%u\n", mode, interlace, omode, ffmode); }
             writeGsGParamToScratch(runtime);
             // The display mode itself goes to SMODE2 as the real library does it (the SetGsCrt syscall). It used
             // to ride in the GIF packet below as A+D registers 0x41 / 0x42 — those are SCISSOR_2 / ALPHA_1, so the
@@ -888,6 +914,21 @@ namespace ps2_stubs
 
     // DISPLAY as libgraph writes it (PCSX2 dumps of NTSC games: 0x1BF9FF0183227C): MAGH spreads the buffer over the
     // 2560-VCK line (DW = 2559 for 640 px) and, in FIELD mode (INT=1, FFMD=1), DH counts frame lines = 2 x the
+    // libgraph sceGszbufaddr: the Z buffer after the frame buffer(s), in pages: one w x h buffer when interlaced in
+    // FIELD mode (sceGsFFMode 0), else two. Same arithmetic as the game's code (signed shifts).
+    static int32_t gsZbufAddr(int32_t psm, int32_t w, int32_t h)
+    {
+        const int32_t fbw = (w + 63 < 0 ? w + 126 : w + 63) >> 6;
+        int32_t fbh;
+        if ((psm & 2) != 0)
+            fbh = (h + 63 < 0 ? h + 126 : h + 63) >> 6;
+        else
+            fbh = (h + 31 < 0 ? h + 62 : h + 31) >> 5;
+        const int32_t product = fbw * fbh;
+        const bool single = g_gparam.interlace == 1u && g_gparam.ffmode == 0u;
+        return single ? product : product * 2;
+    }
+
     // field buffer's height. MAGH=0/DW=639 squeezed HCTP's picture into a quarter of the paraLLEl-GS scanout.
     static uint64_t makeLibgraphDisplay(uint32_t w, uint32_t h)
     {
@@ -907,6 +948,7 @@ namespace ps2_stubs
         const uint32_t ztest = trailing.arg0;
         const uint32_t zpsm = trailing.arg1;
         const uint32_t clear = trailing.arg2;
+        { static int n = 0; if (n++ < 10) std::fprintf(stderr, "[gsenv] SetDefDBuffDc psm=%u w=%u h=%u ztest=%u zpsm=%u clear=%u inter=%u ffmode=%u ra=0x%x\n", psm, w, h, ztest, zpsm, clear, g_gparam.interlace, g_gparam.ffmode, getRegU32(ctx, 31)); }
 
         if (w == 0u)
         {
@@ -927,12 +969,7 @@ namespace ps2_stubs
         const int32_t drawWidth = static_cast<int32_t>(w);
         const int32_t drawHeight = static_cast<int32_t>(h);
 
-        uint32_t zbufAddr = 0u;
-        {
-            R5900Context temp = *ctx;
-            sceGszbufaddr(rdram, &temp, runtime);
-            zbufAddr = getRegU32(&temp, 2);
-        }
+        const uint32_t zbufAddr = static_cast<uint32_t>(gsZbufAddr(static_cast<int32_t>(psm), static_cast<int32_t>(w), static_cast<int32_t>(h)));
 
         // libgraph: buffer 1 right after buffer 0 (pages of one w x h buffer), the Z buffer after both. fbp1 = zbufAddr
         // put HCTP's second field buffer ON its Z buffer -> Z writes garbled every other field (paraLLEl-GS).
@@ -1002,12 +1039,7 @@ namespace ps2_stubs
         const int32_t drawWidth = static_cast<int32_t>(w);
         const int32_t drawHeight = static_cast<int32_t>(h);
 
-        uint32_t zbufAddr = 0u;
-        {
-            R5900Context temp = *ctx;
-            sceGszbufaddr(rdram, &temp, runtime);
-            zbufAddr = getRegU32(&temp, 2);
-        }
+        const uint32_t zbufAddr = static_cast<uint32_t>(gsZbufAddr(static_cast<int32_t>(psm), static_cast<int32_t>(w), static_cast<int32_t>(h)));
 
         GsDBuffMem db{};
         db.disp[0].pmode = pmode;
@@ -1070,8 +1102,7 @@ namespace ps2_stubs
 
         uint32_t psm = param_2 & 0xFU;
         uint32_t fbw = ((static_cast<uint32_t>(w) + 63u) >> 6) & 0x3FU;
-        sceGszbufaddr(rdram, ctx, runtime);
-        int32_t zbuf = static_cast<int32_t>(static_cast<int16_t>(getRegU32(ctx, 2) & 0xFFFF));
+        int32_t zbuf = gsZbufAddr(static_cast<int32_t>(param_2), w, h);
 
         GsDrawEnv1Mem env{};
         seedGsDrawEnv1(env,
@@ -1113,8 +1144,7 @@ namespace ps2_stubs
 
         uint32_t psm = param_2 & 0xFU;
         uint32_t fbw = ((static_cast<uint32_t>(w) + 63u) >> 6) & 0x3FU;
-        sceGszbufaddr(rdram, ctx, runtime);
-        int32_t zbuf = static_cast<int32_t>(static_cast<int16_t>(getRegU32(ctx, 2) & 0xFFFF));
+        int32_t zbuf = gsZbufAddr(static_cast<int32_t>(param_2), w, h);
 
         GsDrawEnv2Mem env{};
         seedGsDrawEnv2(env,
@@ -1368,48 +1398,16 @@ namespace ps2_stubs
 
     void sceGszbufaddr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // libgraph sceGszbufaddr(psm, w, h): a0 / a1 / a2 (SLUS_207.87 0x101238). It read w / h from a2 / a3 - right
+        // only for the stubs' own calls (env, psm, w, h), wrong when the game calls it.
         (void)rdram;
-        uint32_t param_1 = getRegU32(ctx, 4);
-        int32_t w = static_cast<int32_t>(static_cast<int16_t>(getRegU32(ctx, 6) & 0xFFFF));
-        int32_t h = static_cast<int32_t>(static_cast<int16_t>(getRegU32(ctx, 7) & 0xFFFF));
-
-        int32_t width_blocks = (w + 63) >> 6;
-        if (w + 63 < 0)
-            width_blocks = (w + 126) >> 6;
-
-        int32_t height_blocks;
-        if ((param_1 & 2) != 0)
-        {
-            int32_t v = (h + 63) >> 6;
-            if (h + 63 < 0)
-                v = (h + 126) >> 6;
-            height_blocks = v;
-        }
-        else
-        {
-            int32_t v = (h + 31) >> 5;
-            if (h + 31 < 0)
-                v = (h + 62) >> 5;
-            height_blocks = v;
-        }
-
-        int32_t product = width_blocks * height_blocks;
-
-        uint64_t gparam_val = 0;
-        if (runtime)
-        {
-            uint8_t *scratch = runtime->memory().getScratchpad();
-            if (scratch)
-            {
-                std::memcpy(&gparam_val, scratch + 0x100, sizeof(gparam_val));
-            }
-        }
-        if ((gparam_val & 0xFFFF0000FFFFULL) == 1ULL)
-            product = (product * 0x10000) >> 16;
-        else
-            product = (product * 0x20000) >> 16;
-
-        setReturnS32(ctx, product);
+        (void)runtime;
+        const int32_t psm = static_cast<int16_t>(getRegU32(ctx, 4) & 0xFFFF);
+        const int32_t w = static_cast<int16_t>(getRegU32(ctx, 5) & 0xFFFF);
+        const int32_t h = static_cast<int16_t>(getRegU32(ctx, 6) & 0xFFFF);
+        const int32_t z = gsZbufAddr(psm, w, h);
+        { static int n = 0; if (n++ < 10) std::fprintf(stderr, "[gsenv] zbufaddr(game) psm=%d w=%d h=%d -> %d ra=0x%x\n", psm, w, h, z, getRegU32(ctx, 31)); }
+        setReturnS32(ctx, z);
     }
 
     void Ps2SwapDBuff(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

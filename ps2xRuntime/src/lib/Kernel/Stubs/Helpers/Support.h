@@ -1511,12 +1511,14 @@ namespace
 
 namespace
 {
+    // libgraph sceGsGParam: four shorts (sceGsInterMode, sceGsOutMode, sceGsFFMode, sceGsVersion); game code and
+    // sceGszbufaddr read it as such (bytes made sceGszbufaddr's "interlace + FIELD" test never match)
     struct GsGParam
     {
-        uint8_t interlace;
-        uint8_t omode;
-        uint8_t ffmode;
-        uint8_t version;
+        uint16_t interlace;
+        uint16_t omode;
+        uint16_t ffmode;
+        uint16_t version;
     };
 
     struct GsDispEnvMem
