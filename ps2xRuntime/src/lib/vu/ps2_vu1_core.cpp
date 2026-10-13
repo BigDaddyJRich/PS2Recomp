@@ -1,3 +1,4 @@
+#include <unordered_map>
 #include <intrin.h>
 #include <bit>
 #include <string>
@@ -1795,6 +1796,44 @@ namespace
         return opHi == 0x14u || opHi == 0x16u || opHi == 0x17u || opHi == 0x18u || opHi == 0x1Au || opHi == 0x1Bu;
     }
 
+    // HCTP: per interpreter, per pair: 1 = the program the pair belongs to (up to and including the delay slot after
+    // an E-bit pair) reads the MAC / status flags. The fast paths (flagless upper ops, compiled code) go by the program
+    // at the pc instead of by "any code in VU memory reads them": HCTP has 2 FMANDs in 2 of its 9 VU1 programs, which
+    // put all VU1 code on the exact (slow) path. Kept here so ps2_vu1.h (included by every generated file) is unchanged.
+    std::unordered_map<const void *, std::array<uint8_t, 0x4000u / 8u>> &programMacReadTables()
+    {
+        static std::unordered_map<const void *, std::array<uint8_t, 0x4000u / 8u>> tables;
+        return tables;
+    }
+
+    template <typename Decoded>
+    void recomputeProgramMacReads(const void *owner, const Decoded *decoded, uint32_t pairCount)
+    {
+        auto &table = programMacReadTables()[owner];
+        table.fill(0u);
+        uint32_t start = 0u;
+        bool reads = false;
+        for (uint32_t i = 0; i < pairCount; ++i)
+        {
+            reads = reads || pairReadsMacStatus(decoded[i].lower, decoded[i].iBit);
+            const bool end = i + 1u == pairCount || (i > 0u && decoded[i - 1u].eBit);
+            if (end)
+            {
+                if (reads)
+                    std::fill(table.begin() + start, table.begin() + i + 1u, uint8_t{1u});
+                start = i + 1u;
+                reads = false;
+            }
+        }
+    }
+
+    bool programReadsMacAt(const void *owner, uint32_t pc)
+    {
+        const auto &tables = programMacReadTables();
+        const auto it = tables.find(owner);
+        return it == tables.end() || it->second[(pc >> 3) & (0x4000u / 8u - 1u)] != 0u;
+    }
+
     struct RegisteredVu1Piece
     {
         const Vu1CompiledPiece *piece = nullptr;
@@ -1867,6 +1906,7 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
         readsMacStatus = readsMacStatus || pairReadsMacStatus(m_decodedCodeCache[i].lower, m_decodedCodeCache[i].iBit);
     }
     m_codeReadsMacStatus = readsMacStatus;
+    recomputeProgramMacReads(this, m_decodedCodeCache.data(), pairCount);
 
     m_cachedVuCode = vuCode;
     m_cachedMemory = memory;
@@ -1910,6 +1950,7 @@ bool VU1Interpreter::ensureDecodedCodeCache(const uint8_t *vuCode, uint32_t code
             for (uint32_t i = 0; i < pairCount && !readsMacStatus; ++i)
                 readsMacStatus = pairReadsMacStatus(m_decodedCodeCache[i].lower, m_decodedCodeCache[i].iBit);
             m_codeReadsMacStatus = readsMacStatus;
+            recomputeProgramMacReads(this, m_decodedCodeCache.data(), pairCount);
             m_cachedCodeGeneration = generation;
             if (first < last && m_compiledEnabled && m_unit == Unit::VU1)
                 refreshCompiledRange(m_compiledFnAt, vuCode, codeSize, first, last, [this](RegisteredVu1Piece &entry)
@@ -2189,6 +2230,8 @@ void VU1Interpreter::runLoop(uint8_t *vuCode, uint32_t codeSize,
         commitReadyPipelines();
         if (m_state.pc + 8u > codeSize)
             break;
+        if (m_fastMode && m_decodedCodeCacheValid)
+            m_codeReadsMacStatus = programReadsMacAt(this, m_state.pc);
 
         // Enter the compiled code at a compiled pair when no branch / E-bit / halt is pending; it runs until it
         // leaves its code, runs out of budget or ends the program, leaving the state as this loop would.

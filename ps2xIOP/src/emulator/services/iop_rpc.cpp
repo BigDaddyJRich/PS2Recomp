@@ -367,9 +367,27 @@ namespace ps2x::iop::detail
             m_kernel.sleepCurrent(cpu);
             setV0(0);
             return true;
-        case 23:
-            setV0(0);
+        case 23: // sceSifGetOtherData(rd, src (EE), dest (IOP), size, mode): the IOP pulls EE memory over SIF DMA.
+        {
+            // HCTP's yiop sound IRX fetches its sound banks this way; the stub returned without copying -> empty banks,
+            // no sound effects (ADX music, which streams by another path, still played). Done at once, so a NOWAIT
+            // caller finds the transfer finished.
+            const uint32_t src = cpu.gpr[5];
+            const uint32_t dest = cpu.gpr[6] & 0x1FFFFFu;
+            const int32_t size = static_cast<int32_t>(cpu.gpr[7]);
+            bool ok = size > 0 && m_memory.isRamRange(dest, static_cast<uint32_t>(size));
+            if (ok)
+            {
+                std::vector<uint8_t> scratch(static_cast<size_t>(size));
+                ok = m_host.readGuest(src, scratch.data(), scratch.size()) &&
+                     m_memory.writeRam(dest, scratch.data(), scratch.size());
+            }
+            static uint32_t logged = 0u;
+            if (logged++ < 32u)
+                std::fprintf(stderr, "[iop-getother] src=0x%x dest=0x%x size=%d ok=%d\n", src, dest, size, ok ? 1 : 0);
+            setV0(ok ? 0u : static_cast<uint32_t>(-1));
             return true;
+        }
         case 24: // RemoveRpc
         {
             const uint32_t serverData = cpu.gpr[4];
