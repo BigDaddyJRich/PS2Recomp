@@ -2693,7 +2693,9 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
 
         // M3R and IMT mirror GIF_MODE, PSE mirrors GIF_CTRL, and M3P is the
         // effective PATH3 mask controlled by the VIF1 MSKPATH3 command (the chain worker's).
-        fenceChain(ChainFence::GifStat);
+        extern bool hctpAtSyncPathPoll();
+        if (!(m_chain && m_chain->async() && hctpAtSyncPathPoll()))
+            fenceChain(ChainFence::GifStat);
         stat = (stat & ~0xFu) |
                (mode & 0x1u) |
                (m_path3Masked ? 0x2u : 0u) |

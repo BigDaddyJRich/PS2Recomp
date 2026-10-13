@@ -860,8 +860,38 @@ namespace
                 }
             }
 
+            {
+                // HCTP_DISPLOG=1: DISPFB/DISPLAY changes per vsync (first 400) - field-mode shimmy diagnosis.
+                static const bool dispLog = std::getenv("HCTP_DISPLOG") != nullptr;
+                static uint64_t s_prev[4] = {~0ull, ~0ull, ~0ull, ~0ull};
+                static int s_lines = 0;
+                const uint64_t cur[4] = {record.regs[7], record.regs[8], record.regs[9], record.regs[10]};
+                if (dispLog && s_lines < 400 && std::memcmp(cur, s_prev, sizeof(cur)) != 0)
+                {
+                    ++s_lines;
+                    std::memcpy(s_prev, cur, sizeof(cur));
+                    std::fprintf(stderr, "[displog] tick=%llu flip=%u SMODE2=%llx DISPFB1=%llx DISPLAY1=%llx DISPFB2=%llx DISPLAY2=%llx\n",
+                                 (unsigned long long)record.vsyncTick, (unsigned)record.flip,
+                                 (unsigned long long)record.regs[2], (unsigned long long)cur[0],
+                                 (unsigned long long)cur[1], (unsigned long long)cur[2], (unsigned long long)cur[3]);
+                }
+            }
             ParallelGS::VSyncInfo info{};
-            info.phase = static_cast<uint32_t>(record.vsyncTick & 1u);
+            // Field phase follows the game's field buffers, not the vsync count: HCTP draws two 640x224 field
+            // buffers and swaps DISPFB each vsync. When the game misses a vsync the same buffer stays up, and
+            // a tick-parity phase would shift that unchanged picture by a line (the whole-screen shimmy). Hold
+            // the phase until DISPFB1/2 change. HCTP_FIELD_TICK=1 = old tick parity; HCTP_FIELD_INVERT=1 flips.
+            static const bool fieldTick = std::getenv("HCTP_FIELD_TICK") != nullptr;
+            static const uint32_t fieldInvert = std::getenv("HCTP_FIELD_INVERT") ? 1u : 0u;
+            static uint64_t s_fieldFb[2] = {~0ull, ~0ull};
+            static uint32_t s_fieldPhase = 0u;
+            if (fieldTick || record.regs[7] != s_fieldFb[0] || record.regs[9] != s_fieldFb[1])
+            {
+                s_fieldFb[0] = record.regs[7];
+                s_fieldFb[1] = record.regs[9];
+                s_fieldPhase = static_cast<uint32_t>((record.vsyncTick + fieldInvert) & 1u);
+            }
+            info.phase = s_fieldPhase;
             info.force_progressive = true;
             info.anti_blur = true;
             info.overscan = false;

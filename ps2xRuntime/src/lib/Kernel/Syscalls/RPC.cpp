@@ -1,4 +1,8 @@
 #include <cstdio>
+#include <algorithm>
+#include <vector>
+#include <cstring>
+#include <cstdlib>
 #include <unordered_map>
 #include "Common.h"
 #include "RPC.h"
@@ -510,6 +514,55 @@ namespace ps2_syscalls
             }
         }
 
+        {
+            // HCTP_RPCLOG=1: light EE->IOP RPC trace (repeats of the same sid/fno/args collapsed).
+            static const bool rpcLog = std::getenv("HCTP_RPCLOG") != nullptr;
+            // HCTP_RPCLOG=2: full payload (up to 32 words) of each RPC whose payload changed since the last call
+            // with the same sid / fno / first word (CRI DTX channel: per-handle state words), first 4000 lines.
+            static const bool rpcLog2 = [] { const char *e = std::getenv("HCTP_RPCLOG"); return e && e[0] == '2'; }();
+            if (rpcLog2 && sendBuf && sendSize)
+            {
+                static std::unordered_map<uint64_t, std::vector<uint32_t>> lastPayload;
+                static int lines = 0;
+                const uint32_t nWords = std::min<uint32_t>(sendSize / 4u, 32u);
+                std::vector<uint32_t> pw(nWords);
+                for (uint32_t i = 0; i < nWords; ++i)
+                    (void)readStackU32(rdram, sendBuf, i * 4u, pw[i]);
+                const uint64_t key = (static_cast<uint64_t>(sid) << 32) ^ (static_cast<uint64_t>(rpcNum) << 16) ^ (nWords ? pw[0] : 0u);
+                auto &prev = lastPayload[key];
+                if (prev != pw && lines < 4000)
+                {
+                    ++lines;
+                    std::fprintf(stderr, "[rpc2] sid=0x%x fno=%u n=%u:", sid, rpcNum, nWords);
+                    for (uint32_t i = 0; i < nWords; ++i)
+                        std::fprintf(stderr, (i < prev.size() && prev[i] == pw[i]) ? " ." : " %x", pw[i]);
+                    std::fprintf(stderr, "\n");
+                    prev = pw;
+                }
+            }
+            if (rpcLog)
+            {
+                static uint32_t lastKey[6] = {};
+                static uint32_t repeats = 0;
+                uint32_t w[4] = {};
+                if (sendBuf && sendSize)
+                    for (uint32_t i = 0; i < 4 && i * 4 < sendSize; ++i)
+                        (void)readStackU32(rdram, sendBuf, i * 4, w[i]);
+                const uint32_t key[6] = {sid, rpcNum, w[0], w[1], w[2], w[3]};
+                if (std::memcmp(key, lastKey, sizeof(key)) == 0)
+                    ++repeats;
+                else
+                {
+                    if (repeats)
+                        std::fprintf(stderr, "[rpc] (x%u repeats)\n", repeats);
+                    repeats = 0;
+                    std::memcpy(lastKey, key, sizeof(key));
+                    std::fprintf(stderr, "[rpc] sid=0x%x fno=%u mode=%u ssz=%u rsz=%u w=%08x %08x %08x %08x ra=0x%x th=%d\n",
+                                 sid, rpcNum, mode, sendSize, receiveSize, w[0], w[1], w[2], w[3],
+                                 getRegU32(ctx, 31), runtime ? 0 : -1);
+                }
+            }
+        }
         const uint32_t serverPtr = client->server;
         auto *server = serverPtr
                            ? reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, serverPtr))

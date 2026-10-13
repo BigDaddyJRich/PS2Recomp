@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "Common.h"
 #include "Audio.h"
 
@@ -128,7 +129,9 @@ namespace ps2_stubs
                 FAST_WRITE32(buf + i * 4u, arg[i]);
 
             static uint32_t logged = 0u;
-            if (logged < 24u)
+            // HCTP_SDRLOG=<lines>: log more commands (default 24) - in-match hit sounds diagnosis
+            static const uint32_t logCap = std::getenv("HCTP_SDRLOG") ? static_cast<uint32_t>(std::strtoul(std::getenv("HCTP_SDRLOG"), nullptr, 10)) : 24u;
+            if (logged < logCap)
             {
                 ++logged;
                 std::fprintf(stderr, "[libsdr] cmd 0x%x args 0x%x 0x%x 0x%x 0x%x 0x%x\n", cmd, arg[1], arg[2], arg[3],

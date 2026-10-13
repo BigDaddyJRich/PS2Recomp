@@ -80,7 +80,8 @@ namespace
     }
 }
 
-ChainWorker::ChainWorker(PS2Runtime &runtime) : m_runtime(runtime) {}
+static PS2Runtime *g_hctpChainRuntime = nullptr;
+ChainWorker::ChainWorker(PS2Runtime &runtime) : m_runtime(runtime) { g_hctpChainRuntime = &runtime; }
 
 ChainWorker::~ChainWorker()
 {
@@ -335,6 +336,66 @@ void ChainWorker::publish()
     }
 }
 
+
+// HCTP_FENCELOG=1: time the game thread spends waiting for the chain worker, by reason (fence reason, or 100 =
+// present backlog throttle) and guest ra / pc; summary every 5 s.
+#include <chrono>
+#include <map>
+#include <cstdlib>
+namespace
+{
+struct FenceAcc
+{
+    uint64_t n = 0;
+    double ms = 0.0;
+};
+void hctpFenceNote(PS2Runtime &rt, int reason, double ms)
+{
+    static const bool on = std::getenv("HCTP_FENCELOG") != nullptr;
+    if (!on)
+        return;
+    static std::map<uint64_t, FenceAcc> acc;
+    static auto last = std::chrono::steady_clock::now();
+    R5900Context *ctx = rt.currentEeContext();
+    const uint32_t ra = ctx ? static_cast<uint32_t>(ctx->r[31].m128i_u32[0]) : 0u;
+    const uint32_t pc = ctx ? ctx->pc : 0u;
+    FenceAcc &a = acc[(static_cast<uint64_t>(reason) << 56) | (static_cast<uint64_t>(ra) << 28) | (pc & 0xFFFFFFFu)];
+    ++a.n;
+    a.ms += ms;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(5))
+        return;
+    last = now;
+    std::vector<std::pair<double, uint64_t>> v;
+    for (auto &kv : acc)
+        v.push_back({kv.second.ms, kv.first});
+    std::sort(v.rbegin(), v.rend());
+    for (size_t i = 0; i < v.size() && i < 8; ++i)
+        std::fprintf(stderr, "[fencelog] reason=%d ra=0x%x pc=0x%x n=%llu ms=%.1f\n", int(v[i].second >> 56),
+                     unsigned((v[i].second >> 28) & 0xFFFFFFFu), unsigned(v[i].second & 0xFFFFFFFu),
+                     (unsigned long long)acc[v[i].second].n, v[i].first);
+    std::fprintf(stderr, "[fencelog] ----\n");
+    acc.clear();
+}
+}
+
+// HCTP's CRender::Synch polls sceGsSyncPath (0x14e180) every frame; its GIF_STAT reads (0x14e6c4 blocking mode,
+// 0x14e73c polling mode) only ask "is the GS idle?". Packets are copied at the kick, so the game may build the next
+// frame while the worker still draws this one (the present backlog throttle bounds how far ahead it gets). Without
+// this, each frame waits ~11 ms for the worker: game logic and rendering ran in series. HCTP_SYNCPATH_FENCE=1 = old.
+bool hctpAtSyncPathPoll()
+{
+    // EXPERIMENT, off by default: skipping it made the demo SLOWER (11 vs 30 presents/s; the game then waits
+    // for FINISH in a CSR read at 0x14c664). HCTP_SYNCPATH_NOFENCE=1 turns it on.
+    static const bool on = std::getenv("HCTP_SYNCPATH_NOFENCE") != nullptr;
+    if (!on)
+        return false;
+    if (!g_hctpChainRuntime)
+        return false;
+    R5900Context *ctx = g_hctpChainRuntime->currentEeContext();
+    return ctx && (ctx->pc == 0x14e73cu || ctx->pc == 0x14e6c4u);
+}
+
 void ChainWorker::fence(ChainFence reason)
 {
     if (!m_async || t_onChainWorker)
@@ -350,8 +411,10 @@ void ChainWorker::fence(ChainFence reason)
         return;
     ps2_host_profile::count(ps2_host_profile::ChainFences);
     ps2_host_profile::count(reason == ChainFence::Csr ? ps2_host_profile::ChainFenceCsr : ps2_host_profile::ChainFenceOther);
+    const auto t0 = std::chrono::steady_clock::now();
     waitProgress("the chain worker to finish", [&]()
                  { return m_stop.load(std::memory_order_acquire) || m_readPos.load(std::memory_order_acquire) >= m_localWrite; });
+    hctpFenceNote(m_runtime, int(reason), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
 }
 
 bool ChainWorker::waitBacklog(uint32_t maxAhead, const std::atomic<bool> &stop)
@@ -363,8 +426,10 @@ bool ChainWorker::waitBacklog(uint32_t maxAhead, const std::atomic<bool> &stop)
     if (caughtUp())
         return true;
     ps2_host_profile::count(ps2_host_profile::ChainThrottleWaits);
+    const auto t0 = std::chrono::steady_clock::now();
     waitProgress("the chain worker to catch up", [&]()
                  { return stop.load(std::memory_order_acquire) || m_stop.load(std::memory_order_acquire) || caughtUp(); });
+    hctpFenceNote(m_runtime, 100, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     return !stop.load(std::memory_order_acquire);
 }
 
