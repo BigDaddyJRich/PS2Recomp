@@ -1725,12 +1725,22 @@ namespace
         uint64_t bytes = 0;
         switch (psm)
         {
+        // Bytes of TRANSFER data (host <-> local): what the GS packs per pixel, not how it stores them. PSMT8H /
+        // PSMT4HL / PSMT4HH are sent as 8 / 4 / 4 bits per pixel (stored in the high bits of 32-bit words), PSMCT24
+        // as 3 bytes. As 32 bits per pixel the HCTP in-match HUD fonts (PSMT4HH at 0x1840 / 0x1c40) went up
+        // 8x the size with the wrong row stride -> garbled wrestler names, clock, season dialogue.
         case 0:  // PSMCT32
-        case 1:  // PSMCT24 (treat as 32)
-        case 27: // PSMT8H (packed in 32-bit lanes)
-        case 36: // PSMT4HL (packed in 32-bit lanes)
-        case 44: // PSMT4HH (packed in 32-bit lanes)
             bytes = pixels * 4ull;
+            break;
+        case 1: // PSMCT24
+            bytes = pixels * 3ull;
+            break;
+        case 27: // PSMT8H
+            bytes = pixels;
+            break;
+        case 36: // PSMT4HL
+        case 44: // PSMT4HH
+            bytes = (pixels + 1ull) / 2ull;
             break;
         case 2:  // PSMCT16
         case 10: // PSMCT16S
