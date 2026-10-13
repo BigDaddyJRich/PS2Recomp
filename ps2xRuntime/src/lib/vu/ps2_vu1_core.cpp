@@ -1,3 +1,4 @@
+#include <chrono>
 #include <unordered_map>
 #include <intrin.h>
 #include <bit>
@@ -33,6 +34,10 @@ namespace
     // processed (front end, drawing) in the caller's mode like every other path to the GS.
     thread_local int t_callerRoundingMode = FE_TONEAREST;
 }
+
+void hctpDumpVifTrace(const char *why);
+static int g_vu1EntryKind = 0; // HCTP diag: 1 = MSCAL (execute), 2 = MSCNT (resume), 0 = other
+static uint32_t g_vu1PrevStart = 0, g_vu1PrevEndPc = 0;
 
 void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
 {
@@ -1850,9 +1855,20 @@ namespace
 
     bool programReadsMacAt(const void *owner, uint32_t pc)
     {
-        const auto &tables = programMacReadTables();
-        const auto it = tables.find(owner);
-        return it == tables.end() || it->second[(pc >> 3) & (0x4000u / 8u - 1u)] != 0u;
+        // per thread: the last owner's table (the map lookup per pair was ~5% of the chain worker); map nodes are
+        // stable, so the cached pointer stays valid while the table is refilled
+        thread_local const void *cachedOwner = nullptr;
+        thread_local const std::array<uint8_t, 0x4000u / 8u> *cachedTable = nullptr;
+        if (owner != cachedOwner || cachedTable == nullptr)
+        {
+            const auto &tables = programMacReadTables();
+            const auto it = tables.find(owner);
+            if (it == tables.end())
+                return true;
+            cachedOwner = owner;
+            cachedTable = &it->second;
+        }
+        return (*cachedTable)[(pc >> 3) & (0x4000u / 8u - 1u)] != 0u;
     }
 
     struct RegisteredVu1Piece
@@ -2095,6 +2111,7 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     m_state.vf[0][1] = 0.0f;
     m_state.vf[0][2] = 0.0f;
     m_state.vf[0][3] = 1.0f;
+    g_vu1EntryKind = 1;
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
 }
 
@@ -2107,6 +2124,7 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
     m_state.itop = itop;
     m_state.stoppedByD = false;
     m_state.stoppedByT = false;
+    g_vu1EntryKind = 2;
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
 }
 
@@ -2221,6 +2239,17 @@ void VU1Interpreter::runVerified(uint8_t *vuCode, uint32_t codeSize,
         std::fprintf(stderr, "[vu1verify] %u programs checked, %u differed%c", programs, mismatches, 10);
 }
 
+// VENDETTA_VU1_STAT=1: every 10 s, VU1 pairs run compiled vs interpreted and why (chain worker only)
+static const bool s_vu1Stat = std::getenv("VENDETTA_VU1_STAT") != nullptr;
+static uint64_t s_vu1Interp[32][5];
+static uint64_t s_vu1CompiledTotal, s_vu1PairsTotal, s_vu1Runs;
+static uint64_t s_vu1Starts[32], s_vu1StartPairs[32];
+static uint32_t s_vu1StartBucket;
+static bool s_vu1InProgram;
+static uint64_t s_vu1ProgPairs, s_vu1MaxPairs[32];
+static uint32_t s_vu1StartPc, s_vu1MaxPc[32];
+static uint64_t s_vu1PcStarts[0x4000 / 8];
+
 void VU1Interpreter::runLoop(uint8_t *vuCode, uint32_t codeSize,
                              uint8_t *vuData, uint32_t dataSize,
                              GS &gs, PS2Memory *memory, uint32_t maxCycles)
@@ -2275,6 +2304,36 @@ void VU1Interpreter::runLoop(uint8_t *vuCode, uint32_t codeSize,
     if (m_fastMode)
         drainRegisterWrites();
     const uint64_t budgetEnd = m_cycle + maxCycles;
+    if (s_vu1Stat && m_unit == Unit::VU1 && !s_vu1InProgram)
+    {
+        s_vu1InProgram = true;
+        s_vu1StartBucket = (m_state.pc >> 9) & 31u;
+        ++s_vu1Starts[s_vu1StartBucket];
+        s_vu1StartPc = m_state.pc & 0x3FF8u;
+        if (s_vu1StartPc == 0x0060u && vuData != nullptr && dataSize >= 0x4000u)
+        {
+            static uint64_t n = 0, zero = 0;
+            int32_t hdr[4];
+            std::memcpy(hdr, vuData + 800u * 16u, 16);
+            ++n;
+            if ((hdr[0] & 0xFFFF) == 0)
+                ++zero;
+            static int vifDumps = 0;
+            if ((hdr[0] & 0xFFFF) > 0x400 && vifDumps < 4)
+            {
+                ++vifDumps;
+                char why[96];
+                std::snprintf(why, sizeof(why), "p1 start at 0060 with q800.x=%08x entry=%d", hdr[0], g_vu1EntryKind);
+                hctpDumpVifTrace(why);
+            }
+            if (n <= 30u || (n % 20000u) == 0u)
+                std::fprintf(stderr, "[vu1hdr] n=%llu q800=%08x %08x %08x %08x entry=%d prevStart=%04x prevEnd=%04x top=%u\n",
+                             (unsigned long long)n, hdr[0], hdr[1], hdr[2], hdr[3], g_vu1EntryKind, g_vu1PrevStart,
+                             g_vu1PrevEndPc, (unsigned)m_state.top);
+        }
+        ++s_vu1PcStarts[s_vu1StartPc >> 3];
+        s_vu1ProgPairs = 0u;
+    }
     const uint64_t startCycle = m_cycle;
     uint64_t pairsRun = 0u;
     uint64_t compiledPairsRun = 0u;
@@ -2326,6 +2385,15 @@ void VU1Interpreter::runLoop(uint8_t *vuCode, uint32_t codeSize,
             }
         }
 
+        if (s_vu1Stat && m_unit == Unit::VU1)
+        {
+            const uint32_t bucket = (m_state.pc >> 9) & 31u; // 512-byte buckets
+            uint32_t why = 0u;                                // 0 compiled off/not fast
+            if (compiledAllowed)
+                why = m_codeReadsMacStatus ? 1u : (m_state.branchPending || m_state.ebit || m_state.haltAfterDelaySlot) ? 2u
+                    : !m_compiledFnAt[m_state.pc >> 3] ? 3u : 4u;
+            ++s_vu1Interp[bucket][why];
+        }
         const DecodedInstructionPair &decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
         if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
         {
@@ -2518,6 +2586,98 @@ void VU1Interpreter::runLoop(uint8_t *vuCode, uint32_t codeSize,
         m_pendingHaltT = false;
     }
     m_state.cycles = m_cycle;
+    if (s_vu1Stat && m_unit == Unit::VU1)
+    {
+        s_vu1CompiledTotal += compiledPairsRun;
+        s_vu1PairsTotal += pairsRun;
+        s_vu1Runs++;
+        s_vu1StartPairs[s_vu1StartBucket] += pairsRun;
+        s_vu1ProgPairs += pairsRun;
+        if (s_vu1ProgPairs > 200000u)
+        {
+            static int logged = 0;
+            if (logged < 40)
+            {
+                ++logged;
+                std::fprintf(stderr, "[vu1long] start=%04x pairs=%llu now pc=%04x ended=%d ebit=%d vi:", s_vu1StartPc,
+                             (unsigned long long)s_vu1ProgPairs, m_state.pc, programEnded ? 1 : 0, m_state.ebit ? 1 : 0);
+                for (int r = 0; r < 16; ++r)
+                    std::fprintf(stderr, " %d", (int)m_state.vi[r]);
+                std::fputc('\n', stderr);
+            }
+            static bool dumped = false;
+            if (!dumped && memory != nullptr)
+            {
+                dumped = true;
+                if (FILE *f = std::fopen("F:/hctp-newbase/logs/vu1_code_dump.bin", "wb"))
+                {
+                    std::fwrite(vuCode, 1, codeSize, f);
+                    std::fclose(f);
+                }
+                if (FILE *f = std::fopen("F:/hctp-newbase/logs/vu1_data_dump.bin", "wb"))
+                {
+                    std::fwrite(vuData, 1, dataSize, f);
+                    std::fclose(f);
+                }
+            }
+        }
+        if (programEnded)
+        {
+            g_vu1PrevStart = s_vu1StartPc;
+            g_vu1PrevEndPc = m_state.pc;
+            s_vu1InProgram = false;
+            if (s_vu1ProgPairs > s_vu1MaxPairs[s_vu1StartBucket])
+            {
+                s_vu1MaxPairs[s_vu1StartBucket] = s_vu1ProgPairs;
+                s_vu1MaxPc[s_vu1StartBucket] = s_vu1StartPc;
+            }
+        }
+        const auto now = std::chrono::steady_clock::now();
+        static auto last = now;
+        if (now - last > std::chrono::seconds(10))
+        {
+            last = now;
+            std::fprintf(stderr, "[vu1stat] runs=%llu pairs=%llu compiled=%llu | interp by 512B bucket [off,mac,pend,nofn,other]:",
+                         (unsigned long long)s_vu1Runs, (unsigned long long)s_vu1PairsTotal, (unsigned long long)s_vu1CompiledTotal);
+            for (uint32_t b = 0; b < 32u; ++b)
+            {
+                uint64_t sum = 0;
+                for (uint32_t w = 0; w < 5u; ++w)
+                    sum += s_vu1Interp[b][w];
+                if (sum > s_vu1PairsTotal / 200u)
+                    std::fprintf(stderr, " %04x:[%llu,%llu,%llu,%llu,%llu]", b * 512u, (unsigned long long)s_vu1Interp[b][0],
+                                 (unsigned long long)s_vu1Interp[b][1], (unsigned long long)s_vu1Interp[b][2],
+                                 (unsigned long long)s_vu1Interp[b][3], (unsigned long long)s_vu1Interp[b][4]);
+            }
+            std::fprintf(stderr, " | starts/pairs by start bucket:");
+            for (uint32_t b = 0; b < 32u; ++b)
+                if (s_vu1Starts[b] != 0u)
+                    std::fprintf(stderr, " %04x:%llu/%llu", b * 512u, (unsigned long long)s_vu1Starts[b], (unsigned long long)s_vu1StartPairs[b]);
+            std::fprintf(stderr, " | max pairs/run (start pc):");
+            for (uint32_t b = 0; b < 32u; ++b)
+                if (s_vu1MaxPairs[b] != 0u)
+                    std::fprintf(stderr, " %04x:%llu(%04x)", b * 512u, (unsigned long long)s_vu1MaxPairs[b], s_vu1MaxPc[b]);
+            std::fprintf(stderr, " | top start pcs:");
+            for (int k = 0; k < 8; ++k)
+            {
+                uint32_t best = 0;
+                for (uint32_t i = 1; i < 0x4000u / 8u; ++i)
+                    if (s_vu1PcStarts[i] > s_vu1PcStarts[best])
+                        best = i;
+                if (s_vu1PcStarts[best] == 0u)
+                    break;
+                std::fprintf(stderr, " %04x:%llu", best * 8u, (unsigned long long)s_vu1PcStarts[best]);
+                s_vu1PcStarts[best] = 0u;
+            }
+            std::memset(s_vu1PcStarts, 0, sizeof(s_vu1PcStarts));
+            std::memset(s_vu1MaxPairs, 0, sizeof(s_vu1MaxPairs));
+            std::memset(s_vu1Starts, 0, sizeof(s_vu1Starts));
+            std::memset(s_vu1StartPairs, 0, sizeof(s_vu1StartPairs));
+            std::fputc('\n', stderr);
+            std::memset(s_vu1Interp, 0, sizeof(s_vu1Interp));
+            s_vu1CompiledTotal = s_vu1PairsTotal = s_vu1Runs = 0;
+        }
+    }
     ps2_host_profile::count(ps2_host_profile::Vu1Pairs, pairsRun);
     ps2_host_profile::count(ps2_host_profile::Vu1CompiledPairs, compiledPairsRun);
     ps2_host_profile::count(ps2_host_profile::Vu1Cycles, m_cycle - startCycle);

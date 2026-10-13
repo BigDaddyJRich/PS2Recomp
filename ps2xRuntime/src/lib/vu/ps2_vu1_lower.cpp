@@ -284,7 +284,10 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     case 0x24: // JR
     {
         uint8_t is = VIS(instr);
-        uint32_t target = ((uint32_t)(uint16_t)readBranchVi(is) * 8u) & pcMask;
+        // JR / JALR read the current VI: the "previous op wrote it -> old value" rule is for the conditional
+        // branches only (PCSX2 VUops _vuJR/_vuJALR, microVU mVUanalyzeJump). With the backup, HCTP's
+        // "IADDIU vi12, 660 ; JALR vi12" jumped to the stale vi12 (0x60 = program 1 on garbage -> 65k-loop runaways).
+        uint32_t target = ((uint32_t)(uint16_t)(is == 0u ? 0 : m_state.vi[is]) * 8u) & pcMask;
         m_state.branchPending = true;
         m_state.branchTarget = target;
         m_state.branchDelay = 1;
@@ -294,7 +297,10 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     {
         uint8_t it = VIT(instr);
         uint8_t is = VIS(instr);
-        uint32_t target = ((uint32_t)(uint16_t)readBranchVi(is) * 8u) & pcMask;
+        // JR / JALR read the current VI: the "previous op wrote it -> old value" rule is for the conditional
+        // branches only (PCSX2 VUops _vuJR/_vuJALR, microVU mVUanalyzeJump). With the backup, HCTP's
+        // "IADDIU vi12, 660 ; JALR vi12" jumped to the stale vi12 (0x60 = program 1 on garbage -> 65k-loop runaways).
+        uint32_t target = ((uint32_t)(uint16_t)(is == 0u ? 0 : m_state.vi[is]) * 8u) & pcMask;
         if (it != 0)
             m_state.vi[it] = (int32_t)((m_state.pc + 16) / 8);
         m_state.branchPending = true;

@@ -87,6 +87,15 @@ namespace
     }
 }
 
+uint32_t g_hctpVifTraceCmd[48], g_hctpVifTracePos[48], g_hctpVifTraceAt = 0;
+void hctpDumpVifTrace(const char *why)
+{
+    std::fprintf(stderr, "[viftrace] %s:", why);
+    for (uint32_t k = g_hctpVifTraceAt > 48u ? g_hctpVifTraceAt - 48u : 0u; k < g_hctpVifTraceAt; ++k)
+        std::fprintf(stderr, " %x:%08x", g_hctpVifTracePos[k % 48u], g_hctpVifTraceCmd[k % 48u]);
+    std::fputc('\n', stderr);
+}
+
 void PS2Memory::processVIF0Data(uint32_t srcPhys, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u || srcPhys >= PS2_RAM_BACKING_SIZE)
@@ -346,6 +355,14 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         uint8_t num = (cmd >> 16) & 0xFF;
         const bool irq = (cmd & 0x80000000u) != 0u;
 
+        // HCTP diag (VENDETTA_VU1_STAT): the last VIF codes (dumped by the VU1 side, see hctpDumpVifTrace)
+        static const bool vifTrace = std::getenv("VENDETTA_VU1_STAT") != nullptr;
+        if (vifTrace)
+        {
+            g_hctpVifTraceCmd[g_hctpVifTraceAt % 48u] = cmd;
+            g_hctpVifTracePos[g_hctpVifTraceAt % 48u] = pos - 4u;
+            ++g_hctpVifTraceAt;
+        }
         // Track most-recent command for VIFn_CODE emulation.
         vif1_regs.code = cmd;
         vif1_regs.num = num;
