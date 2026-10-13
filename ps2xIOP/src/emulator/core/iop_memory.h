@@ -24,7 +24,10 @@ namespace ps2x::iop::detail
         static constexpr uint32_t Spu2End = 0x1FA00000u;
         static constexpr uint32_t SifBase = 0x1D000000u;
         static constexpr uint32_t SifEnd = 0x1D001000u;
-        static constexpr uint32_t HeapBase = 0x00120000u;
+        // Modules load from 0x10000 (module arena) up to here, the sysmem heap above. HCTP's 20 IRX end ~0x90000; at
+        // 0x120000 the heap was 832 KB and a match load (two wrestlers' banks + crowd) found no 32 KB block
+        // ([iop-alloc] failed, sceSifGetOtherData to IOP 0 forever on NOW LOADING). A real IOP has ~1.5 MB here.
+        static constexpr uint32_t HeapBase = 0x000C0000u;
         static constexpr uint32_t HeapLimit = 0x001F0000u;
 
         struct Allocation
