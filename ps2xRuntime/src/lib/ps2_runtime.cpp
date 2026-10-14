@@ -20,6 +20,7 @@
 #endif
 #include "ps2_iop_host.h"
 #include "hctp_native_vu1.h"
+#include "runtime/ps2_vu1_compiled.h"
 #include "ps2x/iop/iop_subsystem.h"
 
 #include <iostream>
@@ -1050,8 +1051,16 @@ bool PS2Runtime::syncCoreSubsystems()
                                      const uint32_t fbrst = m_chain.kickFbrst();
                                      m_vu1.state().dBitEnabled = (fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
+                                     // native p08 chunk (HCTP_NATIVE_P08=1): drawn from the spec, the VU1 stays idle
+                                     if (!Vu1Compiled::xgkickActive(m_vu1) &&
+                                         hctpNativeVu1TryDraw(m_memory.getVU1Code(), m_memory.getVU1Data(),
+                                                              m_vu1.state(), top, m_gs))
+                                     {
+                                         m_chain.noteVu1Run(0u);
+                                         return;
+                                     }
                                      hctpNativeVu1BeforeResume(m_memory.getVU1Code(), m_memory.getVU1Data(),
-                                                               m_vu1.state().pc, top);
+                                                               m_vu1.state(), top);
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                   m_gs, &m_memory, top, itop, 65536);

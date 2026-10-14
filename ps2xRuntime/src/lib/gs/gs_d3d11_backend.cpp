@@ -2667,6 +2667,46 @@ bool GSD3D11Backend::PresentLatchedToHost()
     std::lock_guard lock(ps2host::d3dLock());
     if (!d->hasDisplay || !d->displaySrv)
         return false;
+    // HCTP_SHOT_DIR=<dir>: the latched frame as <dir>\nshot_NNN.ppm every 10 s (tests, independent of the desktop)
+    static const char *shotDir = std::getenv("HCTP_SHOT_DIR");
+    static auto shotLast = std::chrono::steady_clock::now();
+    static int shotN = 0;
+    if (shotDir && d->displayTex && std::chrono::steady_clock::now() - shotLast > std::chrono::seconds(10))
+    {
+        shotLast = std::chrono::steady_clock::now();
+        D3D11_TEXTURE2D_DESC td{};
+        d->displayTex->GetDesc(&td);
+        td.Usage = D3D11_USAGE_STAGING;
+        td.BindFlags = 0;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        td.MiscFlags = 0;
+        ComPtr<ID3D11Texture2D> staging;
+        D3D11_MAPPED_SUBRESOURCE m{};
+        if (td.Format == DXGI_FORMAT_R8G8B8A8_UNORM && SUCCEEDED(d->dev->CreateTexture2D(&td, nullptr, &staging)))
+        {
+            d->ctx->CopyResource(staging.Get(), d->displayTex.Get());
+            if (SUCCEEDED(d->ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m)))
+            {
+                char path[512];
+                std::snprintf(path, sizeof(path), "%s\\nshot_%03d.ppm", shotDir, shotN++);
+                if (FILE *f = std::fopen(path, "wb"))
+                {
+                    std::fprintf(f, "P6 %u %u 255%c", td.Width, td.Height, 10);
+                    std::vector<uint8_t> row(td.Width * 3u);
+                    for (uint32_t y = 0; y < td.Height; ++y)
+                    {
+                        const uint8_t *src = static_cast<const uint8_t *>(m.pData) + y * m.RowPitch;
+                        for (uint32_t x = 0; x < td.Width; ++x)
+                            for (int c = 0; c < 3; ++c)
+                                row[x * 3u + c] = src[x * 4u + c];
+                        std::fwrite(row.data(), 1, row.size(), f);
+                    }
+                    std::fclose(f);
+                }
+                d->ctx->Unmap(staging.Get(), 0);
+            }
+        }
+    }
     ps2host::setPresentWide(d->displayWide);
     ps2host::presentTexture(d->displaySrv.Get(), d->displayW, d->displayH, 1.0f, 1.0f);
     return true;
