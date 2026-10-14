@@ -1243,7 +1243,11 @@ namespace ps2_stubs
         {
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw01), 8u);
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw02), 8u);
-            if (hasSeededGsClearPacket(db.clear0))
+            // The clear packet below draws the real clear (its rect, scissor, FBMSK). The extra whole-target fast
+            // clear wiped memory the packet leaves alone - HCTP keeps PSMT4HL HUD textures (DEMO plate, Press START)
+            // in the top byte of its Z buffer - and the paraLLEl path never had it. HCTP_SWAP_FASTCLEAR=1 restores it.
+            static const bool s_fastClear0 = std::getenv("HCTP_SWAP_FASTCLEAR") != nullptr;
+            if (s_fastClear0 && hasSeededGsClearPacket(db.clear0))
             {
                 const uint32_t clearContext = static_cast<uint32_t>((db.clear0.prim.value >> 9) & 0x1u);
                 runtime->gs().clearFramebufferContext(clearContext, static_cast<uint32_t>(db.clear0.rgbaq.value));
@@ -1254,7 +1258,11 @@ namespace ps2_stubs
         {
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw11), 8u);
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw12), 8u);
-            if (hasSeededGsClearPacket(db.clear1))
+            // The clear packet below draws the real clear (its rect, scissor, FBMSK). The extra whole-target fast
+            // clear wiped memory the packet leaves alone - HCTP keeps PSMT4HL HUD textures (DEMO plate, Press START)
+            // in the top byte of its Z buffer - and the paraLLEl path never had it. HCTP_SWAP_FASTCLEAR=1 restores it.
+            static const bool s_fastClear1 = std::getenv("HCTP_SWAP_FASTCLEAR") != nullptr;
+            if (s_fastClear1 && hasSeededGsClearPacket(db.clear1))
             {
                 const uint32_t clearContext = static_cast<uint32_t>((db.clear1.prim.value >> 9) & 0x1u);
                 runtime->gs().clearFramebufferContext(clearContext, static_cast<uint32_t>(db.clear1.rgbaq.value));

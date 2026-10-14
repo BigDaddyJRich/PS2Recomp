@@ -867,7 +867,7 @@ void GS::presentUnlocked(const GSDisplayRegs &regs, uint64_t vsyncTick, bool for
         static const double s_dumpSec = s_dumpEnv ? std::atof(s_dumpEnv) : -1.0;
         static const auto s_t0 = std::chrono::steady_clock::now();
         static bool s_dumped = false;
-        if (s_dumpSec >= 0.0 && !s_dumped && m_backend &&
+        if (s_dumpSec >= 0.0 && !s_dumped && (m_backend || m_gpu) &&
             std::chrono::duration<double>(std::chrono::steady_clock::now() - s_t0).count() >= s_dumpSec)
         {
             s_dumped = true;

@@ -187,6 +187,7 @@ cbuffer Draw : register(b0)
     float4 p2;          // x fst, y fba, z tex alpha scale (255 decoded / 128 render target), w dst alpha mode
     float4 region;      // minu, maxu, minv, maxv
     float4 p3;          // x wms, y wmt, z storage origin x, w storage origin y
+    float4 p4;          // x linear filter, y texture is a render target
 };
 Texture2D gsTex : register(t0);
 SamplerState gsSamp : register(s0);
@@ -214,6 +215,22 @@ float wrapCoord(float c, float size, float mode, float mn, float mx)
     return (float)(((ic & (uint)mn) | (uint)mx)) + 0.5;
 }
 
+// GS-style texel fetch: wrap/clamp each integer texel in TEXTURE space (not the storage atlas), as PCSX2 does.
+int wrapTexel(int c, float size, float mode, float mn, float mx)
+{
+    if (mode == 0.0) return c & ((int)size - 1);
+    if (mode == 1.0) return clamp(c, 0, (int)size - 1);
+    if (mode == 2.0) return clamp(c, (int)mn, (int)mx);
+    return (c & (int)mn) | (int)mx;
+}
+float4 fetchTexel(int2 ic)
+{
+    ic.x = wrapTexel(ic.x, texDims.x, p3.x, region.x, region.y);
+    ic.y = wrapTexel(ic.y, texDims.y, p3.y, region.z, region.w);
+    int2 sc = clamp(ic + (int2)p3.zw, int2(0, 0), (int2)texDims.zw - 1);
+    return gsTex.Load(int3(sc, 0));
+}
+
 bool alphaTest(float a, float atst, float aref)
 {
     if (atst == 0.0) return false;
@@ -235,10 +252,25 @@ PsOut ps_main(PsIn i)
         float2 texel;
         if (p2.x != 0.0) texel = i.tc.xy;
         else texel = (i.tc.xy / i.tc.z) * texDims.xy;
-        texel.x = wrapCoord(texel.x, texDims.x, p3.x, region.x, region.y);
-        texel.y = wrapCoord(texel.y, texDims.y, p3.y, region.z, region.w);
-        float2 uv = (texel + p3.zw) / texDims.zw;
-        float4 t = gsTex.SampleLevel(gsSamp, uv, 0);
+        float4 t;
+        if (p4.y != 0.0)
+        {
+            // render-target source (upscaled storage): normalized hardware sampling
+            texel.x = wrapCoord(texel.x, texDims.x, p3.x, region.x, region.y);
+            texel.y = wrapCoord(texel.y, texDims.y, p3.y, region.z, region.w);
+            t = gsTex.SampleLevel(gsSamp, (texel + p3.zw) / texDims.zw, 0);
+        }
+        else if (p4.x != 0.0)
+        {
+            float2 b = texel - 0.5;
+            int2 i0 = (int2)floor(b);
+            float2 f = floor(frac(b) * 16.0) / 16.0; // GS: 4-bit filter weights
+            float4 t00 = fetchTexel(i0), t10 = fetchTexel(i0 + int2(1, 0));
+            float4 t01 = fetchTexel(i0 + int2(0, 1)), t11 = fetchTexel(i0 + int2(1, 1));
+            t = lerp(lerp(t00, t10, f.x), lerp(t01, t11, f.x), f.y);
+        }
+        else
+            t = fetchTexel((int2)floor(texel));
         t.rgb *= 255.0;
         t.a *= p2.z;
         float tfx = p0.x;
@@ -319,6 +351,7 @@ float4 ps_blit(BlitOut i) : SV_Target
         float p2[4];
         float region[4];
         float p3[4];
+        float p4[4];
     };
 
     // Everything that changes how a batch of primitives is rendered.
@@ -393,6 +426,7 @@ struct GSD3D11Backend::Impl
         ComPtr<ID3D11RenderTargetView> rtv;
         ComPtr<ID3D11ShaderResourceView> srv;
         bool gpuDirty = false;
+        bool alphaWritten = false; // a draw since the last writeback wrote bits 24-31 (else they stay as in GS memory)
         bool needsUpload = false;
         bool skipNextSync = false; // the pending upload replaces this target's dirty rows: no readback
         // Native rows whose VRAM contents changed since the last upload (inclusive).
@@ -793,8 +827,27 @@ struct GSD3D11Backend::Impl
     }
 
     // Write GPU render-target contents back to local memory (point-sampled down to native).
+    // HCTP diag (HCTP_WATCH_BLK=<block>:<count>): hash of the watched GS blocks, to name whoever changes them.
+    uint64_t watchHash() const
+    {
+        static const char *e = std::getenv("HCTP_WATCH_BLK");
+        if (!e || !vram)
+            return 0;
+        static const uint32_t b = static_cast<uint32_t>(std::atol(e));
+        static const uint32_t n = std::strchr(e, ':') ? static_cast<uint32_t>(std::atol(std::strchr(e, ':') + 1)) : 4u;
+        uint64_t h = 1469598103934665603ull;
+        for (uint32_t i = b * 256u; i < (b + n) * 256u && i < vramSize; ++i)
+            h = (h ^ vram[i]) * 1099511628211ull;
+        return h;
+    }
     void syncRtToVram(RenderTarget &rt)
     {
+        const uint64_t watchIn = watchHash();
+        if (std::getenv("HCTP_WATCH_BLK") && rt.fbpBlock == 4096u)
+            std::printf("[watchrt] writeback fbp=%u dirtyY=%u-%u dirtyX=%u-%u alpha=%d needsUp=%d upY=%u-%u reason=%s\n", rt.fbpBlock,
+                        rt.dirtyY0, rt.dirtyY1, rt.dirtyX0, rt.dirtyX1, rt.alphaWritten ? 1 : 0, rt.needsUpload ? 1 : 0, rt.upY0, rt.upY1,
+                        syncReason ? syncReason : "?");
+        struct WatchOut { const Impl *d; uint64_t in; const RenderTarget &rt; ~WatchOut() { if (d->watchHash() != in) std::printf("[watchblk] RT writeback fbp=%u fbw=%u psm=%u %ux%u changed the watched blocks\n", rt.fbpBlock, rt.fbw, rt.psm, rt.w, rt.h); } } watchOut{this, watchIn, rt};
         if (!rt.gpuDirty)
             return;
         {
@@ -848,6 +901,11 @@ struct GSD3D11Backend::Impl
         const uint32_t xEnd = (s_allRows || rt.dirtyX0 == 0xFFFFFFFFu) ? rt.w : std::min(rt.w, rt.dirtyX1 + 1u);
         for (uint32_t y = yFirst; y < yEnd; ++y)
         {
+            // Rows waiting for a re-upload hold older data on the GPU than in GS memory (an upload landed there
+            // since): writing them back would put the stale copy over the newer textures (HUD textures in the
+            // top byte of the Z buffer).
+            if (rt.needsUpload && rt.upY0 != 0xFFFFFFFFu && y >= rt.upY0 && y <= rt.upY1)
+                continue;
             const uint32_t *row = reinterpret_cast<const uint32_t *>(static_cast<const uint8_t *>(m.pData) + y * m.RowPitch);
             for (uint32_t x = xFirst; x < xEnd; ++x)
             {
@@ -859,7 +917,7 @@ struct GSD3D11Backend::Impl
                     const uint32_t v = r | (g << 5) | (b << 10) | (aRaw >= 0x40u ? 0x8000u : 0u);
                     mem.WriteVram(rt.psm, rt.fbpBlock, rt.fbw, x, y, v);
                 }
-                else if (is24(rt.psm))
+                else if (is24(rt.psm) || !rt.alphaWritten)
                     mem.WriteVram(GS_PSM_CT24, rt.fbpBlock, rt.fbw, x, y, c & 0x00FFFFFFu);
                 else
                     mem.WriteVram(GS_PSM_CT32, rt.fbpBlock, rt.fbw, x, y, (c & 0x00FFFFFFu) | (aRaw << 24));
@@ -869,6 +927,7 @@ struct GSD3D11Backend::Impl
         if (yEnd > yFirst && xEnd > xFirst)
             recordWriter('R', rt.fbpBlock, rt.fbw, rt.psm, xFirst, yFirst, xEnd - xFirst, yEnd - yFirst);
         rt.gpuDirty = false;
+        rt.alphaWritten = false;
         rt.dirtyY0 = 0xFFFFFFFFu;
         rt.dirtyY1 = 0u;
         rt.dirtyX0 = 0xFFFFFFFFu;
@@ -947,7 +1006,9 @@ struct GSD3D11Backend::Impl
     {
         fbw = std::max<uint32_t>(fbw, 1u);
         if (psm == GS_PSM_Z32 || psm == GS_PSM_Z24 || psm == GS_PSM_Z16 || psm == GS_PSM_Z16S)
-            psm = (psm == GS_PSM_Z16 || psm == GS_PSM_Z16S) ? GS_PSM_CT16 : GS_PSM_CT32;
+            // Z24 -> CT24: the top 8 bits of a Z24 buffer are free memory (HCTP keeps PSMT4HL/T8H HUD textures there:
+            // DEMO plate, Press START) and writing the target back must not overwrite them.
+            psm = (psm == GS_PSM_Z16 || psm == GS_PSM_Z16S) ? GS_PSM_CT16 : psm == GS_PSM_Z24 ? GS_PSM_CT24 : GS_PSM_CT32;
         const uint32_t w = std::min<uint32_t>(fbw * 64u, 2048u);
         uint32_t h = std::max<uint32_t>(minH, 256u);
         h = std::min<uint32_t>((h + 31u) & ~31u, 2048u);
@@ -1009,13 +1070,16 @@ struct GSD3D11Backend::Impl
         for (auto &d : depths)
             if (d.zbpBlock == zbpBlock)
             {
-                if (d.w == w && d.h == h)
+                // GS depth is memory: a draw into a differently sized target with the same ZBP (the 2-D layer
+                // over the 3-D scene) must test against the scene's depth, not a cleared buffer. Reuse a buffer that
+                // is big enough (new ones start at 640x512).
+                if (d.w >= w && d.h >= h)
                     return &d;
                 d.tex.Reset();
                 d.dsv.Reset();
-                d.w = w;
-                d.h = h;
-                if (!createTexture(w * scale, h * scale, D3D11_BIND_DEPTH_STENCIL, d.tex, DXGI_FORMAT_D32_FLOAT))
+                d.w = std::max(w, d.w);
+                d.h = std::max(h, d.h);
+                if (!createTexture(d.w * scale, d.h * scale, D3D11_BIND_DEPTH_STENCIL, d.tex, DXGI_FORMAT_D32_FLOAT))
                     return nullptr;
                 dev->CreateDepthStencilView(d.tex.Get(), nullptr, &d.dsv);
                 ctx->ClearDepthStencilView(d.dsv.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
@@ -1023,9 +1087,9 @@ struct GSD3D11Backend::Impl
             }
         DepthTarget d;
         d.zbpBlock = zbpBlock;
-        d.w = w;
-        d.h = h;
-        if (!createTexture(w * scale, h * scale, D3D11_BIND_DEPTH_STENCIL, d.tex, DXGI_FORMAT_D32_FLOAT))
+        d.w = std::max(w, 640u); // room for the frame-sized targets that share this ZBP (see above)
+        d.h = std::max(h, 512u);
+        if (!createTexture(d.w * scale, d.h * scale, D3D11_BIND_DEPTH_STENCIL, d.tex, DXGI_FORMAT_D32_FLOAT))
             return nullptr;
         dev->CreateDepthStencilView(d.tex.Get(), nullptr, &d.dsv);
         ctx->ClearDepthStencilView(d.dsv.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
@@ -1513,10 +1577,13 @@ struct GSD3D11Backend::Impl
 
     static float zNorm(double z, uint8_t zpsm)
     {
-        double maxz = 4294967296.0;
-        if (zpsm == GS_PSM_Z24) maxz = 16777216.0;
-        else if (zpsm == GS_PSM_Z16 || zpsm == GS_PSM_Z16S) maxz = 65536.0;
-        return static_cast<float>(std::clamp(z / maxz, 0.0, 1.0));
+        // One scale for every Z format: the GS compares raw integers, and Z32/Z24/Z16 draws can share one
+        // buffer (3-D scene vs the 2-D layer), so a per-format scale would make them incomparable. Each format
+        // only clamps to its own range.
+        double top = 4294967295.0;
+        if (zpsm == GS_PSM_Z24) top = 16777215.0;
+        else if (zpsm == GS_PSM_Z16 || zpsm == GS_PSM_Z16S) top = 65535.0;
+        return static_cast<float>(std::clamp(z, 0.0, top) / 4294967296.0);
     }
 
     void submit(const GSPrimitiveBatch &batch)
@@ -1779,6 +1846,34 @@ struct GSD3D11Backend::Impl
                     std::fflush(stdout);
                 }
             }
+            {
+                // HCTP diag: HCTP_RTDUMP_SEC=<s>: once, the render target a draw samples as tex 0, read back to GS
+                // memory and written as rtdump_0.ppm (working dir) before that draw.
+                static const char *s_rdEnv = std::getenv("HCTP_RTDUMP_SEC");
+                static const double s_rdSec = s_rdEnv ? std::atof(s_rdEnv) : -1.0;
+                static const auto s_rdT0 = std::chrono::steady_clock::now();
+                static bool s_rdDone = false;
+                if (s_rdEnv && !s_rdDone && srcRt && t.tbp0 == 0u &&
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - s_rdT0).count() >= s_rdSec)
+                {
+                    s_rdDone = true;
+                    syncRtToVram(*srcRt);
+                    const uint32_t w = srcRt->w, h = srcRt->h;
+                    if (FILE *f = std::fopen("rtdump_0.ppm", "wb"))
+                    {
+                        std::fprintf(f, "P6\n%u %u\n255\n", w, h);
+                        for (uint32_t y = 0; y < h; ++y)
+                            for (uint32_t x = 0; x < w; ++x)
+                            {
+                                const uint32_t c = mem.ReadVram(srcRt->psm, srcRt->fbpBlock, srcRt->fbw, x, y);
+                                const uint8_t px[3] = {static_cast<uint8_t>(c), static_cast<uint8_t>(c >> 8), static_cast<uint8_t>(c >> 16)};
+                                std::fwrite(px, 1, 3, f);
+                            }
+                        std::fclose(f);
+                    }
+                    std::printf("[rtdump] fbp=%u fbw=%u psm=%u %ux%u\n", srcRt->fbpBlock, srcRt->fbw, srcRt->psm, w, h);
+                }
+            }
             if (srcRt && srcRt->fbw == std::max<uint32_t>(t.tbw, 1u) && bitsPerPixel(srcRt->psm) == bitsPerPixel(t.psm) && !srcRt->needsUpload)
             {
                 texDims[2] = static_cast<float>(srcRt->w);
@@ -1897,6 +1992,8 @@ struct GSD3D11Backend::Impl
         cbd.p3[1] = static_cast<float>(wmt);
         cbd.p3[2] = origin[0];
         cbd.p3[3] = origin[1];
+        cbd.p4[0] = st.linearFilter ? 1.0f : 0.0f;
+        cbd.p4[1] = texFromRt ? 1.0f : 0.0f;
 
         // ---- vertex upload
         const uint32_t bytes = static_cast<uint32_t>(pending.size() * sizeof(Vtx));
@@ -2070,12 +2167,21 @@ struct GSD3D11Backend::Impl
                     break;
                 }
         if (s_hasRect && traceAbeOk && s_traced < s_traceLimit && traceTimeOk)
+        {
+            // draws whose bounding box overlaps the rect
+            float bx0 = 1e9f, by0 = 1e9f, bx1 = -1e9f, by1 = -1e9f;
             for (const Vtx &v : pending)
-                if (v.x < s_rect[0] || v.y < s_rect[1] || v.x > s_rect[2] || v.y > s_rect[3])
-                {
-                    traceAbeOk = false;
-                    break;
-                }
+            {
+                bx0 = std::min(bx0, v.x); by0 = std::min(by0, v.y);
+                bx1 = std::max(bx1, v.x); by1 = std::max(by1, v.y);
+            }
+            if (bx1 < s_rect[0] || by1 < s_rect[1] || bx0 > s_rect[2] || by0 > s_rect[3])
+                traceAbeOk = false;
+        }
+        // PS2X_GS_TRACE_FBP=<frame fbp (pages)>: only draws into that frame buffer
+        static const long s_traceFbp = std::getenv("PS2X_GS_TRACE_FBP") ? std::atol(std::getenv("PS2X_GS_TRACE_FBP")) : -1;
+        if (s_traceFbp >= 0 && static_cast<long>(c.frame.fbp) != s_traceFbp)
+            traceAbeOk = false;
         if (s_traced < s_traceLimit && frameCounter >= s_traceFrame && traceTimeOk && traceTexOk && traceAbeOk && !pending.empty())
         {
             if (s_traced == 0)
@@ -2195,6 +2301,24 @@ struct GSD3D11Backend::Impl
             bound.srv = nullptr;
         }
         rt->gpuDirty = true;
+        {
+            // Does this draw write frame-buffer alpha? Not with the top byte masked, and not when the alpha test
+            // can never pass (ATST NEVER) and failing pixels keep alpha (AFAIL ZB_ONLY / RGB_ONLY) - HCTP's per-frame
+            // Z-clear sprite and its RGB-only passes over the Z buffer memory, whose top byte holds HUD textures.
+            const uint32_t tAte = static_cast<uint32_t>(c.test & 1u), tAtst = static_cast<uint32_t>((c.test >> 1) & 7u);
+            const uint32_t tAfail = static_cast<uint32_t>((c.test >> 12) & 3u);
+            const bool neverPassKeepsAlpha = tAte && tAtst == 0u && (tAfail == 2u || tAfail == 3u);
+            if (c.frame.psm == GS_PSM_CT32 && (c.frame.fbmsk >> 24) != 0xFFu && !neverPassKeepsAlpha)
+                rt->alphaWritten = true;
+        }
+        if (rt->fbpBlock == 4096u && std::getenv("HCTP_WATCH_BLK"))
+        {
+            static int s_n = 200;
+            if (s_n-- > 0)
+                std::printf("[watchrt] draw into fbp=4096 psm=%u fbmsk=%08x prim=%u tme=%u tex=%u n=%zu test=%llx v0=(%.1f,%.1f)%c", c.frame.psm,
+                            c.frame.fbmsk, static_cast<unsigned>(st.prim.type), st.prim.tme ? 1u : 0u, c.tex0.tbp0, pending.size(),
+                            static_cast<unsigned long long>(c.test), pending.empty() ? 0.f : pending[0].x, pending.empty() ? 0.f : pending[0].y, 10);
+        }
         {
             float minY = 1e9f, maxY = -1e9f, minX = 1e9f, maxX = -1e9f;
             for (const Vtx &v : pending)
@@ -2371,6 +2495,18 @@ void GSD3D11Backend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut
 {
     std::lock_guard lock(ps2host::d3dLock());
     m_impl->flushPending();
+    {
+        // HCTP diag: with HCTP_WATCH_BLK=<cbp>:n, log CLUT loads from that address (order vs [watchblk] uploads).
+        static const char *s_w = std::getenv("HCTP_WATCH_BLK");
+        static const uint32_t s_wb = s_w ? static_cast<uint32_t>(std::atol(s_w)) : 0u;
+        static int s_left = 300;
+        if (s_w && tex0.cbp == s_wb && s_left-- > 0)
+        {
+            const uint8_t *v = m_impl->vram + s_wb * 256u;
+            std::printf("[watchclut] TEX0 tbp=%u psm=%u cbp=%u cpsm=%u csm=%u csa=%u cld=%u mem0=%02x%02x%02x%02x\n", tex0.tbp0, tex0.psm,
+                        tex0.cbp, tex0.cpsm, tex0.csm, tex0.csa, tex0.cld, v[3], v[2], v[1], v[0]);
+        }
+    }
     m_impl->loadClut(tex0, texclut);
     m_impl->mem.LoadClut(tex0, texclut);
 }
@@ -2503,7 +2639,31 @@ void GSD3D11Backend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
     }
     std::lock_guard lock(ps2host::d3dLock());
     Impl &d = *m_impl;
+    // HCTP diag: HCTP_WATCH_BLK=<block>:<count> - report every upload chunk that changes those GS blocks.
+    static const char *s_watchEnv = std::getenv("HCTP_WATCH_BLK");
+    static const uint32_t s_watchBlk = s_watchEnv ? static_cast<uint32_t>(std::atol(s_watchEnv)) : 0u;
+    static const uint32_t s_watchCnt = (s_watchEnv && std::strchr(s_watchEnv, ':')) ? static_cast<uint32_t>(std::atol(std::strchr(s_watchEnv, ':') + 1)) : 4u;
+    uint64_t watchBefore = 0;
+    auto watchHash = [&]() {
+        uint64_t h = 1469598103934665603ull;
+        for (uint32_t i = s_watchBlk * 256u; i < (s_watchBlk + s_watchCnt) * 256u && i < d.vramSize; ++i)
+            h = (h ^ d.vram[i]) * 1099511628211ull;
+        return h;
+    };
+    if (s_watchEnv && d.vram)
+        watchBefore = watchHash();
     d.mem.UploadImage(data, sizeBytes);
+    if (s_watchEnv && d.vram && watchHash() != watchBefore)
+    {
+        const GSTransferSnapshot snap = d.mem.GetTransferSnapshot();
+        static int s_left = 400;
+        static uint32_t s_movie = 0;
+        if (d.lastUploadDbp == 10752u)
+            ++s_movie;
+        else if (s_left-- > 0)
+            std::printf("[watchblk] (after %u movie chunks)", s_movie), std::printf("[watchblk] upload dbp=%u changed blocks %u+%u (copied %u/%u px)\n", d.lastUploadDbp, s_watchBlk, s_watchCnt,
+                        snap.copiedPixels, snap.totalPixels);
+    }
     // Texture/CLUT decodes cached from these pages (possibly taken mid-transfer) are now stale.
     if (d.uploadFirst <= d.uploadLast)
     {
@@ -2629,12 +2789,20 @@ bool GSD3D11Backend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
     Impl &d = *m_impl;
     d.flushPending();
     Impl::RenderTarget *rt = d.findRt(framePageBaseToBlock(context.frame.fbp));
+    {
+        static const long s_fbp = std::getenv("PS2X_GS_TRACE_FBP") ? std::atol(std::getenv("PS2X_GS_TRACE_FBP")) : -1;
+        static int s_left = 40;
+        if (s_fbp >= 0 && static_cast<long>(context.frame.fbp) == s_fbp && s_left-- > 0)
+            std::printf("[gs-clear] fbp=%u psm=%u fbmsk=%08x rgba=%08x rt=%d\n", context.frame.fbp, context.frame.psm, context.frame.fbmsk, rgba, rt ? 1 : 0);
+    }
     if (rt && d.gpuReady)
     {
         const float a = std::min(1.0f, static_cast<float>((rgba >> 24) & 0xFFu) / 128.0f);
         const float col[4] = {(rgba & 0xFFu) / 255.0f, ((rgba >> 8) & 0xFFu) / 255.0f, ((rgba >> 16) & 0xFFu) / 255.0f, a};
         d.ctx->ClearRenderTargetView(rt->rtv.Get(), col);
         rt->gpuDirty = true;
+        if (context.frame.psm == GS_PSM_CT32 && (context.frame.fbmsk >> 24) != 0xFFu)
+            rt->alphaWritten = true;
         rt->dirtyY0 = 0u;
         rt->dirtyY1 = rt->h ? rt->h - 1u : 0u;
         rt->dirtyX0 = 0u;
