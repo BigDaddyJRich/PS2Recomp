@@ -1086,7 +1086,7 @@ bool PS2Runtime::initialize(const char *title)
             // settings in hctp_native.ini next to the game, defaults without it). HCTP_RENDERER=cpu: the CPU GS renderer
             // (its picture shown through the same window), else the Direct3D 11 GS renderer.
             const ps2_host_settings::Settings &settings = ps2_host_settings::get();
-            ps2host::loadConfig("hctp_native.ini");
+            ps2host::loadConfig(".\\hctp_native.ini"); // GetPrivateProfile*: a bare name would mean the Windows folder
             if (!ps2host::init(title))
             {
                 std::cerr << "Failed to initialize the native Direct3D 11 host" << std::endl;

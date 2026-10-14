@@ -49,6 +49,8 @@ public:
     void ResetPresentation(GSPresentMailbox &box, uint64_t seq) override;
     // true once per newly latched frame (window thread)
     static bool TakeFreshFrame();
+    // frames the game has presented so far (the FPS counter's GAME line)
+    static uint64_t LatchedFrameCount();
 
     // Host presentation: blits the most recently latched display frame to the swap chain.
     // Returns false when no hardware frame is available (caller falls back to CPU pixels).

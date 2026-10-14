@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -34,7 +35,11 @@ namespace
 {
     std::atomic<uint64_t> g_shimPresents{0};
 }
-uint64_t ps2Vif1KickCount() { return g_shimPresents.load(std::memory_order_relaxed); }
+// game frames (the host's FPS counter, GAME line): frames the game presented, not window refreshes
+uint64_t ps2Vif1KickCount()
+{
+    return GSD3D11Backend::IsActive() ? GSD3D11Backend::LatchedFrameCount() : g_shimPresents.load(std::memory_order_relaxed);
+}
 
 // ---- window / monitor ----------------------------------------------------------------------------------------------
 void InitWindow(int, int, const char *) {} // ps2host::init made the window
@@ -85,7 +90,29 @@ namespace
 }
 
 void BeginDrawing() {}
-void EndDrawing() { g_shimPresents.fetch_add(1, std::memory_order_relaxed); }
+void EndDrawing()
+{
+    const uint64_t window = g_shimPresents.fetch_add(1, std::memory_order_relaxed) + 1u;
+    // every 5 s: window refreshes and game frames per second ([native-fps], the measured frame rate)
+    static double s_last = -1.0;
+    static uint64_t s_lastWindow = 0, s_lastGame = 0;
+    const double now = ps2host::timeSeconds();
+    if (s_last < 0.0)
+    {
+        s_last = now;
+        s_lastWindow = window;
+        s_lastGame = ps2Vif1KickCount();
+    }
+    else if (now - s_last >= 5.0)
+    {
+        const uint64_t game = ps2Vif1KickCount();
+        std::fprintf(stderr, "[native-fps] window=%.1f game=%.1f%c", (window - s_lastWindow) / (now - s_last),
+                     (game - s_lastGame) / (now - s_last), 10);
+        s_last = now;
+        s_lastWindow = window;
+        s_lastGame = game;
+    }
+}
 void ClearBackground(Color) {}
 
 Image GenImageColor(int width, int height, Color color)

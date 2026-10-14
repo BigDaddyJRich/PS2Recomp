@@ -2640,6 +2640,8 @@ void GSD3D11Backend::ResetPresentation(GSPresentMailbox &box, uint64_t seq)
     m_impl->hasDisplay = false;
 }
 
+uint64_t GSD3D11Backend::LatchedFrameCount() { return g_latchedFrames.load(std::memory_order_acquire); }
+
 bool GSD3D11Backend::TakeFreshFrame()
 {
     static uint64_t s_taken = 0;
