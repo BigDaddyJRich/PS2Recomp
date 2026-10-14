@@ -1248,9 +1248,9 @@ uint32_t GS::continueGifTag(GifContinuation &tag, const uint8_t *data, uint32_t 
     {
         if (offset + 8u > sizeBytes)
         {
-            // the padding word is in the next packet: keep the tag one more 8-byte step
-            tag.regListWords = 0;
-            tag.active = offset + 8u <= sizeBytes;
+            // the padding word is in the next packet: keep the tag open (loopsLeft 0, regListWords odd) so the
+            // next call skips exactly that 8-byte word instead of parsing the next packet 8 bytes off
+            tag.active = true;
             return offset;
         }
         offset += 8u;
