@@ -2027,7 +2027,10 @@ struct GSD3D11Backend::Impl
         // PS2X_GS_TRACE_TBP=<tbp>: only draws sampling that texture address count (e.g. a locked env map).
         static const long s_traceTbp = std::getenv("PS2X_GS_TRACE_TBP") ? std::atol(std::getenv("PS2X_GS_TRACE_TBP")) : -1;
         const bool traceTexOk = (s_traceTbp < 0 || (pendingState.prim.tme && static_cast<long>(pendingState.context.tex0.tbp0) == s_traceTbp));
-        if (s_traced < s_traceLimit && frameCounter >= s_traceFrame && traceTimeOk && traceTexOk && !pending.empty())
+        // PS2X_GS_TRACE_ABE=1: only textured, alpha-blended draws (2D overlays / logos)
+        static const bool s_traceAbe = std::getenv("PS2X_GS_TRACE_ABE") != nullptr;
+        const bool traceAbeOk = !s_traceAbe || (pendingState.prim.tme && pendingState.prim.abe);
+        if (s_traced < s_traceLimit && frameCounter >= s_traceFrame && traceTimeOk && traceTexOk && traceAbeOk && !pending.empty())
         {
             if (s_traced == 0)
                 std::printf("[gs-trace] start at frame %llu\n", static_cast<unsigned long long>(frameCounter));
