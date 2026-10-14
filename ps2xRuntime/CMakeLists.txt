@@ -408,6 +408,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_host_update.cpp
     src/lib/ps2_host_window.cpp
     src/lib/ps2_chain.cpp
+    src/lib/hctp_native_vu1.cpp
     src/lib/ps2_vif1_interpreter.cpp
     src/lib/vu/ps2_vu1_core.cpp
     src/lib/vu/ps2_vu1_upper.cpp

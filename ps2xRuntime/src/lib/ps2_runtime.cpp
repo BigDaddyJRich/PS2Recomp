@@ -19,6 +19,7 @@
 #include "runtime/gs/gs_d3d11_backend.h"
 #endif
 #include "ps2_iop_host.h"
+#include "hctp_native_vu1.h"
 #include "ps2x/iop/iop_subsystem.h"
 
 #include <iostream>
@@ -1049,14 +1050,18 @@ bool PS2Runtime::syncCoreSubsystems()
                                      const uint32_t fbrst = m_chain.kickFbrst();
                                      m_vu1.state().dBitEnabled = (fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
+                                     hctpNativeVu1BeforeResume(m_memory.getVU1Code(), m_memory.getVU1Data(),
+                                                               m_vu1.state().pc, top);
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                   m_gs, &m_memory, top, itop, 65536);
+                                     hctpNativeVu1AfterResume(m_memory.getVU1Data());
                                      m_chain.noteVu1Run((m_vu1.state().stoppedByD ? 0x0200u : 0u) |
                                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u)); });
     resetIop();
     m_vu0.reset();
     m_vu1.reset();
+    hctpNativeVu1Init();
 
     m_boundRdram = rdram;
     m_boundGSVram = gsVram;
