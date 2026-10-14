@@ -860,6 +860,30 @@ void GS::presentUnlocked(const GSDisplayRegs &regs, uint64_t vsyncTick, bool for
 {
     if (m_holding)
         flushOverlayUnlocked(); // the frame's 2-D layer, placed for widescreen, before the picture
+    // HCTP_VRAM_DUMP_SEC=N: the 4 MB GS memory as the renderer sees it, once, N s after start (vram_dump.bin in the
+    // working directory) - to diff the native renderers' memory against paraLLEl-GS
+    {
+        static const char *s_dumpEnv = std::getenv("HCTP_VRAM_DUMP_SEC");
+        static const double s_dumpSec = s_dumpEnv ? std::atof(s_dumpEnv) : -1.0;
+        static const auto s_t0 = std::chrono::steady_clock::now();
+        static bool s_dumped = false;
+        if (s_dumpSec >= 0.0 && !s_dumped && m_backend &&
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - s_t0).count() >= s_dumpSec)
+        {
+            s_dumped = true;
+            std::vector<uint8_t> vram;
+            if (m_gpu)
+                m_gpu->snapshotVram(vram);
+            else
+                m_backend->SnapshotVram(vram);
+            if (FILE *f = std::fopen("vram_dump.bin", "wb"))
+            {
+                std::fwrite(vram.data(), 1, vram.size(), f);
+                std::fclose(f);
+            }
+            std::fprintf(stderr, "[vramdump] %zu bytes%c", vram.size(), 10);
+        }
+    }
     const GSPresentationRequest request = completePresentationRequestUnlocked(regs, vsyncTick);
     const bool flip = !m_hasPresented || regs != m_lastPresentedRegs;
     // The same display registers, the same request and no write to GS memory since: the same picture.
@@ -2194,6 +2218,88 @@ void GS::vertexKick(bool drawing)
     if (drawing && m_backend)
     {
         GSPrimitiveBatch batch = buildDrawBatch(needed);
+        // HCTP diag: HCTP_CAPTURE_TBP=<tbp> (+ HCTP_CAPTURE_SEC=<s>): at the first draw sampling that texture after
+        // the time, write tex_capture.txt (working dir): draw registers, the texture's indices (de-swizzled through
+        // the CPU renderer's addressing on a snapshot of this renderer's GS memory) and the CLUT entries in CSM order.
+        {
+            static const char *s_capEnv = std::getenv("HCTP_CAPTURE_TBP");
+            static const long s_capTbp = s_capEnv ? std::atol(s_capEnv) : -1;
+            static const char *s_capSecEnv = std::getenv("HCTP_CAPTURE_SEC");
+            static const double s_capSec = s_capSecEnv ? std::atof(s_capSecEnv) : 0.0;
+            static const auto s_capT0 = std::chrono::steady_clock::now();
+            static bool s_captured = false;
+            const GSContext &cc = batch.state.context;
+            if (s_capTbp >= 0 && !s_captured && batch.state.prim.tme && static_cast<long>(cc.tex0.tbp0) == s_capTbp &&
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - s_capT0).count() >= s_capSec)
+            {
+                s_captured = true;
+                std::vector<uint8_t> vram;
+                if (m_gpu)
+                    m_gpu->snapshotVram(vram);
+                else
+                    m_backend->SnapshotVram(vram);
+                if (FILE *f = std::fopen("tex_capture.txt", "w"))
+                {
+                    const GSTex0Reg &t = cc.tex0;
+                    std::fprintf(f, "renderer=%s\nPRIM type=%u iip=%u tme=%u fge=%u abe=%u aa1=%u fst=%u ctxt=%u fix=%u\n",
+                                 m_gpu ? "paraLLEl" : "native", static_cast<unsigned>(batch.state.prim.type),
+                                 batch.state.prim.iip ? 1u : 0u, batch.state.prim.tme ? 1u : 0u, batch.state.prim.fge ? 1u : 0u,
+                                 batch.state.prim.abe ? 1u : 0u, batch.state.prim.aa1 ? 1u : 0u, batch.state.prim.fst ? 1u : 0u,
+                                 batch.state.prim.ctxt ? 1u : 0u, batch.state.prim.fix ? 1u : 0u);
+                    std::fprintf(f, "TEX0 tbp=%u tbw=%u psm=0x%x tw=%u th=%u tcc=%u tfx=%u cbp=%u cpsm=0x%x csm=%u csa=%u cld=%u\n",
+                                 t.tbp0, t.tbw, t.psm, t.tw, t.th, t.tcc, t.tfx, t.cbp, t.cpsm, t.csm, t.csa, t.cld);
+                    std::fprintf(f, "TEX1=%016llx CLAMP=%016llx ALPHA=%016llx TEST=%016llx FBA=%u\n",
+                                 static_cast<unsigned long long>(cc.tex1), static_cast<unsigned long long>(cc.clamp),
+                                 static_cast<unsigned long long>(cc.alpha), static_cast<unsigned long long>(cc.test),
+                                 static_cast<unsigned>(cc.fba));
+                    std::fprintf(f, "TEXA ta0=%u ta1=%u aem=%u TEXCLUT cbw=%u cou=%u cov=%u PABE=%u FRAME fbp=%u psm=0x%x fbmsk=%08x ZBUF zbp=%u zpsm=0x%x zmsk=%u\n",
+                                 batch.state.texa.ta0, batch.state.texa.ta1, batch.state.texa.aem ? 1u : 0u,
+                                 batch.state.texclut.cbw, batch.state.texclut.cou, batch.state.texclut.cov, m_pabe ? 1u : 0u,
+                                 cc.frame.fbp, cc.frame.psm, cc.frame.fbmsk, static_cast<unsigned>(cc.zbuf.zbp),
+                                 static_cast<unsigned>(cc.zbuf.psm), cc.zbuf.zmask ? 1u : 0u);
+                    for (uint32_t i = 0; i < batch.vertexCount; ++i)
+                    {
+                        const GSVertex &v = batch.vertices[i];
+                        std::fprintf(f, "V%u xy=%.2f,%.2f z=%.0f rgba=%u,%u,%u,%u stq=%g,%g,%g uv=%u,%u fog=%u\n", i, v.x, v.y, v.z,
+                                     v.r, v.g, v.b, v.a, v.s, v.t, v.q, v.u, v.v, v.fog);
+                    }
+                    if (!vram.empty())
+                    {
+                        GSCpuBackend reader(1u);
+                        reader.Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
+                        const uint32_t tw = 1u << std::min<uint32_t>(t.tw, 10u), th = 1u << std::min<uint32_t>(t.th, 10u);
+                        std::fprintf(f, "INDICES %ux%u\n", tw, th);
+                        for (uint32_t y = 0; y < th && y < 64u; ++y)
+                        {
+                            for (uint32_t x = 0; x < tw && x < 64u; ++x)
+                                std::fprintf(f, "%02x", reader.ReadVram(t.psm, t.tbp0, std::max<uint32_t>(t.tbw, 1u), x, y) & 0xFFu);
+                            std::fprintf(f, "\n");
+                        }
+                        std::fprintf(f, "CLUT (entry: rgba as stored, CSM1 order)\n");
+                        const uint32_t entries = (t.psm == 0x14u || t.psm == 0x24u || t.psm == 0x2Cu) ? 16u : 256u;
+                        for (uint32_t e = 0; e < entries; ++e)
+                        {
+                            uint32_t sx, sy;
+                            if (t.csm == 0u)
+                            {
+                                const uint32_t si = entries == 16u ? e : ((e & ~0x18u) | ((e & 0x08u) << 1u) | ((e & 0x10u) >> 1u));
+                                sx = entries == 16u ? (e & 7u) : (si & 0x0Fu);
+                                sy = entries == 16u ? (e >> 3u) : (si >> 4u);
+                            }
+                            else
+                            {
+                                sx = (static_cast<uint32_t>(batch.state.texclut.cou) << 4u) + e;
+                                sy = batch.state.texclut.cov;
+                            }
+                            std::fprintf(f, "%3u:%08x%s", e, reader.ReadVram(t.cpsm, t.cbp, 1u, sx, sy), (e % 8u) == 7u ? "\n" : " ");
+                        }
+                        reader.Initialize(nullptr, 0u);
+                    }
+                    std::fclose(f);
+                    std::fprintf(stderr, "[texcap] tbp=%ld captured%c", s_capTbp, 10);
+                }
+            }
+        }
         // HCTP diag (HCTP_FONTLOG=1): draws whose frame / Z buffer reaches the font sheets (blocks 0x2240-0x233f)
         {
             static const bool fontLog = std::getenv("HCTP_FONTLOG") != nullptr;
