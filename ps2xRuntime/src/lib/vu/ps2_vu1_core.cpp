@@ -1,3 +1,4 @@
+#include <type_traits>
 #include <chrono>
 #include <vector>
 #include <mutex>
@@ -39,6 +40,46 @@ namespace
     // raw words of each decoded pair per interpreter: an upload of unchanged code re-decodes nothing
     std::unordered_map<const void *, std::vector<uint64_t>> g_decodedRawWords;
     std::mutex g_decodedRawWordsMutex;
+
+    // HCTP: per-address memo of the last 4 decodes (the game swaps its 0x2a00 overlays many times a frame; a pair's
+    // decode depends only on its two words and its address, so a swapped-back overlay is a lookup, not a decode)
+    template <class D>
+    struct PairMemo
+    {
+        uint64_t words[4];
+        D decoded[4];
+        uint8_t count = 0u, next = 0u;
+    };
+    std::unordered_map<const void *, std::shared_ptr<void>> g_pairMemos;
+    std::mutex g_pairMemosMutex;
+
+    template <class D>
+    std::vector<PairMemo<D>> &pairMemos(const void *owner, size_t pairs)
+    {
+        std::lock_guard<std::mutex> lock(g_pairMemosMutex);
+        auto &slot = g_pairMemos[owner];
+        if (!slot)
+            slot = std::make_shared<std::vector<PairMemo<D>>>(pairs);
+        return *static_cast<std::vector<PairMemo<D>> *>(slot.get());
+    }
+
+    template <class D, class F>
+    D memoDecode(std::vector<PairMemo<D>> &memos, uint32_t index, const uint8_t *vuCode, F &&decode)
+    {
+        uint64_t words;
+        std::memcpy(&words, vuCode + index * 8u, 8u);
+        PairMemo<D> &m = memos[index];
+        for (uint8_t k = 0; k < m.count; ++k)
+            if (m.words[k] == words)
+                return m.decoded[k];
+        const D d = decode();
+        m.words[m.next] = words;
+        m.decoded[m.next] = d;
+        m.next = static_cast<uint8_t>((m.next + 1u) & 3u);
+        if (m.count < 4u)
+            ++m.count;
+        return d;
+    }
 }
 
 void hctpDumpVifTrace(const char *why);
@@ -1949,9 +1990,11 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
         raw = &g_decodedRawWords[this];
     }
     raw->assign(kMaxDecodedPairs, 0u);
+    using D = std::decay_t<decltype(m_decodedCodeCache[0])>;
+    auto &memos = pairMemos<D>(this, kMaxDecodedPairs);
     for (uint32_t i = 0; i < pairCount; ++i)
     {
-        m_decodedCodeCache[i] = decodeInstructionPair(vuCode, i * 8u);
+        m_decodedCodeCache[i] = memoDecode(memos, i, vuCode, [&] { return decodeInstructionPair(vuCode, i * 8u); });
         std::memcpy(&(*raw)[i], vuCode + i * 8u, 8u);
         readsMacStatus = readsMacStatus || pairReadsMacStatus(m_decodedCodeCache[i].lower, m_decodedCodeCache[i].iBit);
     }
@@ -2003,6 +2046,8 @@ bool VU1Interpreter::ensureDecodedCodeCache(const uint8_t *vuCode, uint32_t code
             if (raw->size() < kMaxDecodedPairs)
                 raw->assign(kMaxDecodedPairs, ~0ull);
             uint32_t changedFirst = last, changedLast = first;
+            using D = std::decay_t<decltype(m_decodedCodeCache[0])>;
+            auto &memos = pairMemos<D>(this, kMaxDecodedPairs);
             for (uint32_t i = first; i < last; ++i)
             {
                 uint64_t words;
@@ -2010,7 +2055,7 @@ bool VU1Interpreter::ensureDecodedCodeCache(const uint8_t *vuCode, uint32_t code
                 if (words == (*raw)[i])
                     continue;
                 (*raw)[i] = words;
-                m_decodedCodeCache[i] = decodeInstructionPair(vuCode, i * 8u);
+                m_decodedCodeCache[i] = memoDecode(memos, i, vuCode, [&] { return decodeInstructionPair(vuCode, i * 8u); });
                 changedFirst = std::min(changedFirst, i);
                 changedLast = i + 1u;
             }
