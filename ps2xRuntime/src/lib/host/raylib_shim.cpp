@@ -1,6 +1,7 @@
 // The raylib subset on the native Win32 host (see host/raylib_shim.h).
 #include "host/raylib_shim.h"
 #include "runtime/gs/gs_d3d11_backend.h"
+#include "runtime/gs/ps2_gif_arbiter.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -23,8 +24,12 @@
 #include <unordered_map>
 #include <vector>
 
-// win32_host.cpp's FPS counter and hitch log read these (Crush Hour keeps them in its runtime)
+// Diagnostics globals the ported host / D3D11 renderer read (Crush Hour keeps them in its runtime): the FPS counter and
+// hitch log, the GS trace windows and the transfer log's GIF path label.
 std::atomic<double> g_hitchLastFlip{-1.0};
+std::atomic<double> g_ps2xBank1LoadedAt{-1.0};
+std::atomic<double> g_ps2xTraceAnchorAt{-1.0};
+thread_local GifPathId g_gifCurrentPath = GifPathId::Path2;
 namespace
 {
     std::atomic<uint64_t> g_shimPresents{0};
