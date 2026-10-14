@@ -332,6 +332,16 @@ float4 ps_blit(BlitOut i) : SV_Target
 {
     return blitTex.SampleLevel(blitSamp, blitRect.xy + i.uv * blitRect.zw, 0);
 }
+// DATE pre-pass: keep (stencil = 1) the pixels whose destination alpha bit 7 equals DATM (blitRect.x).
+// Render-target alpha is stored as GS alpha / 128, so bit 7 set <=> stored value >= 1.0.
+Texture2D dateTex : register(t1);
+float4 ps_date(BlitOut i) : SV_Target
+{
+    float a = dateTex.Load(int3(int2(i.pos.xy), 0)).a;
+    bool bit7 = a >= (127.5 / 128.0);
+    if (bit7 != (blitRect.x != 0.0)) discard;
+    return float4(0, 0, 0, 0);
+}
 )";
 
     struct Vtx
@@ -385,7 +395,9 @@ struct GSD3D11Backend::Impl
     ComPtr<ID3D11Device> dev;
     ComPtr<ID3D11DeviceContext> ctx;
     ComPtr<ID3D11VertexShader> vs, vsBlit;
-    ComPtr<ID3D11PixelShader> ps, psBlit;
+    ComPtr<ID3D11PixelShader> ps, psBlit, psDate;
+    ComPtr<ID3D11BlendState> blendNoColor;
+    ComPtr<ID3D11DepthStencilState> dsDateMark;
     ComPtr<ID3D11InputLayout> layout;
     ComPtr<ID3D11Buffer> vb, cb, blitCb;
     uint32_t vbCapacity = 0;
@@ -645,10 +657,11 @@ struct GSD3D11Backend::Impl
             }
             return true;
         };
-        ComPtr<ID3DBlob> vsb, psb, vsbb, psbb;
+        ComPtr<ID3DBlob> vsb, psb, vsbb, psbb, psdb;
         if (!compile("vs_main", "vs_5_0", vsb) || !compile("ps_main", "ps_5_0", psb) ||
-            !compile("vs_blit", "vs_5_0", vsbb) || !compile("ps_blit", "ps_5_0", psbb))
+            !compile("vs_blit", "vs_5_0", vsbb) || !compile("ps_blit", "ps_5_0", psbb) || !compile("ps_date", "ps_5_0", psdb))
             return false;
+        dev->CreatePixelShader(psdb->GetBufferPointer(), psdb->GetBufferSize(), nullptr, &psDate);
         dev->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, &vs);
         dev->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, &ps);
         dev->CreateVertexShader(vsbb->GetBufferPointer(), vsbb->GetBufferSize(), nullptr, &vsBlit);
@@ -692,6 +705,20 @@ struct GSD3D11Backend::Impl
         D3D11_BLEND_DESC bd{};
         bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
         dev->CreateBlendState(&bd, &blendOpaque);
+        {
+            D3D11_BLEND_DESC nb{};
+            nb.RenderTarget[0].RenderTargetWriteMask = 0;
+            dev->CreateBlendState(&nb, &blendNoColor);
+            D3D11_DEPTH_STENCIL_DESC md{};
+            md.DepthEnable = FALSE;
+            md.StencilEnable = TRUE;
+            md.StencilReadMask = md.StencilWriteMask = 0xFF;
+            md.FrontFace.StencilFunc = D3D11_COMPARISON_ALWAYS;
+            md.FrontFace.StencilPassOp = D3D11_STENCIL_OP_REPLACE;
+            md.FrontFace.StencilFailOp = md.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+            md.BackFace = md.FrontFace;
+            dev->CreateDepthStencilState(&md, &dsDateMark);
+        }
         D3D11_DEPTH_STENCIL_DESC dd{};
         dd.DepthEnable = FALSE;
         dev->CreateDepthStencilState(&dd, &depthOff);
@@ -1079,7 +1106,7 @@ struct GSD3D11Backend::Impl
                 d.dsv.Reset();
                 d.w = std::max(w, d.w);
                 d.h = std::max(h, d.h);
-                if (!createTexture(d.w * scale, d.h * scale, D3D11_BIND_DEPTH_STENCIL, d.tex, DXGI_FORMAT_D32_FLOAT))
+                if (!createTexture(d.w * scale, d.h * scale, D3D11_BIND_DEPTH_STENCIL, d.tex, DXGI_FORMAT_D32_FLOAT_S8X24_UINT))
                     return nullptr;
                 dev->CreateDepthStencilView(d.tex.Get(), nullptr, &d.dsv);
                 ctx->ClearDepthStencilView(d.dsv.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
@@ -1089,7 +1116,7 @@ struct GSD3D11Backend::Impl
         d.zbpBlock = zbpBlock;
         d.w = std::max(w, 640u); // room for the frame-sized targets that share this ZBP (see above)
         d.h = std::max(h, 512u);
-        if (!createTexture(d.w * scale, d.h * scale, D3D11_BIND_DEPTH_STENCIL, d.tex, DXGI_FORMAT_D32_FLOAT))
+        if (!createTexture(d.w * scale, d.h * scale, D3D11_BIND_DEPTH_STENCIL, d.tex, DXGI_FORMAT_D32_FLOAT_S8X24_UINT))
             return nullptr;
         dev->CreateDepthStencilView(d.tex.Get(), nullptr, &d.dsv);
         ctx->ClearDepthStencilView(d.dsv.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
@@ -1507,9 +1534,9 @@ struct GSD3D11Backend::Impl
         return bs.Get();
     }
 
-    ID3D11DepthStencilState *depthState(bool enable, uint32_t func, bool write)
+    ID3D11DepthStencilState *depthState(bool enable, uint32_t func, bool write, bool date = false)
     {
-        const uint32_t key = (enable ? 1u : 0u) | (func << 1) | (write ? 8u : 0u);
+        const uint32_t key = (enable ? 1u : 0u) | (func << 1) | (write ? 8u : 0u) | (date ? 16u : 0u);
         auto it = depthStates.find(key);
         if (it != depthStates.end())
             return it->second.Get();
@@ -1519,6 +1546,17 @@ struct GSD3D11Backend::Impl
         static const D3D11_COMPARISON_FUNC funcs[4] = {D3D11_COMPARISON_NEVER, D3D11_COMPARISON_ALWAYS,
                                                        D3D11_COMPARISON_GREATER_EQUAL, D3D11_COMPARISON_GREATER};
         dd.DepthFunc = funcs[func & 3u];
+        if (date)
+        {
+            // DATE: only pixels marked by the pre-pass, each pixel once (on the GS the write sets alpha bit 7, so an
+            // overlapping primitive of the same draw fails DATE - no double-darkened shadow triangles)
+            dd.StencilEnable = TRUE;
+            dd.StencilReadMask = dd.StencilWriteMask = 0xFF;
+            dd.FrontFace.StencilFunc = D3D11_COMPARISON_EQUAL;
+            dd.FrontFace.StencilPassOp = D3D11_STENCIL_OP_ZERO;
+            dd.FrontFace.StencilFailOp = dd.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+            dd.BackFace = dd.FrontFace;
+        }
         ComPtr<ID3D11DepthStencilState> ds;
         dev->CreateDepthStencilState(&dd, &ds);
         depthStates[key] = ds;
@@ -2034,6 +2072,63 @@ struct GSD3D11Backend::Impl
         vbWriteOffset += bytes;
         }
 
+        // ---- DATE (destination alpha test) pre-pass: stencil = 1 where the frame's alpha bit 7 == DATM
+        const bool dateOn = ((c.test >> 14) & 1u) != 0u && c.frame.psm != GS_PSM_CT24;
+        static const bool s_noDate = std::getenv("HCTP_NO_DATE") != nullptr;
+        bool dateActive = false;
+        if (dateOn && !s_noDate)
+        {
+            if (!dt)
+                dt = getDepth(framePageBaseToBlock(c.zbuf.zbp), rt->w, rt->h);
+            if (dt && psDate)
+            {
+                D3D11_TEXTURE2D_DESC td{};
+                rt->tex->GetDesc(&td);
+                D3D11_TEXTURE2D_DESC fd{};
+                if (feedbackTex)
+                    feedbackTex->GetDesc(&fd);
+                if (!feedbackTex || fd.Width != td.Width || fd.Height != td.Height)
+                {
+                    feedbackTex.Reset();
+                    feedbackSrv.Reset();
+                    createTexture(td.Width, td.Height, D3D11_BIND_SHADER_RESOURCE, feedbackTex);
+                    dev->CreateShaderResourceView(feedbackTex.Get(), nullptr, &feedbackSrv);
+                }
+                ctx->CopyResource(feedbackTex.Get(), rt->tex.Get());
+                ctx->ClearDepthStencilView(dt->dsv.Get(), D3D11_CLEAR_STENCIL, 0.0f, 0);
+                D3D11_MAPPED_SUBRESOURCE bm{};
+                if (SUCCEEDED(ctx->Map(blitCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &bm)))
+                {
+                    const float r[4] = {static_cast<float>((c.test >> 15) & 1u), 0.0f, 0.0f, 0.0f};
+                    std::memcpy(bm.pData, r, sizeof(r));
+                    ctx->Unmap(blitCb.Get(), 0);
+                }
+                D3D11_VIEWPORT dvp{0, 0, static_cast<float>(rt->w * scale), static_cast<float>(rt->h * scale), 0, 1};
+                ctx->RSSetViewports(1, &dvp);
+                D3D11_RECT dsc{static_cast<LONG>(c.scissor.x0 * scale), static_cast<LONG>(c.scissor.y0 * scale),
+                               static_cast<LONG>((c.scissor.x1 + 1u) * scale), static_cast<LONG>((c.scissor.y1 + 1u) * scale)};
+                ctx->RSSetScissorRects(1, &dsc);
+                ctx->RSSetState(raster.Get());
+                ID3D11RenderTargetView *drtv = rt->rtv.Get();
+                ctx->OMSetRenderTargets(1, &drtv, dt->dsv.Get());
+                ctx->OMSetBlendState(blendNoColor.Get(), nullptr, 0xFFFFFFFFu);
+                ctx->OMSetDepthStencilState(dsDateMark.Get(), 1);
+                ctx->IASetInputLayout(nullptr);
+                ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                ctx->VSSetShader(vsBlit.Get(), nullptr, 0);
+                ctx->PSSetShader(psDate.Get(), nullptr, 0);
+                ID3D11Buffer *bcb = blitCb.Get();
+                ctx->PSSetConstantBuffers(0, 1, &bcb);
+                ID3D11ShaderResourceView *fsrv = feedbackSrv.Get();
+                ctx->PSSetShaderResources(1, 1, &fsrv);
+                ctx->Draw(3, 0);
+                ID3D11ShaderResourceView *nullSrv1 = nullptr;
+                ctx->PSSetShaderResources(1, 1, &nullSrv1);
+                ++pipeGen; // rebind the draw pipeline below
+                dateActive = true;
+            }
+        }
+
         // ---- pipeline
         const uint64_t hostEpoch = ps2host::d3dStateEpoch();
         if (bound.gen != pipeGen || bound.hostEpoch != hostEpoch)
@@ -2117,10 +2212,10 @@ struct GSD3D11Backend::Impl
                 bound.bs = bs;
                 std::memcpy(bound.bf, bf, sizeof(bf));
             }
-            ID3D11DepthStencilState *ds = dt ? depthState(true, zfunc, depthWrite) : depthOff.Get();
+            ID3D11DepthStencilState *ds = dt ? depthState(depthNeeded, zfunc, depthWrite && depthNeeded, dateActive) : depthOff.Get();
             if (ds != bound.ds)
             {
-                ctx->OMSetDepthStencilState(ds, 0);
+                ctx->OMSetDepthStencilState(ds, dateActive ? 1u : 0u);
                 bound.ds = ds;
             }
             ctx->Draw(static_cast<UINT>(pending.size()), firstVertex);
