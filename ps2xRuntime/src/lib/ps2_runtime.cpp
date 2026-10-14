@@ -1041,9 +1041,15 @@ bool PS2Runtime::syncCoreSubsystems()
                                      const uint32_t fbrst = m_chain.kickFbrst();
                                      m_vu1.state().dBitEnabled = (fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
+                                     if (hctpNativeVu1Mscal(m_memory.getVU1Code(), m_memory.getVU1Data(), startPC))
+                                     {
+                                         m_chain.noteVu1Run(0u);
+                                         return;
+                                     }
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
+                                     hctpNativeVu1AfterMscal(m_memory.getVU1Data());
                                      m_chain.noteVu1Run((m_vu1.state().stoppedByD ? 0x0200u : 0u) |
                                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u)); });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)

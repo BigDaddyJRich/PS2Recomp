@@ -411,3 +411,198 @@ void hctpNativeVu1AfterResume(const uint8_t *data)
     }
     report();
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// p01 (VU 0x00a0): 4-bone skinned transform + 3 directional lights, as C++ (notes\VU1_PROGRAMS.md, p01 corrections:
+// the normal is normalised when [1010].x == 0, and the light matrix is applied by columns).
+// HCTP_NATIVE_VERIFY=1 compares it with the VU1's results; HCTP_NATIVE_P01=1 runs it instead of the VU1.
+namespace
+{
+    constexpr uint32_t kP01Start = 0x00a0u;
+    bool g_p01Native = false;
+    uint64_t g_p01Hash = 0;
+    uint64_t g_p01Batches = 0, g_p01Verts = 0, g_p01Ok[4] = {0, 0, 0, 0}, g_p01NativeBatches = 0;
+    int g_p01Dumped = 0;
+    std::vector<float> g_p01Out; // per vertex: pos4, normal4, screen4, light4
+    uint32_t g_p01Base = 0, g_p01Count = 0;
+    bool g_p01Pending = false;
+    std::chrono::steady_clock::time_point g_p01Last;
+
+    uint64_t p01Hash(const uint8_t *code)
+    {
+        uint64_t h = 1469598103934665603ull;
+        for (uint32_t i = 0x00a0u; i < 0x04c0u; ++i)
+            h = (h ^ code[i]) * 1099511628211ull;
+        return h;
+    }
+
+    // computes the batch into g_p01Out; false = not a p01 batch we handle
+    bool p01Compute(const uint8_t *data)
+    {
+        uint32_t w800[4];
+        std::memcpy(w800, data + 800u * 16u, 16);
+        const uint32_t count = w800[0] & 0xFFFFu, b = w800[1] & 0xFFFFu;
+        if (count == 0u || count > 160u || b + 640u + count > 1024u)
+            return false;
+        const float *hdr = q(data, 800);
+        const float fogA = hdr[2], fogB = hdr[3];
+        uint32_t w1010;
+        std::memcpy(&w1010, data + 1010u * 16u, 4);
+        const bool normalise = (w1010 & 0xFFFFu) == 0u;
+        const float *L[3] = {q(data, 1012), q(data, 1013), q(data, 1014)};
+        const float *C[3] = {q(data, 1016), q(data, 1017), q(data, 1018)};
+        const float *P[4] = {q(data, 1020), q(data, 1021), q(data, 1022), q(data, 1023)};
+        g_p01Out.resize(static_cast<size_t>(count) * 16u);
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            const float *pos = q(data, b + i), *wt = q(data, b + 640u + i), *nrm = q(data, b + 160u + i);
+            float v[4] = {0, 0, 0, 0}, n[3] = {0, 0, 0};
+            for (int k = 0; k < 4; ++k)
+            {
+                const float *M[4] = {q(data, 801u + 4u * k), q(data, 802u + 4u * k), q(data, 803u + 4u * k), q(data, 804u + 4u * k)};
+                for (int c = 0; c < 4; ++c)
+                {
+                    const float sk = M[0][c] * pos[0] + M[1][c] * pos[1] + M[2][c] * pos[2] + M[3][c] * pos[3];
+                    v[c] += sk * wt[k];
+                }
+                for (int c = 0; c < 3; ++c)
+                {
+                    const float sn = M[0][c] * nrm[0] + M[1][c] * nrm[1] + M[2][c] * nrm[2];
+                    n[c] += sn * wt[k];
+                }
+            }
+            float cl[4];
+            for (int c = 0; c < 4; ++c)
+                cl[c] = P[0][c] * v[0] + P[1][c] * v[1] + P[2][c] * v[2] + P[3][c] * v[3];
+            const float qv = 1.0f / cl[3];
+            const float fog = std::fmin(std::fmax(fogA + cl[3] * fogB, 0.0f), 255.0f);
+            if (normalise)
+            {
+                const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+                const float inv = 1.0f / len;
+                for (float &c : n)
+                    c *= inv;
+            }
+            float d[4];
+            for (int c = 0; c < 4; ++c)
+                d[c] = std::fmax(L[0][c] * n[0] + L[1][c] * n[1] + L[2][c] * n[2], 0.0f);
+            float *o = &g_p01Out[static_cast<size_t>(i) * 16u];
+            for (int c = 0; c < 4; ++c)
+                o[c] = v[c];
+            o[4] = n[0];
+            o[5] = n[1];
+            o[6] = n[2];
+            o[7] = qv;
+            o[8] = cl[0] * qv;
+            o[9] = cl[1] * qv;
+            o[10] = cl[2] * qv;
+            o[11] = fog;
+            for (int c = 0; c < 4; ++c)
+                o[12 + c] = C[0][c] * d[0] + C[1][c] * d[1] + C[2][c] * d[2];
+        }
+        g_p01Base = b;
+        g_p01Count = count;
+        return true;
+    }
+
+    void p01Report()
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - g_p01Last <= std::chrono::seconds(5))
+            return;
+        g_p01Last = now;
+        if (g_p01Verts)
+            std::fprintf(stderr, "[nvu1] p01 hash=%llx batches=%llu verts=%llu match: pos %.2f%% normal %.2f%% screen %.2f%% light %.2f%%%c",
+                         static_cast<unsigned long long>(g_p01Hash), static_cast<unsigned long long>(g_p01Batches),
+                         static_cast<unsigned long long>(g_p01Verts), 100.0 * g_p01Ok[0] / g_p01Verts,
+                         100.0 * g_p01Ok[1] / g_p01Verts, 100.0 * g_p01Ok[2] / g_p01Verts, 100.0 * g_p01Ok[3] / g_p01Verts, 10);
+        if (g_p01NativeBatches)
+            std::fprintf(stderr, "[nvu1] p01 native batches=%llu%c", static_cast<unsigned long long>(g_p01NativeBatches), 10);
+    }
+
+    bool isP01(const uint8_t *code, uint32_t startPC)
+    {
+        if (startPC != kP01Start || !code)
+            return false;
+        static uint64_t s_sig = 0, s_hash = 0;
+        uint64_t sig;
+        std::memcpy(&sig, code + 0x00a0u, 8);
+        if (sig != s_sig)
+        {
+            s_sig = sig;
+            s_hash = p01Hash(code);
+        }
+        g_p01Hash = s_hash;
+        static const char *s_wantEnv = std::getenv("HCTP_P01_HASH");
+        static const uint64_t s_want = s_wantEnv ? std::strtoull(s_wantEnv, nullptr, 16) : 0ull;
+        return s_want == 0ull || s_hash == s_want;
+    }
+
+    bool nearV(const float *a, const float *b, int n, float tol)
+    {
+        for (int c = 0; c < n; ++c)
+            if (!(std::fabs(a[c] - b[c]) <= tol * std::fmax(1.0f, std::fabs(b[c]))))
+                return false;
+        return true;
+    }
+}
+
+bool hctpNativeVu1Mscal(const uint8_t *code, uint8_t *data, uint32_t startPC)
+{
+    static const bool s_init = []
+    {
+        const char *e = std::getenv("HCTP_NATIVE_P01");
+        g_p01Native = e && e[0] == '1';
+        return true;
+    }();
+    (void)s_init;
+    g_p01Pending = false;
+    if (!data || !isP01(code, startPC))
+        return false;
+    if (g_on)
+    {
+        g_p01Pending = p01Compute(data);
+        return false;
+    }
+    if (!g_p01Native || !p01Compute(data))
+        return false;
+    for (uint32_t i = 0; i < g_p01Count; ++i)
+    {
+        const float *o = &g_p01Out[static_cast<size_t>(i) * 16u];
+        std::memcpy(data + ((g_p01Base + i) & 0x3FFu) * 16u, o, 16);
+        std::memcpy(data + ((g_p01Base + 160u + i) & 0x3FFu) * 16u, o + 4, 16);
+        std::memcpy(data + ((g_p01Base + 320u + i) & 0x3FFu) * 16u, o + 8, 16);
+        std::memcpy(data + ((g_p01Base + 480u + i) & 0x3FFu) * 16u, o + 12, 16);
+    }
+    ++g_p01NativeBatches;
+    p01Report();
+    return true;
+}
+
+void hctpNativeVu1AfterMscal(const uint8_t *data)
+{
+    if (!g_p01Pending || !data)
+        return;
+    g_p01Pending = false;
+    ++g_p01Batches;
+    for (uint32_t i = 0; i < g_p01Count; ++i)
+    {
+        const float *o = &g_p01Out[static_cast<size_t>(i) * 16u];
+        const float *vu[4] = {q(data, g_p01Base + i), q(data, g_p01Base + 160u + i), q(data, g_p01Base + 320u + i),
+                              q(data, g_p01Base + 480u + i)};
+        const bool ok[4] = {nearV(vu[0], o, 4, 1e-4f), nearV(vu[1], o + 4, 4, 1e-3f), nearV(vu[2], o + 8, 4, 1e-3f),
+                            nearV(vu[3], o + 12, 3, 1e-2f)};
+        ++g_p01Verts;
+        for (int k = 0; k < 4; ++k)
+            g_p01Ok[k] += ok[k];
+        if (!(ok[0] && ok[1] && ok[2] && ok[3]) && g_p01Dumped < 8)
+        {
+            ++g_p01Dumped;
+            std::fprintf(stderr, "[nvu1] p01 mismatch v=%u ok=%d%d%d%d | p vu %g %g %g %g spec %g %g %g %g | n vu %g %g %g %g spec %g %g %g %g | s vu %g %g %g %g spec %g %g %g %g | L vu %g %g %g spec %g %g %g%c",
+                         i, ok[0], ok[1], ok[2], ok[3], vu[0][0], vu[0][1], vu[0][2], vu[0][3], o[0], o[1], o[2], o[3],
+                         vu[1][0], vu[1][1], vu[1][2], vu[1][3], o[4], o[5], o[6], o[7], vu[2][0], vu[2][1], vu[2][2],
+                         vu[2][3], o[8], o[9], o[10], o[11], vu[3][0], vu[3][1], vu[3][2], o[12], o[13], o[14], 10);
+        }
+    }
+    p01Report();
+}

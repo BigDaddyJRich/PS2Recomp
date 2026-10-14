@@ -15,3 +15,6 @@ bool hctpNativeVu1TryDraw(const uint8_t *code, uint8_t *data, const VU1State &st
 // top = TOP (qwords)
 void hctpNativeVu1BeforeResume(const uint8_t *code, const uint8_t *data, const VU1State &st, uint32_t top);
 void hctpNativeVu1AfterResume(const uint8_t *data);
+// p01 at MSCAL 0x00a0: HCTP_NATIVE_P01=1 -> computed natively, true = skip the VU1; verify mode compares after the run
+bool hctpNativeVu1Mscal(const uint8_t *code, uint8_t *data, uint32_t startPC);
+void hctpNativeVu1AfterMscal(const uint8_t *data);
