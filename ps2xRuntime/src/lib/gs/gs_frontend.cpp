@@ -1155,6 +1155,15 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint8_t path)
 
         recordGifTagDebugEventUnlocked(sizeBytes, nloop, flg, nreg);
         ++s_hudTag;
+        if (s_hudLog.phase == HudLog::Capturing)
+        {
+            char line[200];
+            std::snprintf(line, sizeof(line), "[hud] TAG path=%u pk=%u off=%u size=%u nloop=%u eop=%u pre=%u prim=0x%x flg=%u nreg=%u regs=%016llx\n",
+                          static_cast<unsigned>(path), s_hudPacket, offset - 16u, sizeBytes, nloop,
+                          static_cast<unsigned>((tagLo >> 15) & 1u), static_cast<unsigned>((tagLo >> 46) & 1u),
+                          static_cast<unsigned>((tagLo >> 47) & 0x7FFu), flg, nreg, static_cast<unsigned long long>(tagHi));
+            s_hudLog.text += line;
+        }
 
         bool pre = ((tagLo >> 46) & 1) != 0;
         if (pre)
