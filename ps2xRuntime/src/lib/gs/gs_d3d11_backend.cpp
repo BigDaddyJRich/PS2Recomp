@@ -2060,6 +2060,15 @@ struct GSD3D11Backend::Impl
         static const bool s_hasRect = std::getenv("PS2X_GS_TRACE_RECT") &&
                                       std::sscanf(std::getenv("PS2X_GS_TRACE_RECT"), "%f:%f:%f:%f", &s_rect[0], &s_rect[1],
                                                   &s_rect[2], &s_rect[3]) == 4;
+        // PS2X_GS_TRACE_ZMAX=<z>: only draws whose vertices all have normalized z below (HUD layers sit near 0)
+        static const float s_zmax = std::getenv("PS2X_GS_TRACE_ZMAX") ? static_cast<float>(std::atof(std::getenv("PS2X_GS_TRACE_ZMAX"))) : 2.0f;
+        if (s_zmax < 2.0f && traceAbeOk)
+            for (const Vtx &v : pending)
+                if (v.z > s_zmax)
+                {
+                    traceAbeOk = false;
+                    break;
+                }
         if (s_hasRect && traceAbeOk && s_traced < s_traceLimit && traceTimeOk)
             for (const Vtx &v : pending)
                 if (v.x < s_rect[0] || v.y < s_rect[1] || v.x > s_rect[2] || v.y > s_rect[3])
