@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <chrono>
 #include <algorithm>
 #include <vector>
 #include <cstring>
@@ -605,7 +606,14 @@ namespace ps2_syscalls
             request.endFunction = endFunction;
             request.endParameter = endParameter;
 
+            const auto hctpRpcT0 = std::chrono::steady_clock::now();
             iopResult = PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
+            {
+                // HCTP: RPCs that take long on the host (in-match freeze diagnosis), always on, rare
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - hctpRpcT0).count();
+                if (ms > 50.0)
+                    std::fprintf(stderr, "[rpc-slow] sid=0x%x fno=%u mode=%u ssz=%u %.1f ms ra=0x%x\n", sid, rpcNum, mode, sendSize, ms, getRegU32(ctx, 31));
+            }
 
             if (iopResult.signalNowaitCompletion &&
                 (mode & kSifRpcModeNowait) != 0u)

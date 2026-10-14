@@ -398,6 +398,7 @@ namespace
 
         g_nextPseudoLbn += entry.sectors + 1;
         g_cdFilesByKey.emplace(key, entry);
+        std::fprintf(stderr, "[cdfile] lbn 0x%x-0x%x %s\n", entry.baseLbn, entry.baseLbn + entry.sectors, entry.hostPath.string().c_str()); // HCTP: lbn -> file map
         entryOut = entry;
         g_lastCdError = 0;
         return true;

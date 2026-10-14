@@ -2289,8 +2289,18 @@ void EeScheduler::processDueDeadlines()
                 static const bool catchUp = std::getenv("VENDETTA_VBLANK_CATCHUP") != nullptr;
                 auto hostDeadline = scheduled.hostDeadline;
                 const auto now = std::chrono::steady_clock::now();
-                if (!catchUp && now - hostDeadline > kVBlankResync)
+                // HCTP_VBLANK_RESYNC_MS (default 100): the lag that restarts the schedule. The restart also re-anchors
+                // the host clock (catchUpBeforeDeadline's origin): without it HCTP's matches froze 5-9 s after each
+                // restart (every ~6 s at 30 fps). HCTP_VBLANK_NOREANCHOR=1 = old behaviour.
+                static const auto resync = std::chrono::milliseconds(std::getenv("HCTP_VBLANK_RESYNC_MS") ? std::atoi(std::getenv("HCTP_VBLANK_RESYNC_MS")) : 100);
+                static const bool reanchor = std::getenv("HCTP_VBLANK_NOREANCHOR") == nullptr;
+                if (!catchUp && now - hostDeadline > resync)
                 {
+                    if (reanchor)
+                    {
+                        m_hostClockOrigin = now;
+                        m_hostClockOriginCycle = m_eeCycle;
+                    }
                     static const bool log = std::getenv("VENDETTA_HOSTPROF") != nullptr;
                     if (log)
                     {
