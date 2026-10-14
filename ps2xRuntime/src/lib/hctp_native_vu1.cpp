@@ -418,9 +418,23 @@ void hctpNativeVu1AfterResume(const uint8_t *data)
 // HCTP_NATIVE_VERIFY=1 compares it with the VU1's results; HCTP_NATIVE_P01=1 runs it instead of the VU1.
 namespace
 {
-    constexpr uint32_t kP01Start = 0x00a0u;
+    struct Stage1Prog
+    {
+        uint32_t start, end;
+        int bones;      // matrices at 801 + 4k; 1 = rigid (weight 1)
+        bool weights;   // blend weights at b+640
+        bool normalise; // honours [1010].x == 0
+    };
+    constexpr Stage1Prog kStage1[4] = {
+        {0x00a0u, 0x04c0u, 4, true, true},
+        {0x05a0u, 0x0a40u, 3, true, true},
+        {0x0aa0u, 0x0ea8u, 2, true, true},
+        {0x0fa0u, 0x1280u, 1, false, false},
+    };
+    int g_s1 = -1; // which program the current batch is
     bool g_p01Native = false;
     uint64_t g_p01Hash = 0;
+    uint64_t g_s1Verts[4] = {0, 0, 0, 0}, g_s1Ok[4] = {0, 0, 0, 0};
     uint64_t g_p01Batches = 0, g_p01Verts = 0, g_p01Ok[4] = {0, 0, 0, 0}, g_p01NativeBatches = 0;
     int g_p01Dumped = 0;
     std::vector<float> g_p01Out; // per vertex: pos4, normal4, screen4, light4
@@ -431,7 +445,7 @@ namespace
     uint64_t p01Hash(const uint8_t *code)
     {
         uint64_t h = 1469598103934665603ull;
-        for (uint32_t i = 0x00a0u; i < 0x04c0u; ++i)
+        for (uint32_t i = kStage1[g_s1].start; i < kStage1[g_s1].end; ++i)
             h = (h ^ code[i]) * 1099511628211ull;
         return h;
     }
@@ -448,16 +462,18 @@ namespace
         const float fogA = hdr[2], fogB = hdr[3];
         uint32_t w1010;
         std::memcpy(&w1010, data + 1010u * 16u, 4);
-        const bool normalise = (w1010 & 0xFFFFu) == 0u;
+        const Stage1Prog &prog = kStage1[g_s1];
+        const bool normalise = prog.normalise && (w1010 & 0xFFFFu) == 0u;
         const float *L[3] = {q(data, 1012), q(data, 1013), q(data, 1014)};
         const float *C[3] = {q(data, 1016), q(data, 1017), q(data, 1018)};
         const float *P[4] = {q(data, 1020), q(data, 1021), q(data, 1022), q(data, 1023)};
         g_p01Out.resize(static_cast<size_t>(count) * 16u);
         for (uint32_t i = 0; i < count; ++i)
         {
-            const float *pos = q(data, b + i), *wt = q(data, b + 640u + i), *nrm = q(data, b + 160u + i);
+            static const float kOne[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+            const float *pos = q(data, b + i), *wt = prog.weights ? q(data, b + 640u + i) : kOne, *nrm = q(data, b + 160u + i);
             float v[4] = {0, 0, 0, 0}, n[3] = {0, 0, 0};
-            for (int k = 0; k < 4; ++k)
+            for (int k = 0; k < prog.bones; ++k)
             {
                 const float *M[4] = {q(data, 801u + 4u * k), q(data, 802u + 4u * k), q(data, 803u + 4u * k), q(data, 804u + 4u * k)};
                 for (int c = 0; c < 4; ++c)
@@ -516,26 +532,47 @@ namespace
                          static_cast<unsigned long long>(g_p01Hash), static_cast<unsigned long long>(g_p01Batches),
                          static_cast<unsigned long long>(g_p01Verts), 100.0 * g_p01Ok[0] / g_p01Verts,
                          100.0 * g_p01Ok[1] / g_p01Verts, 100.0 * g_p01Ok[2] / g_p01Verts, 100.0 * g_p01Ok[3] / g_p01Verts, 10);
+        if (g_p01Verts)
+            std::fprintf(stderr, "[nvu1] stage1 per program (all fields ok): p01 %llu/%llu p02 %llu/%llu p03 %llu/%llu p04 %llu/%llu%c",
+                         static_cast<unsigned long long>(g_s1Ok[0]), static_cast<unsigned long long>(g_s1Verts[0]),
+                         static_cast<unsigned long long>(g_s1Ok[1]), static_cast<unsigned long long>(g_s1Verts[1]),
+                         static_cast<unsigned long long>(g_s1Ok[2]), static_cast<unsigned long long>(g_s1Verts[2]),
+                         static_cast<unsigned long long>(g_s1Ok[3]), static_cast<unsigned long long>(g_s1Verts[3]), 10);
         if (g_p01NativeBatches)
-            std::fprintf(stderr, "[nvu1] p01 native batches=%llu%c", static_cast<unsigned long long>(g_p01NativeBatches), 10);
+            std::fprintf(stderr, "[nvu1] stage1 native batches=%llu%c", static_cast<unsigned long long>(g_p01NativeBatches), 10);
     }
 
     bool isP01(const uint8_t *code, uint32_t startPC)
     {
-        if (startPC != kP01Start || !code)
+        if (!code)
             return false;
-        static uint64_t s_sig = 0, s_hash = 0;
+        g_s1 = -1;
+        for (int k = 0; k < 4; ++k)
+            if (kStage1[k].start == startPC)
+                g_s1 = k;
+        if (g_s1 < 0)
+            return false;
+        // HCTP_NATIVE_S1=mask: which of p01..p04 (bits 0..3) run natively (default: p01 only)
+        static const char *s_maskEnv = std::getenv("HCTP_NATIVE_S1");
+        static const unsigned s_mask = s_maskEnv ? static_cast<unsigned>(std::strtoul(s_maskEnv, nullptr, 0)) : 1u;
+        if (!g_on && !(s_mask & (1u << g_s1)))
+            return false;
+        static uint64_t s_sig[4] = {0, 0, 0, 0}, s_hash[4] = {0, 0, 0, 0};
         uint64_t sig;
-        std::memcpy(&sig, code + 0x00a0u, 8);
-        if (sig != s_sig)
+        std::memcpy(&sig, code + kStage1[g_s1].start, 8);
+        if (sig != s_sig[g_s1])
         {
-            s_sig = sig;
-            s_hash = p01Hash(code);
+            s_sig[g_s1] = sig;
+            s_hash[g_s1] = p01Hash(code);
         }
-        g_p01Hash = s_hash;
-        static const char *s_wantEnv = std::getenv("HCTP_P01_HASH");
-        static const uint64_t s_want = s_wantEnv ? std::strtoull(s_wantEnv, nullptr, 16) : 0ull;
-        return s_want == 0ull || s_hash == s_want;
+        g_p01Hash = s_hash[g_s1];
+        // known-good hashes (verified): p01 adfb2a208b546483; others accepted when HCTP_S1_ANYHASH=1 or listed
+        static const char *s_anyEnv = std::getenv("HCTP_S1_ANYHASH");
+        static const bool s_any = s_anyEnv && s_anyEnv[0] == '1';
+        if (g_on || s_any)
+            return true;
+        static const uint64_t kGood[4] = {0xadfb2a208b546483ull, 0ull, 0ull, 0ull};
+        return kGood[g_s1] != 0ull && s_hash[g_s1] == kGood[g_s1];
     }
 
     bool nearV(const float *a, const float *b, int n, float tol)
@@ -595,11 +632,13 @@ void hctpNativeVu1AfterMscal(const uint8_t *data)
         ++g_p01Verts;
         for (int k = 0; k < 4; ++k)
             g_p01Ok[k] += ok[k];
+        ++g_s1Verts[g_s1];
+        g_s1Ok[g_s1] += ok[0] && ok[1] && ok[2] && ok[3];
         if (!(ok[0] && ok[1] && ok[2] && ok[3]) && g_p01Dumped < 8)
         {
             ++g_p01Dumped;
-            std::fprintf(stderr, "[nvu1] p01 mismatch v=%u ok=%d%d%d%d | p vu %g %g %g %g spec %g %g %g %g | n vu %g %g %g %g spec %g %g %g %g | s vu %g %g %g %g spec %g %g %g %g | L vu %g %g %g spec %g %g %g%c",
-                         i, ok[0], ok[1], ok[2], ok[3], vu[0][0], vu[0][1], vu[0][2], vu[0][3], o[0], o[1], o[2], o[3],
+            std::fprintf(stderr, "[nvu1] s1 p0%d mismatch v=%u ok=%d%d%d%d | p vu %g %g %g %g spec %g %g %g %g | n vu %g %g %g %g spec %g %g %g %g | s vu %g %g %g %g spec %g %g %g %g | L vu %g %g %g spec %g %g %g%c",
+                         g_s1 + 1, i, ok[0], ok[1], ok[2], ok[3], vu[0][0], vu[0][1], vu[0][2], vu[0][3], o[0], o[1], o[2], o[3],
                          vu[1][0], vu[1][1], vu[1][2], vu[1][3], o[4], o[5], o[6], o[7], vu[2][0], vu[2][1], vu[2][2],
                          vu[2][3], o[8], o[9], o[10], o[11], vu[3][0], vu[3][1], vu[3][2], o[12], o[13], o[14], 10);
         }
