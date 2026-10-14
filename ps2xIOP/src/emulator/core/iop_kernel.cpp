@@ -1,3 +1,6 @@
+#include <map>
+#include <cstdlib>
+#include <cstdio>
 #include "iop_kernel.h"
 
 #include "iop_memory.h"
@@ -388,6 +391,12 @@ namespace ps2x::iop::detail
                 setV0(-1);
                 return true;
             }
+            if (ordinal == 7 && std::getenv("VENDETTA_SPULOG"))
+            {
+                static std::map<int, int> perId; // HCTP: bank-upload semaphore diag, 20 lines per id
+                if (perId[id]++ < 20)
+                    std::fprintf(stderr, "[iopsema] iSignalSema id %d current %d max %d%c", id, it->second.current, it->second.maximum, 10);
+            }
             if (it->second.current < it->second.maximum)
                 ++it->second.current;
             wakeOneSemaphore(id);
@@ -413,6 +422,12 @@ namespace ps2x::iop::detail
                 setV0(-419);
             else if (m_currentThread != nullptr)
             {
+                if (std::getenv("VENDETTA_SPULOG"))
+                {
+                    static std::map<int, int> perId;
+                    if (perId[id]++ < 20)
+                        std::fprintf(stderr, "[iopsema] WaitSema id %d blocks (pc 0x%x ra 0x%x)%c", id, cpu.pc, cpu.gpr[31], 10);
+                }
                 m_currentThread->state = IopThreadState::Semaphore;
                 m_currentThread->waitId = id;
                 cpu.yielded = true;

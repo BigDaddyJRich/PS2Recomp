@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "iop_intrman.h"
 
 #include "../core/iop_cpu.h"
@@ -95,9 +96,18 @@ namespace ps2x::iop::detail
     bool IopIntrman::dispatchInterrupt(int irq, IopGuestExecutor &executor) const
     {
         const auto enabled = m_enabled.find(irq);
+        const auto handler = m_handlers.find(irq);
+        if (irq == 0x28)
+        {
+            // HCTP: SPU2 DMA completion delivery (sound-bank uploads stop after the first core-1 chunk)
+            static int lines = 0;
+            if (lines++ < 200)
+                std::fprintf(stderr, "[spuirq] irq %d arg 0x%x enabled %d handler 0x%x%c", irq, handler != m_handlers.end() ? handler->second.argument : 0u,
+                             (enabled != m_enabled.end() && enabled->second) ? 1 : 0,
+                             handler != m_handlers.end() ? handler->second.function : 0u, 10);
+        }
         if (enabled == m_enabled.end() || !enabled->second)
             return false;
-        const auto handler = m_handlers.find(irq);
         if (handler == m_handlers.end() || handler->second.function == 0u)
             return false;
 

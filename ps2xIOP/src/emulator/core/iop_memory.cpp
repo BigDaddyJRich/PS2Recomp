@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "iop_memory.h"
 
 #include <algorithm>
@@ -341,6 +342,15 @@ namespace ps2x::iop::detail
         // hundreds of times faster than real time.
         constexpr uint64_t kIopCyclesPerSpuFrame = 768u;
         const bool autoDma = m_spu2.autoDmaEnabled(core);
+        {
+            // HCTP: SPU2 DMAs that are not the 2 KB AutoDMA stream blocks (sound-bank uploads), capped
+            static int hctpLines = 0;
+            if (transferWords * 4u != 2048u && hctpLines < 2000)
+            {
+                ++hctpLines;
+                std::fprintf(stderr, "[spubig] core %d bytes %u autoDma %d chcr 0x%x%c", core, static_cast<unsigned>(transferWords * 4u), autoDma ? 1 : 0, value, 10);
+            }
+        }
         DmaStart start{
             secondCore ? kDmaSpu1Irq : kDmaSpu0Irq,
             core,

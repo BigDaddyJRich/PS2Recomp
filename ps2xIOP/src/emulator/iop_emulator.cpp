@@ -270,6 +270,59 @@ namespace ps2x::iop::detail
 
         ImportDisposition dispatchImport(const IopImportCall &call, CpuState &cpu)
         {
+            // HCTP: libsd's sceSdInit (libsd:4) clears the handler registrations (transfer-done / SPU2 interrupt
+            // callbacks). HCTP's CSL sound server registers its transfer handler (libsd:26) as the EE starts it;
+            // on the PS2 that lands after the CRI ADX driver's sceSdInit, here (RPCs handled at once) before it -
+            // the registration was wiped, every sound-bank upload stopped after its first 32 KB chunk and in-match
+            // hit sounds played from empty sound memory. Registrations made before a later sceSdInit are replayed
+            // before the next transfer (libsd:17 / :18). HCTP_SD_NOREPLAY=1 = old behaviour.
+            if (iequals(call.library, "libsd") && !sdReplaying)
+            {
+                if (call.ordinal == 4u || call.ordinal == 21u || call.ordinal == 22u || call.ordinal == 26u || call.ordinal == 27u)
+                    std::fprintf(stderr, "[sd-reg] libsd:%u a0=0x%x a1=0x%x a2=0x%x ra=0x%x cyc=%llu%c", static_cast<unsigned>(call.ordinal),
+                                 cpu.gpr[4], cpu.gpr[5], cpu.gpr[6], cpu.gpr[31], static_cast<unsigned long long>(totalCycles), 10);
+                static const bool noReplay = std::getenv("HCTP_SD_NOREPLAY") != nullptr;
+                if (!noReplay)
+                {
+                    if (call.ordinal == 4u)
+                        sdReplayPending = !sdRegistrations.empty();
+                    else if (sdReplayPending && (call.ordinal == 17u || call.ordinal == 18u)) // a transfer: sceSdInit (which waits midway) is long done
+                    {
+                        sdReplayPending = false;
+                        sdReplaying = true;
+                        for (const auto &kv : sdRegistrations)
+                        {
+                            const SdRegistration &r = kv.second;
+                            (void)callFunction(r.guest, r.a0, r.a1, r.a2, 0u, r.gp);
+                            std::fprintf(stderr, "[sd-replay] libsd:%u(0x%x, 0x%x, 0x%x) re-applied after sceSdInit%c",
+                                         static_cast<unsigned>(kv.first >> 8), r.a0, r.a1, r.a2, 10);
+                        }
+                        sdReplaying = false;
+                    }
+                }
+                if (!noReplay && (call.ordinal == 21u || call.ordinal == 22u || call.ordinal == 26u || call.ordinal == 27u))
+                {
+                    const uint32_t a0 = cpu.gpr[4], a1 = cpu.gpr[5], a2 = cpu.gpr[6], gp = cpu.gpr[28];
+                    const uint32_t key = (call.ordinal << 8) | (call.ordinal == 22u || call.ordinal == 27u ? 0u : (a0 & 0xFFu));
+                    const ImportDisposition d = dispatchImportTraced(call, cpu);
+                    if (d == ImportDisposition::JumpToGuest)
+                        sdRegistrations[key] = SdRegistration{cpu.pc, a0, a1, a2, gp};
+                    return d;
+                }
+            }
+            return dispatchImportTraced(call, cpu);
+        }
+
+        struct SdRegistration
+        {
+            uint32_t guest, a0, a1, a2, gp;
+        };
+        std::map<uint32_t, SdRegistration> sdRegistrations;
+        bool sdReplayPending = false;
+        bool sdReplaying = false;
+
+        ImportDisposition dispatchImportTraced(const IopImportCall &call, CpuState &cpu)
+        {
             // VENDETTA_IOPLOG=1: every IOP module call into the kernel / SIF / sound libraries, with its result.
             static const bool trace = std::getenv("VENDETTA_IOPLOG") != nullptr;
             // (Checked before the name compares below, which only matter for the log.)
@@ -728,6 +781,23 @@ namespace ps2x::iop::detail
         // Not that good to use exception handling for control flow but will do for now
         void servicePendingDmaInterrupts()
         {
+            {
+                // HCTP_IOPDUMP_SEC=N: write IOP RAM to iop_ram.bin once, N seconds after the first call (diag)
+                static const int dumpSec = std::getenv("HCTP_IOPDUMP_SEC") ? std::atoi(std::getenv("HCTP_IOPDUMP_SEC")) : 0;
+                static const auto t0 = std::chrono::steady_clock::now();
+                static bool dumped = false;
+                if (dumpSec > 0 && !dumped && std::chrono::steady_clock::now() - t0 > std::chrono::seconds(dumpSec))
+                {
+                    dumped = true;
+                    const std::span<const uint8_t> ram = memory.ram();
+                    if (FILE *f = std::fopen("iop_ram.bin", "wb"))
+                    {
+                        std::fwrite(ram.data(), 1, ram.size(), f);
+                        std::fclose(f);
+                    }
+                    std::fprintf(stderr, "[iopdump] wrote iop_ram.bin (%zu bytes)%c", ram.size(), 10);
+                }
+            }
             // Before dmaDueFloor nothing in the list is due, and a walk that finds nothing due changes nothing.
             if (servicingDmaInterrupts || totalCycles < dmaDueFloor)
                 return;

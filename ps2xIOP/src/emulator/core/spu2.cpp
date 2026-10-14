@@ -209,6 +209,12 @@ namespace ps2x::iop::detail
         case 0x1A8u:
         case 0x1AAu:
             core.transferAddress = composeAddress(reg(base + 0x1A8u), reg(base + 0x1AAu));
+            if (voiceLogEnabled() && local == 0x1AAu)
+            {
+                static int tsaLines = 0; // HCTP: upload start addresses (bank-load diagnosis)
+                if (tsaLines++ < 3000)
+                    std::fprintf(stderr, "[sputsa] core %d TSA 0x%05X%c", coreIndex, core.transferAddress, 10);
+            }
             break;
         case 0x2E0u: // ESA: a new effects area starts at its beginning
         case 0x2E2u:
@@ -249,11 +255,12 @@ namespace ps2x::iop::detail
             voice.peak = 0;
             core.endFlags &= ~(1u << index);
             if (voiceLogEnabled())
-                std::fprintf(stderr, "[spu] at sample %llu core %d voice %d key on: start 0x%05X loop 0x%05X%s pitch 0x%04X adsr 0x%04X/0x%04X vol 0x%04X/0x%04X\n",
+                std::fprintf(stderr, "[spu] at sample %llu core %d voice %d key on: start 0x%05X loop 0x%05X%s pitch 0x%04X adsr 0x%04X/0x%04X vol 0x%04X/0x%04X nz %u/256\n",
                              static_cast<unsigned long long>(m_nextSampleCycle / kIopCyclesPerSample),
                              coreIndex, index, voice.nextAddress, voice.loopAddress, voice.loopLocked ? " (set)" : "",
                              reg(base + static_cast<uint32_t>(index) * 0x10u + 4u), reg(base + static_cast<uint32_t>(index) * 0x10u + 6u),
-                             reg(base + static_cast<uint32_t>(index) * 0x10u + 8u), voice.left.reg, voice.right.reg);
+                             reg(base + static_cast<uint32_t>(index) * 0x10u + 8u), voice.left.reg, voice.right.reg,
+                             [&] { unsigned nz = 0; for (uint32_t i = 0; i < 256u; ++i) nz += m_ram[(voice.nextAddress + i) & kAddressMask] != 0u; return nz; }());
         }
     }
 
@@ -692,6 +699,19 @@ namespace ps2x::iop::detail
     void Spu2::dmaWrite(int coreIndex, const uint8_t *data, size_t bytes)
     {
         Core &core = m_cores[coreIndex & 1];
+        if (voiceLogEnabled() && core.transferAddress >= 0x2800u)
+        {
+            // HCTP: sound-memory uploads (bank loads) - in-match hit sounds play from empty SPU RAM
+            static int lines = 0;
+            if (lines < 3000)
+            {
+                ++lines;
+                size_t nz = 0;
+                for (size_t i = 0; i < bytes; ++i)
+                    nz += data[i] != 0u;
+                std::fprintf(stderr, "[spudma] core %d to 0x%05X bytes %zu nonzero %zu\n", coreIndex, core.transferAddress, bytes, nz);
+            }
+        }
         for (size_t i = 0; i + 1u < bytes; i += 2u)
         {
             m_ram[core.transferAddress] = static_cast<uint16_t>(data[i] | (data[i + 1u] << 8u));
