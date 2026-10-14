@@ -15,6 +15,9 @@
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
 #include "ps2_host_backend.h"
+#if defined(PS2X_NATIVE_HOST)
+#include "runtime/gs/gs_d3d11_backend.h"
+#endif
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
 
@@ -712,6 +715,14 @@ static bool UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         s_frameTextureFilter = wantedFilter;
         SetTextureFilter(tex, s_frameTextureFilter);
     }
+#if defined(PS2X_NATIVE_HOST)
+    if (GSD3D11Backend::IsActive())
+    {
+        outWidth = FB_WIDTH;
+        outHeight = DEFAULT_DISPLAY_HEIGHT;
+        return GSD3D11Backend::TakeFreshFrame(); // DrawTexturePro (host/raylib_shim.cpp) shows it
+    }
+#endif
     if (rt->gs().showsGpuPicture())
         return UploadGpuFrame(tex, rt, outWidth, outHeight);
     // back from the graphics card's picture (VENDETTA_GS=both, switched in the debug panel): the CPU picture's texture
@@ -1069,6 +1080,30 @@ bool PS2Runtime::initialize(const char *title)
         }
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
+#elif defined(PS2X_NATIVE_HOST)
+        {
+            // HCTP native-renderer build: Win32 window + Direct3D 11 + XInput + XAudio2 (host/win32_host.cpp,
+            // settings in hctp_native.ini next to the game, defaults without it). HCTP_RENDERER=cpu: the CPU GS renderer
+            // (its picture shown through the same window), else the Direct3D 11 GS renderer.
+            const ps2_host_settings::Settings &settings = ps2_host_settings::get();
+            ps2host::loadConfig("hctp_native.ini");
+            if (!ps2host::init(title))
+            {
+                std::cerr << "Failed to initialize the native Direct3D 11 host" << std::endl;
+                return false;
+            }
+            m_audioBackend.setAudioReady(ps2host::audioReady());
+            if (ps2host::audioReady())
+                SetMasterVolume(static_cast<float>(settings.volume) / 100.0f);
+            const char *renderer = std::getenv("HCTP_RENDERER");
+            if (!renderer || std::strcmp(renderer, "cpu") != 0)
+            {
+                m_gs.setRasterBackend(std::make_unique<GSD3D11Backend>());
+                std::cerr << "[runtime] GS: Direct3D 11 renderer (native host)" << std::endl;
+            }
+            else
+                std::cerr << "[runtime] GS: CPU renderer (native host, HCTP_RENDERER=cpu)" << std::endl;
+        }
 #else
         const ps2_host_settings::Settings &settings = ps2_host_settings::get();
         // Made hidden, sized / made fullscreen as the settings ask, painted black, then shown: a window shown at once

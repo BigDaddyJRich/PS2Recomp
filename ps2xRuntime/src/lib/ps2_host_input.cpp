@@ -2,7 +2,7 @@
 // (see ps2_host_input.h).
 
 #include "ps2_host_input.h"
-#include "raylib.h"
+#include "ps2_host_backend.h"
 
 #if defined(PS2X_HAS_GLFW)
 #define GLFW_INCLUDE_NONE

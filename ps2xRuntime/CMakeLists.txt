@@ -16,6 +16,12 @@ option(PS2X_ENABLE_IOP_RPC_TRACE "Log unhandled IOP/SIF RPC trace suggestions" O
 option(PS2X_STRICT_RETURN_DIAGNOSTICS "Route generated JR $ra returns through runtime branch diagnostics" OFF)
 option(PS2X_SHOW_WINDOWS_CONSOLE "Show a console window for ps2EntryRunner on Windows release builds" ON)
 option(PS2X_ENABLE_DEBUG_UI "Build the desktop runtime debug UI" ON)
+# Native Windows host (HCTP native-renderer build, build-native.bat): Win32 window + Direct3D 11 GS renderer + XInput +
+# XAudio2 instead of raylib (host/win32_host.cpp, host/raylib_shim.cpp, gs/gs_d3d11_backend.cpp; from Crush Hour PC).
+option(PS2X_NATIVE_HOST "Native Win32/D3D11/XAudio2/XInput host instead of raylib" OFF)
+if(PS2X_NATIVE_HOST)
+    set(PS2X_ENABLE_DEBUG_UI OFF CACHE BOOL "" FORCE)
+endif()
 
 if(PS2X_ENABLE_SCCACHE)
     find_program(PS2X_SCCACHE_PROGRAM sccache)
@@ -65,6 +71,8 @@ if(PS2X_IS_VITA)
     endif()
 
     include("${PS2X_VITASDK}/share/vita.cmake" REQUIRED)
+elseif(PS2X_NATIVE_HOST)
+    include(FetchContent)
 else()
     include(FetchContent)
     set(FETCHCONTENT_QUIET FALSE)
@@ -234,6 +242,8 @@ if(PS2X_IS_VITA)
         c
         pthread
     )
+elseif(PS2X_NATIVE_HOST)
+    target_link_libraries(ps2_host_backend INTERFACE d3d11 dxgi d3dcompiler xaudio2 xinput winmm)
 else()
     target_link_libraries(ps2_host_backend INTERFACE raylib)
 
@@ -554,6 +564,15 @@ target_include_directories(ps2_runtime PUBLIC
 )
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+if(PS2X_NATIVE_HOST)
+    target_sources(ps2_runtime PRIVATE src/lib/host/win32_host.cpp src/lib/host/raylib_shim.cpp src/lib/gs/gs_d3d11_backend.cpp)
+    # private: the (huge) recompiled runner is not rebuilt when the host changes; only the game overrides use the
+    # host API (the native ADX music's audio streams)
+    target_compile_definitions(ps2_runtime PRIVATE PS2X_NATIVE_HOST=1 NOMINMAX WIN32_LEAN_AND_MEAN)
+    set_source_files_properties(src/runner/hctp_overrides.cpp PROPERTIES
+        SKIP_UNITY_BUILD_INCLUSION ON
+        COMPILE_DEFINITIONS "PS2X_NATIVE_HOST=1;NOMINMAX;WIN32_LEAN_AND_MEAN")
+endif()
 if(WIN32)
     target_link_libraries(ps2_runtime PRIVATE xinput) # the pads' motors on the PC's controllers (ps2_pad_rumble)
     target_link_libraries(ps2_runtime PRIVATE winhttp) # the update check at start (ps2_host_update)

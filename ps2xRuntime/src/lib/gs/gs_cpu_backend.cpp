@@ -1085,6 +1085,22 @@ uint32_t GSCpuBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32
     return ReadVramUnlocked(psm, base, bw, x, y);
 }
 
+void GSCpuBackend::ReadVramRect(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x0, uint32_t y0, uint32_t w, uint32_t h,
+                                uint32_t *out) const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    FlushQueueUnlocked(ps2_host_profile::GsFlushReadback);
+    if (!m_vram)
+    {
+        std::fill(out, out + static_cast<size_t>(w) * h, 0u);
+        return;
+    }
+    const ReadVramFunc fn = m_readVramFuncs[psm & 0x3Fu];
+    for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x)
+            *out++ = fn(m_vram, base, bw, x0 + x, y0 + y);
+}
+
 namespace
 {
     // The reads / writes m_readVramFuncs / m_writeVramFuncs make for the frame and depth formats drawing uses most

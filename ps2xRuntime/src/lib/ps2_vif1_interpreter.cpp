@@ -7,6 +7,97 @@
 #include "runtime/ps2_vu_code_log.h"
 #include <cstring>
 #include <vector>
+#include <chrono>
+#include <map>
+#include <string>
+
+// HCTP diag (HCTP_VU1MAP=1): the VU1 program map for the native renderer. At every MSCAL: which program starts (start
+// pc + the first code words there, matched to tools\vu1_dump.py's listings offline), the VIF UNPACKs sent since the
+// previous MSCAL (format = the vertex layout the program reads), and for the first 2 starts of each program a hex dump
+// of VU1 data memory from TOP (its input batch). Every 5 s: starts per program.
+namespace
+{
+    struct HctpVu1MapUnpack
+    {
+        uint8_t opcode;
+        uint8_t num;
+        uint16_t imm;
+    };
+    std::vector<HctpVu1MapUnpack> g_hctpVu1MapUnpacks;
+    std::map<uint64_t, uint64_t> g_hctpVu1MapStarts;
+    std::map<uint64_t, uint32_t> g_hctpVu1MapDumped;
+    std::chrono::steady_clock::time_point g_hctpVu1MapLast;
+
+    bool hctpVu1MapOn()
+    {
+        static const bool on = [] { const char *v = std::getenv("HCTP_VU1MAP"); return v && v[0] == '1'; }();
+        return on;
+    }
+
+    const char *hctpUnpackName(uint8_t opcode)
+    {
+        static const char *names[16] = {"S-32", "S-16", "S-8", "?", "V2-32", "V2-16", "V2-8", "?",
+                                        "V3-32", "V3-16", "V3-8", "?", "V4-32", "V4-16", "V4-8", "V4-5"};
+        return names[opcode & 0xF];
+    }
+
+    void hctpVu1MapStart(const uint8_t *vuCode, const uint8_t *vuData, uint32_t startPc, uint32_t top, uint32_t itop)
+    {
+        uint32_t w[4] = {};
+        if (vuCode && startPc + 16u <= 0x4000u)
+            std::memcpy(w, vuCode + startPc, 16);
+        // the key: pc + the code there (the overlays at 0x2a00 differ in their words)
+        const uint64_t key = (static_cast<uint64_t>(startPc) << 48) ^ (static_cast<uint64_t>(w[0]) << 16) ^ w[1] ^
+                             (static_cast<uint64_t>(w[2]) << 32) ^ w[3];
+        ++g_hctpVu1MapStarts[key];
+        uint32_t &dumped = g_hctpVu1MapDumped[key];
+        if (dumped < 2u)
+        {
+            ++dumped;
+            char line[2048];
+            int n = std::snprintf(line, sizeof(line), "[vu1map] start pc=0x%04x code=%08x %08x %08x %08x key=%016llx top=0x%x itop=0x%x unpacks:",
+                                  startPc, w[0], w[1], w[2], w[3], static_cast<unsigned long long>(key), top, itop);
+            for (size_t i = 0; i < g_hctpVu1MapUnpacks.size() && i < 24 && n < 1900; ++i)
+            {
+                const HctpVu1MapUnpack &u = g_hctpVu1MapUnpacks[i];
+                n += std::snprintf(line + n, sizeof(line) - n, " %s%s%s x%u @0x%x", hctpUnpackName(u.opcode),
+                                   (u.imm & 0x4000u) ? "u" : "", (u.opcode & 0x10u) ? "m" : "", u.num ? u.num : 256u,
+                                   u.imm & 0x3FFu);
+            }
+            std::fprintf(stderr, "%s%c", line, 10);
+            if (vuData)
+            {
+                for (uint32_t q = 0; q < 40u; ++q)
+                {
+                    const uint32_t addr = ((top + q) & 0x3FFu) * 16u;
+                    uint32_t v[4];
+                    std::memcpy(v, vuData + addr, 16);
+                    float f[4];
+                    std::memcpy(f, v, 16);
+                    std::fprintf(stderr, "[vu1map]   +%02u %08x %08x %08x %08x | %g %g %g %g%c", q, v[0], v[1], v[2], v[3],
+                                 f[0], f[1], f[2], f[3], 10);
+                }
+            }
+        }
+        g_hctpVu1MapUnpacks.clear();
+        const auto now = std::chrono::steady_clock::now();
+        if (now - g_hctpVu1MapLast > std::chrono::seconds(5))
+        {
+            g_hctpVu1MapLast = now;
+            std::string out = "[vu1map] starts:";
+            for (const auto &kv : g_hctpVu1MapStarts)
+            {
+                char b[64];
+                std::snprintf(b, sizeof(b), " %04x/%08llx=%llu", static_cast<unsigned>(kv.first >> 48),
+                              static_cast<unsigned long long>(kv.first & 0xFFFFFFFFull),
+                              static_cast<unsigned long long>(kv.second));
+                out += b;
+            }
+            std::fprintf(stderr, "%s%c", out.c_str(), 10);
+            g_hctpVu1MapStarts.clear();
+        }
+    }
+}
 
 enum VIFCmd : uint8_t
 {
@@ -353,6 +444,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         uint8_t opcode = (cmd >> 24) & 0x7F;
         uint16_t imm = cmd & 0xFFFF;
         uint8_t num = (cmd >> 16) & 0xFF;
+        if ((opcode & 0x60u) == 0x60u && hctpVu1MapOn())
+            g_hctpVu1MapUnpacks.push_back({opcode, num, imm});
         const bool irq = (cmd & 0x80000000u) != 0u;
 
         // HCTP diag (VENDETTA_VU1_STAT): the last VIF codes (dumped by the VU1 side, see hctpDumpVifTrace)
@@ -439,6 +532,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
             vif1_regs.stat ^= (1u << 7); // toggle DBF
 
+            if (hctpVu1MapOn())
+                hctpVu1MapStart(m_vu1Code, m_vu1Data, startPC, runTop, runItop);
             if (m_vu1MscalCallback)
                 m_vu1MscalCallback(startPC, runTop, runItop);
             continue;
