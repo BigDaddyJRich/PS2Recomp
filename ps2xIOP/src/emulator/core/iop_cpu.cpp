@@ -1,6 +1,7 @@
 #include "iop_cpu.h"
 #include "iop_memory.h"
 
+#include <cstring>
 #include <limits>
 
 namespace ps2x::iop::detail
@@ -55,7 +56,14 @@ namespace ps2x::iop::detail
     bool IopCpuCore::executeInstruction(IopCpuState &cpu)
     {
         const uint32_t pc = cpu.pc;
-        const uint32_t instruction = m_memory.read32(pc);
+        // fetch: straight from RAM when the pc is there (always for module code), else through the memory map
+        uint32_t instruction;
+        const uint32_t fetchPhys = pc & 0x1FFFFFFCu;
+        const std::span<const uint8_t> fetchRam = m_memory.ram();
+        if ((pc & 3u) == 0u && fetchPhys + 4u <= fetchRam.size())
+            std::memcpy(&instruction, fetchRam.data() + fetchPhys, sizeof(instruction));
+        else
+            instruction = m_memory.read32(pc);
         const bool wasDelaySlot = cpu.branchPending;
         const uint32_t priorBranchTarget = cpu.branchTarget;
 

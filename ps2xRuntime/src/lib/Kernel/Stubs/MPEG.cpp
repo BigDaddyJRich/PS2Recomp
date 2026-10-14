@@ -2416,9 +2416,22 @@ namespace ps2_stubs
 
     void sceMpegDelete(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)rdram;
-
         const uint32_t mpegAddr = getRegU32(ctx, 4);
+        // HCTP: free the 0x600 work block sceMpegCreate took from the 28 KB kernel arena (mpeg+0x40 -> work,
+        // work+0x44 -> block). Leaked once per movie, it filled the arena after ~10 movies.
+        if (const uint8_t *m = getConstMemPtr(rdram, mpegAddr + 0x40u))
+        {
+            uint32_t work = 0u, block = 0u;
+            std::memcpy(&work, m, 4);
+            if (const uint8_t *w = work ? getConstMemPtr(rdram, work + 0x44u) : nullptr)
+                std::memcpy(&block, w, 4);
+            if (block >= 0x41000u && block < 0xA0000u)
+            {
+                runtime->guestFree(block);
+                if (uint8_t *wp = getMemPtr(rdram, work + 0x44u))
+                    std::memset(wp, 0, 4);
+            }
+        }
         {
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
             g_mpeg_stub_state.callbacksByMpeg.erase(mpegAddr);

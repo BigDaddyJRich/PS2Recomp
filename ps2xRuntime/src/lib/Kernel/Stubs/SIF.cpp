@@ -1,3 +1,8 @@
+#include <array>
+#include <mutex>
+#include <cstdio>
+#include <chrono>
+#include <map>
 #include "Common.h"
 #include "SIF.h"
 #include "../Syscalls/RPC.h"
@@ -203,11 +208,45 @@ namespace ps2_stubs
         seedDefaultSifRegsLocked();
     }
 
+    bool dispatchSifCommandImpl(uint8_t *, PS2Runtime *, uint32_t, const void *, size_t) noexcept;
+    // HCTP DIAG [sifcmd]: IOP->EE SIF commands per cid every ~5 s: sent / dropped / handled (onComplete ran)
+    namespace
+    {
+        std::mutex g_sifCmdMonMutex;
+        std::map<uint32_t, std::array<uint64_t, 3>> g_sifCmdMon;
+        void sifCmdMon(uint32_t cid, int what)
+        {
+            static auto next = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            std::lock_guard<std::mutex> lock(g_sifCmdMonMutex);
+            ++g_sifCmdMon[cid][what];
+            if (what == 1)
+                std::fprintf(stderr, "[sifcmd] DROP cid 0x%x%c", cid, 10);
+            if (std::chrono::steady_clock::now() < next)
+                return;
+            next += std::chrono::seconds(5);
+            std::fprintf(stderr, "[sifcmd] totals (sent/dropped/handled):");
+            for (const auto &[c, n] : g_sifCmdMon)
+                std::fprintf(stderr, " 0x%x=%llu/%llu/%llu", c, (unsigned long long)n[0], (unsigned long long)n[1], (unsigned long long)n[2]);
+            std::fprintf(stderr, "%c", 10);
+        }
+    }
+
     bool dispatchSifCommand(uint8_t *rdram,
                             PS2Runtime *runtime,
                             uint32_t commandId,
                             const void *packet,
                             size_t packetSize) noexcept
+    {
+        const bool delivered = dispatchSifCommandImpl(rdram, runtime, commandId, packet, packetSize);
+        sifCmdMon(commandId, delivered ? 0 : 1);
+        return delivered;
+    }
+
+    bool dispatchSifCommandImpl(uint8_t *rdram,
+                                PS2Runtime *runtime,
+                                uint32_t commandId,
+                                const void *packet,
+                                size_t packetSize) noexcept
     {
         static const bool trace = std::getenv("VENDETTA_IOPLOG") != nullptr;
         if (!rdram || !runtime || !packet || packetSize < 16u || packetSize > 112u)
@@ -271,9 +310,10 @@ namespace ps2_stubs
             SET_GPR_U32(&invocation.context, 7, 0u);
             SET_GPR_U32(&invocation.context, 29, 0u);
             SET_GPR_U32(&invocation.context, 31, 0u);
-            invocation.onComplete = [runtime, packetAddress](const R5900Context &, R5900Context &)
+            invocation.onComplete = [runtime, packetAddress, commandId](const R5900Context &, R5900Context &)
             {
                 runtime->guestFree(packetAddress);
+                sifCmdMon(commandId, 2);
             };
             runtime->eeScheduler().queueInvocation(std::move(invocation));
             return true;
@@ -732,6 +772,30 @@ namespace ps2_stubs
             }
         }
 
+        {
+            // HCTP DIAG [sifmon]: EE->IOP SIF DMA every ~5 s: calls, failures, bytes per destination 64 KB page
+            static std::mutex monMutex;
+            static std::map<uint32_t, uint64_t> bytesByPage;
+            static uint32_t calls = 0u, fails = 0u;
+            static auto next = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            std::lock_guard<std::mutex> monLock(monMutex);
+            ++calls;
+            if (!ok)
+                ++fails;
+            else
+                for (uint32_t k = 0; k < pendingCount; ++k)
+                    bytesByPage[pending[k].dest >> 16] += static_cast<uint32_t>(pending[k].size);
+            if (std::chrono::steady_clock::now() >= next)
+            {
+                next += std::chrono::seconds(5);
+                std::fprintf(stderr, "[sifmon] calls %u fails %u (last dmat 0x%x count %u):", calls, fails, dmatAddr, count);
+                for (const auto &[page, bytes] : bytesByPage)
+                    std::fprintf(stderr, " %x0000=%llu", page, static_cast<unsigned long long>(bytes));
+                std::fprintf(stderr, "%c", 10);
+                bytesByPage.clear();
+                calls = fails = 0u;
+            }
+        }
         if (!ok)
         {
             static uint32_t warnCount = 0;

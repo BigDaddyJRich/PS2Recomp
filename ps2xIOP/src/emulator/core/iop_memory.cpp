@@ -2,6 +2,8 @@
 #include "iop_memory.h"
 
 #include <algorithm>
+#include <string>
+#include <vector>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -254,8 +256,58 @@ namespace ps2x::iop::detail
         return phys <= RamSize && size <= RamSize - phys;
     }
 
+    // HCTP DIAG: HCTP_IOPWATCH="addr:len[:z],..." (hex, up to 8) logs IOP RAM writes into those ranges with the
+    // IOP pc (0xEEEEEEEE = a write from the EE side, e.g. SIF DMA); ":z" = only writes that leave a zero word.
+    uint32_t g_hctpIopPc = 0u;
+    namespace
+    {
+        struct HctpWatch { uint32_t start, end; bool zeroOnly; };
+        std::vector<HctpWatch> &hctpWatches()
+        {
+            static std::vector<HctpWatch> w = []
+            {
+                std::vector<HctpWatch> out;
+                if (const char *e = std::getenv("HCTP_IOPWATCH"))
+                {
+                    std::string spec(e);
+                    size_t pos = 0;
+                    while (pos < spec.size() && out.size() < 8u)
+                    {
+                        size_t comma = spec.find(',', pos);
+                        std::string item = spec.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                        unsigned a = 0, l = 4;
+                        char z = 0;
+                        if (std::sscanf(item.c_str(), "%x:%x:%c", &a, &l, &z) >= 1)
+                            out.push_back({a, a + l, z == 'z'});
+                        if (comma == std::string::npos) break;
+                        pos = comma + 1;
+                    }
+                }
+                return out;
+            }();
+            return w;
+        }
+    }
+
     void IopMemory::markOwned(uint32_t address, size_t size)
     {
+        if (!hctpWatches().empty())
+        {
+            static uint32_t lines = 0u;
+            for (const HctpWatch &w : hctpWatches())
+            {
+                if (address >= w.end || address + size <= w.start || lines >= 4000u)
+                    continue;
+                const uint32_t a = std::max(address, w.start) & ~3u;
+                uint32_t word = 0;
+                if (a + 4u <= RamSize)
+                    std::memcpy(&word, m_ram.data() + a, 4);
+                if (w.zeroOnly && word != 0u)
+                    continue;
+                ++lines;
+                std::fprintf(stderr, "[iopwatch] pc 0x%x wrote 0x%x+%zu -> word@0x%x = %08x%c", g_hctpIopPc, address, size, a, word, 10);
+            }
+        }
         if (address > RamSize || size > RamSize - address)
             return;
         std::fill(m_owned.begin() + address, m_owned.begin() + address + size, uint8_t{1});
@@ -398,6 +450,19 @@ namespace ps2x::iop::detail
                     }
                 }
                 start.delayCycles = static_cast<uint64_t>(bytes / 4u) * kIopCyclesPerSpuFrame;
+                {
+                    // HCTP: [adma] every ~5 s per core: stream blocks fed and their peak (0 = the driver feeds silence)
+                    static uint32_t kicks[2] = {0u, 0u};
+                    static int peak[2] = {0, 0};
+                    for (int16_t v : start.pcm)
+                        peak[core & 1] = std::max(peak[core & 1], v < 0 ? -static_cast<int>(v) : static_cast<int>(v));
+                    if (++kicks[core & 1] >= 470u)
+                    {
+                        std::fprintf(stderr, "[adma] core %d blocks %u peak %d%c", core, kicks[core & 1], peak[core & 1], 10);
+                        kicks[core & 1] = 0u;
+                        peak[core & 1] = 0;
+                    }
+                }
             }
         }
         m_dmaStart = std::move(start);

@@ -12,6 +12,8 @@
 
 namespace ps2x::iop::detail
 {
+    extern uint32_t g_hctpIopPc; // HCTP diag: pc of the instruction being interpreted (HCTP_IOPWATCH)
+
     class IopMemory
     {
     public:
@@ -79,6 +81,8 @@ namespace ps2x::iop::detail
         void setInterruptControl(uint32_t value) noexcept { m_interruptControl = value & 1u; }
 
         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
+        // cheap per-instruction test before takeDmaStart (which moves an optional with a vector)
+        [[nodiscard]] bool hasDmaStart() const noexcept { return m_dmaStart.has_value(); }
         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
         [[nodiscard]] Spu2 &spu2() noexcept { return m_spu2; }
 

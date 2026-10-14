@@ -198,6 +198,8 @@ namespace ps2x::iop::detail
 
         void schedulePendingDma()
         {
+            if (!memory.hasDmaStart())
+                return;
             if (const auto dma = memory.takeDmaStart())
             {
                 // A new completion: the floor must stay at or below it, and the idle skip must look again.
@@ -671,7 +673,9 @@ namespace ps2x::iop::detail
                 return !cpu.stopped;
             }
 
+            g_hctpIopPc = cpu.pc;
             const bool running = cpuCore.executeInstruction(cpu);
+            g_hctpIopPc = 0xEEEEEEEEu;
             schedulePendingDma();
             ++totalInstructions;
             ++totalCycles;
@@ -796,6 +800,30 @@ namespace ps2x::iop::detail
                         std::fclose(f);
                     }
                     std::fprintf(stderr, "[iopdump] wrote iop_ram.bin (%zu bytes)%c", ram.size(), 10);
+                }
+                // HCTP: a file "iop_dump_now" in the game folder -> iop_ram_N.bin + every IOP thread's state (diag)
+                static uint32_t pollTick = 0u;
+                static int dumpIndex = 0;
+                if ((++pollTick & 0xFFFu) == 0u)
+                {
+                    if (FILE *flag = std::fopen("iop_dump_now", "rb"))
+                    {
+                        std::fclose(flag);
+                        std::remove("iop_dump_now");
+                        char name[32];
+                        std::snprintf(name, sizeof(name), "iop_ram_%d.bin", dumpIndex++);
+                        const std::span<const uint8_t> ram = memory.ram();
+                        if (FILE *f = std::fopen(name, "wb"))
+                        {
+                            std::fwrite(ram.data(), 1, ram.size(), f);
+                            std::fclose(f);
+                        }
+                        std::fprintf(stderr, "[iopdump] %s at cycle %llu%c", name, static_cast<unsigned long long>(totalCycles), 10);
+                        for (const auto &[id, t] : kernel.threads())
+                            std::fprintf(stderr, "[iopthr] id %d state %d pc 0x%x ra 0x%x entry 0x%x prio %u wait %d bits 0x%x wake %llu%c",
+                                         id, static_cast<int>(t.state), t.cpu.pc, t.cpu.gpr[31], t.entry, t.priority, t.waitId,
+                                         t.waitBits, static_cast<unsigned long long>(t.wakeCycle), 10);
+                    }
                 }
             }
             // Before dmaDueFloor nothing in the list is due, and a walk that finds nothing due changes nothing.

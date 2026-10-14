@@ -124,8 +124,8 @@ namespace
     // kernel RAM (see Helpers/State.h): interrupt / callback stacks and the runtime's small buffers
     constexpr uint32_t kKernelCallbackStackFloor = 0x00048000u;
     constexpr uint32_t kKernelCallbackStackTop = 0x00080000u;
-    constexpr uint32_t kKernelArenaBase = 0x00041000u;
-    constexpr uint32_t kKernelArenaLimit = 0x00048000u;
+    constexpr uint32_t kKernelArenaBase = 0x00080000u; // HCTP: was 0x41000-0x48000 (28 KB): full -> 16 KB GS uploads spilled into the game heap
+    constexpr uint32_t kKernelArenaLimit = 0x000A0000u; // 128 KB, below the guest low pool (0xA0000)
 
     constexpr uint32_t COP0_CAUSE_EXCCODE_MASK = 0x0000007Cu;
     constexpr uint32_t COP0_CAUSE_BD = 0x80000000u;

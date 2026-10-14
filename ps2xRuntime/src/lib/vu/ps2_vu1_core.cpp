@@ -1,4 +1,6 @@
 #include <chrono>
+#include <vector>
+#include <mutex>
 #include <unordered_map>
 #include <intrin.h>
 #include <bit>
@@ -33,6 +35,10 @@ namespace
     // The rounding mode of runLoop's caller: VU arithmetic runs round-toward-zero, but the GIF packets it kicks are
     // processed (front end, drawing) in the caller's mode like every other path to the GS.
     thread_local int t_callerRoundingMode = FE_TONEAREST;
+    thread_local int t_vuRoundingMode = FE_TOWARDZERO; // the mode run() set (no fegetround per XGKICK)
+    // raw words of each decoded pair per interpreter: an upload of unchanged code re-decodes nothing
+    std::unordered_map<const void *, std::vector<uint64_t>> g_decodedRawWords;
+    std::mutex g_decodedRawWordsMutex;
 }
 
 void hctpDumpVifTrace(const char *why);
@@ -1132,7 +1138,7 @@ void VU1Interpreter::finishXgkick()
         m_xgkick.active = false;
         return;
     }
-    const int vuRoundingMode = std::fegetround();
+    const int vuRoundingMode = t_vuRoundingMode;
     std::fesetround(t_callerRoundingMode);
     if (m_activeMemory)
         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
@@ -1937,9 +1943,16 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
     ps2_host_profile::count(ps2_host_profile::Vu1DecodeFull);
     const uint32_t pairCount = std::min<uint32_t>(codeSize / 8u, kMaxDecodedPairs);
     bool readsMacStatus = false;
+    std::vector<uint64_t> *raw = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_decodedRawWordsMutex);
+        raw = &g_decodedRawWords[this];
+    }
+    raw->assign(kMaxDecodedPairs, 0u);
     for (uint32_t i = 0; i < pairCount; ++i)
     {
         m_decodedCodeCache[i] = decodeInstructionPair(vuCode, i * 8u);
+        std::memcpy(&(*raw)[i], vuCode + i * 8u, 8u);
         readsMacStatus = readsMacStatus || pairReadsMacStatus(m_decodedCodeCache[i].lower, m_decodedCodeCache[i].iBit);
     }
     m_codeReadsMacStatus = readsMacStatus;
@@ -1979,10 +1992,35 @@ bool VU1Interpreter::ensureDecodedCodeCache(const uint8_t *vuCode, uint32_t code
         {
             ps2_host_profile::count(ps2_host_profile::Vu1DecodePartial);
             const uint32_t pairCount = std::min<uint32_t>(codeSize / 8u, kMaxDecodedPairs);
-            const uint32_t first = std::min(begin / 8u, pairCount);
-            const uint32_t last = std::min((end + 7u) / 8u, pairCount);
+            uint32_t first = std::min(begin / 8u, pairCount);
+            uint32_t last = std::min((end + 7u) / 8u, pairCount);
+            // HCTP: only pairs whose words really changed (the game re-uploads identical programs many times a frame)
+            std::vector<uint64_t> *raw = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(g_decodedRawWordsMutex);
+                raw = &g_decodedRawWords[this];
+            }
+            if (raw->size() < kMaxDecodedPairs)
+                raw->assign(kMaxDecodedPairs, ~0ull);
+            uint32_t changedFirst = last, changedLast = first;
             for (uint32_t i = first; i < last; ++i)
+            {
+                uint64_t words;
+                std::memcpy(&words, vuCode + i * 8u, 8u);
+                if (words == (*raw)[i])
+                    continue;
+                (*raw)[i] = words;
                 m_decodedCodeCache[i] = decodeInstructionPair(vuCode, i * 8u);
+                changedFirst = std::min(changedFirst, i);
+                changedLast = i + 1u;
+            }
+            if (changedFirst >= changedLast)
+            {
+                m_cachedCodeGeneration = generation; // nothing changed: decode, MAC reads and compiled entries stand
+                return true;
+            }
+            first = changedFirst;
+            last = changedLast;
             bool readsMacStatus = false;
             for (uint32_t i = 0; i < pairCount && !readsMacStatus; ++i)
                 readsMacStatus = pairReadsMacStatus(m_decodedCodeCache[i].lower, m_decodedCodeCache[i].iBit);
@@ -2265,6 +2303,8 @@ void VU1Interpreter::runLoop(uint8_t *vuCode, uint32_t codeSize,
     if (previousRoundingMode != -1)
         t_callerRoundingMode = previousRoundingMode;
     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
+    const int outerVuRoundingMode = t_vuRoundingMode;
+    t_vuRoundingMode = useVuRounding ? FE_TOWARDZERO : previousRoundingMode;
     // VENDETTA_VU1_EXACT="0x1d60-0x27b0,...": runs that start in these VU code byte ranges use the exact (queued
     // register write) model, the rest fast - to bisect which program the fast model gets wrong (HCTP: in-ring gloss
     // and crowd placement right only with VENDETTA_VU1_FAST=0).
@@ -2684,6 +2724,7 @@ void VU1Interpreter::runLoop(uint8_t *vuCode, uint32_t codeSize,
     if (useVuRounding && previousRoundingMode != -1)
         std::fesetround(previousRoundingMode);
     t_callerRoundingMode = outerCallerRoundingMode;
+    t_vuRoundingMode = outerVuRoundingMode;
 }
 
 // ============================================================================
