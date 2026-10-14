@@ -268,10 +268,13 @@ namespace
         std::atomic<bool> playing{false};
         std::mutex m;
 
-        void submit(int index)
+        // silent = prime with zeros: PlayAudioStream runs on the caller's thread, which may hold the lock the
+        // callback takes (native ADX start) - raylib only calls the callback from its audio thread, so do the same.
+        void submit(int index, bool silent = false)
         {
             std::vector<uint8_t> &b = buffers[index];
-            AudioCallback cb;
+            AudioCallback cb = nullptr;
+            if (!silent)
             {
                 std::lock_guard lock(m);
                 cb = callback;
@@ -380,7 +383,7 @@ void PlayAudioStream(AudioStream stream)
     if (!s || !s->voice || s->playing.exchange(true))
         return;
     for (int i = 0; i < ShimStream::kBuffers; ++i)
-        s->submit(i);
+        s->submit(i, true);
     s->voice->Start();
 }
 

@@ -1819,6 +1819,13 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
         m_backend->LoadClut(t, m_texclut);
+        if (s_hudLog.phase == HudLog::Capturing)
+        {
+            char line[160];
+            std::snprintf(line, sizeof(line), "[hud] TEX0_%d tbp=%u tbw=%u psm=0x%x tw=%u th=%u cbp=%u cld=%u path=%u pk=%u\n", ci + 1,
+                          t.tbp0, t.tbw, t.psm, t.tw, t.th, t.cbp, t.cld, s_hudPath, s_hudPacket);
+            s_hudLog.text += line;
+        }
         static const bool texLog = std::getenv("VENDETTA_GSLOG") != nullptr;
         static uint32_t texLogs = 0u;
         if (texLog && texLogs < 3000u && (t.psm == 0x14u || t.psm == 0x13u))
