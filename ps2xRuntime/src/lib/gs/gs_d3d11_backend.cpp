@@ -64,6 +64,13 @@ namespace
 
     void pageSize(uint8_t psm, uint32_t &pw, uint32_t &ph)
     {
+        // PSMT8H / PSMT4HL / PSMT4HH live in the upper bits of a PSMCT32 buffer: 32-bit pages (64x32)
+        if (psm == GS_PSM_T8H || psm == GS_PSM_T4HL || psm == GS_PSM_T4HH)
+        {
+            pw = 64;
+            ph = 32;
+            return;
+        }
         switch (bitsPerPixel(psm))
         {
         case 16: pw = 64; ph = 64; break;
@@ -1164,7 +1171,25 @@ struct GSD3D11Backend::Impl
     ID3D11ShaderResourceView *decodedTexture(const GSDrawState &st, uint32_t &outW, uint32_t &outH)
     {
         const GSTex0Reg &t = st.context.tex0;
-        const uint32_t tw = st.textureWidth, th = st.textureHeight;
+        // REGION_CLAMP / REGION_REPEAT address texels beyond TW/TH (up to MAXU/MAXV, or MINU|MAXU for repeat):
+        // HCTP's 2D logos and fonts use a small TW/TH with a region clamp over the whole sheet. Decode that much.
+        uint32_t tw = st.textureWidth, th = st.textureHeight;
+        {
+            const uint64_t cl = st.context.clamp;
+            const uint32_t wms = static_cast<uint32_t>(cl & 3u), wmt = static_cast<uint32_t>((cl >> 2) & 3u);
+            const uint32_t minu = static_cast<uint32_t>((cl >> 4) & 0x3FFu), maxu = static_cast<uint32_t>((cl >> 14) & 0x3FFu);
+            const uint32_t minv = static_cast<uint32_t>((cl >> 24) & 0x3FFu), maxv = static_cast<uint32_t>((cl >> 34) & 0x3FFu);
+            if (wms == 2u)
+                tw = std::max<uint32_t>(tw, maxu + 1u);
+            else if (wms == 3u)
+                tw = std::max<uint32_t>(tw, (minu | maxu) + 1u);
+            if (wmt == 2u)
+                th = std::max<uint32_t>(th, maxv + 1u);
+            else if (wmt == 3u)
+                th = std::max<uint32_t>(th, (minv | maxv) + 1u);
+            tw = std::min<uint32_t>(tw, 1024u);
+            th = std::min<uint32_t>(th, 1024u);
+        }
         uint32_t first, last;
         pageSpan(t.tbp0, t.tbw, t.psm, 0, th, first, last);
         syncReason = "texture";
@@ -2029,7 +2054,19 @@ struct GSD3D11Backend::Impl
         const bool traceTexOk = (s_traceTbp < 0 || (pendingState.prim.tme && static_cast<long>(pendingState.context.tex0.tbp0) == s_traceTbp));
         // PS2X_GS_TRACE_ABE=1: only textured, alpha-blended draws (2D overlays / logos)
         static const bool s_traceAbe = std::getenv("PS2X_GS_TRACE_ABE") != nullptr;
-        const bool traceAbeOk = !s_traceAbe || (pendingState.prim.tme && pendingState.prim.abe);
+        bool traceAbeOk = !s_traceAbe || (pendingState.prim.tme && pendingState.prim.abe);
+        // PS2X_GS_TRACE_RECT=x0:y0:x1:y1: only draws whose bbox lies inside
+        static float s_rect[4] = {0, 0, 0, 0};
+        static const bool s_hasRect = std::getenv("PS2X_GS_TRACE_RECT") &&
+                                      std::sscanf(std::getenv("PS2X_GS_TRACE_RECT"), "%f:%f:%f:%f", &s_rect[0], &s_rect[1],
+                                                  &s_rect[2], &s_rect[3]) == 4;
+        if (s_hasRect && traceAbeOk && s_traced < s_traceLimit && traceTimeOk)
+            for (const Vtx &v : pending)
+                if (v.x < s_rect[0] || v.y < s_rect[1] || v.x > s_rect[2] || v.y > s_rect[3])
+                {
+                    traceAbeOk = false;
+                    break;
+                }
         if (s_traced < s_traceLimit && frameCounter >= s_traceFrame && traceTimeOk && traceTexOk && traceAbeOk && !pending.empty())
         {
             if (s_traced == 0)
@@ -2057,19 +2094,20 @@ struct GSD3D11Backend::Impl
             {
                 std::printf("[gs-verts]");
                 for (size_t i = 0; i < pending.size() && i < 8; ++i)
-                    std::printf(" (%.2f,%.2f,%.6f)", pending[i].x, pending[i].y, pending[i].z);
+                    std::printf(" (%.2f,%.2f,%.6f st %.4f,%.4f,%.5f)", pending[i].x, pending[i].y, pending[i].z, pending[i].s, pending[i].t, pending[i].q);
                 std::printf(" ");
             }
             std::printf("[gs-trace] #%llu n=%zu fbp=%u psm=%u fbmsk=%08x tme=%d tex=%u/%u psm=%u %ux%u tfx=%u tcc=%u abe=%d alpha=%llx test=%llx "
                         "sc=%u,%u-%u,%u v0=(%.1f,%.1f z=%.4f rgba=%.0f,%.0f,%.0f,%.0f st=%.3f,%.3f,%.3f) zte=%u ztst=%u zmsk=%d zbp=%u zpsm=%u "
-                        "clut=%u/%u csm=%u csa=%u fst=%d\n",
+                        "clut=%u/%u csm=%u csa=%u fst=%d clamp=%llx tex1=%llx\n",
                         static_cast<unsigned long long>(statDraws), pending.size(), c.frame.fbp, c.frame.psm, c.frame.fbmsk,
                         st.prim.tme ? 1 : 0, c.tex0.tbp0, c.tex0.tbw, c.tex0.psm, st.textureWidth, st.textureHeight,
                         c.tex0.tfx, c.tex0.tcc, st.prim.abe ? 1 : 0, static_cast<unsigned long long>(c.alpha),
                         static_cast<unsigned long long>(c.test), c.scissor.x0, c.scissor.y0, c.scissor.x1, c.scissor.y1,
                         v0.x, v0.y, v0.z, v0.r, v0.g, v0.b, v0.a, v0.s, v0.t, v0.q, ztest, ztst, c.zbuf.zmask ? 1 : 0, static_cast<unsigned>(c.zbuf.zbp), static_cast<unsigned>(c.zbuf.psm),
                         static_cast<unsigned>(c.tex0.cbp), static_cast<unsigned>(c.tex0.cpsm), static_cast<unsigned>(c.tex0.csm),
-                        static_cast<unsigned>(c.tex0.csa), st.prim.fst ? 1 : 0);
+                        static_cast<unsigned>(c.tex0.csa), st.prim.fst ? 1 : 0, static_cast<unsigned long long>(c.clamp),
+                        static_cast<unsigned long long>(c.tex1));
         }
 
         // Debug: PS2X_SKIP_CYCLE="tbp:psm,tbp:psm,..." hides one textured draw class at a time (4 s each,
