@@ -434,6 +434,23 @@ namespace ps2_host_settings
 
     void load(const char *programPath)
     {
+#if defined(PS2X_NATIVE_HOST)
+        // HCTP native build defaults (what run_hctp_native.bat used to set): the D3D11 renderer, the native VU1
+        // programs (p01-p04 stage 1, p08) and native ADX music. The environment still wins; HCTP_NATIVE_DEFAULTS=0
+        // turns them all off (VU1 emulation, CRI IOP audio).
+        if (!(std::getenv("HCTP_NATIVE_DEFAULTS") && std::getenv("HCTP_NATIVE_DEFAULTS")[0] == '0'))
+        {
+            fillSwitch("HCTP_RENDERER", "d3d11");
+            fillSwitch("HCTP_MOVIES", "1");
+            fillSwitch("HCTP_VU1_FAST", "1");
+            fillSwitch("HCTP_NATIVE_P08", "1");
+            fillSwitch("HCTP_NATIVE_P01", "1");
+            fillSwitch("HCTP_NATIVE_S1", "15");
+            fillSwitch("HCTP_S1_ANYHASH", "1");
+            fillSwitch("HCTP_NATIVE_ADX", "1");
+            fillSwitch("VENDETTA_EE_CYCLE_PCT", "100");
+        }
+#endif
         g_settings = Settings{};
         std::filesystem::path file;
         std::error_code error;
