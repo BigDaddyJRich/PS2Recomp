@@ -19,6 +19,13 @@ namespace
 {
     constexpr uint64_t kP08Hash = 0xcaf9bd881ee1d7ccull; // FNV-1a of p08's first 512 code bytes at VU 0x2a00
     constexpr uint32_t kP08LoopHead = 0x3010u;           // MSCNT for a later chunk resumes here
+    // p18 (same overlay slot): p08 without the colour-constant scaling, alpha from the vertex light .w, ST not
+    // multiplied by q (affine: STQ = (S + scroll, T + scroll, corner Q)); chunks that need clipping stay on the VU1
+    constexpr uint64_t kP18Hash = 0x0aa9d7fc6939ef27ull;
+    constexpr uint32_t kP18LoopHead = 0x2e30u;
+    int g_variant = 0; // 0 = p08, 1 = p18 (the chunk computeChunk last accepted)
+    bool g_p18 = false; // HCTP_NATIVE_P18=1
+    int g_p18PcLog = 0;
 
     struct Corner
     {
@@ -84,7 +91,7 @@ namespace
     // the spec for one p08 chunk -> g_expected, g_chunkClip; false when the overlay is not p08 / not a chunk
     bool computeChunk(const uint8_t *code, const uint8_t *data, const VU1State &st, uint32_t top)
     {
-        if (!code || !data || st.pc != kP08LoopHead)
+        if (!code || !data)
             return false;
         static uint64_t s_hashCode = 0, s_hash = 0;
         // the overlay at 0x2a00 changes rarely compared with the chunk rate: hash only when its first words change
@@ -95,8 +102,20 @@ namespace
             s_hashCode = sig;
             s_hash = codeHash(code);
         }
-        if (s_hash != kP08Hash)
+        if (s_hash == kP18Hash && g_p18 && g_p18PcLog < 12)
+        {
+            ++g_p18PcLog;
+            std::fprintf(stderr, "[nvu1] p18 candidate pc=0x%x top=0x%x%c", st.pc, top, 10);
+        }
+        if (st.pc != kP08LoopHead && st.pc != kP18LoopHead)
             return false;
+        if (s_hash == kP08Hash && st.pc == kP08LoopHead)
+            g_variant = 0;
+        else if (s_hash == kP18Hash && st.pc == kP18LoopHead && (g_p18 || g_on))
+            g_variant = 1;
+        else
+            return false;
+        const bool p18 = g_variant == 1;
 
         uint32_t header;
         std::memcpy(&header, data + (top & 0x3FFu) * 16u, 4);
@@ -104,8 +123,9 @@ namespace
         if (count == 0u || count > 48u)
             return false;
         const float *v1 = q(data, 1006), *v1007 = q(data, 1007), *mat = q(data, 1019), *scroll = q(data, 1009);
-        const float s1[4] = {v1[0] * 255.0f, v1[1] * 255.0f, v1[2] * 255.0f, v1[3] * 128.0f};
-        const float s2[4] = {v1007[0] * mat[0], v1007[1] * mat[1], v1007[2] * mat[2], v1007[3] * mat[3]};
+        const float s1[4] = {p18 ? v1[0] : v1[0] * 255.0f, p18 ? v1[1] : v1[1] * 255.0f, p18 ? v1[2] : v1[2] * 255.0f,
+                             p18 ? v1[3] : v1[3] * 128.0f};
+        const float s2[4] = {v1007[0] * mat[0], v1007[1] * mat[1], v1007[2] * mat[2], p18 ? 0.0f : v1007[3] * mat[3]};
         // clip constants as p08's setup left them: vf15.z = -2048, vf15.x = [1008].x - 2047, vf15.w = 2047,
         // vf11.w = 1024; vi8 = backface mode
         const float offXY = st.vf[15][2], offZ = st.vf[15][0];
@@ -121,7 +141,7 @@ namespace
             const float *c1 = q(data, top + 2u + 2u * k);
             const uint32_t idx = cornerIndex(data, top, k);
             const float *P = q(data, idx + 320u), *N = q(data, idx + 160u), *Lc = q(data, idx + 480u);
-            const float light[4] = {Lc[0], Lc[1], Lc[2], 1.0f};
+            const float light[4] = {Lc[0], Lc[1], Lc[2], p18 ? Lc[3] : 1.0f};
             Corner &o = g_expected[k];
             for (int c = 0; c < 4; ++c)
             {
@@ -133,7 +153,7 @@ namespace
             const float st3[3] = {c0[0] + scroll[0], c0[1] + scroll[1], c0[2]};
             for (int c = 0; c < 3; ++c)
             {
-                o.stq[c] = st3[c] * N[3];
+                o.stq[c] = p18 ? st3[c] : st3[c] * N[3];
                 o.st[c] = st3[c];
             }
             const float *V = q(data, idx);
@@ -317,6 +337,8 @@ void hctpNativeVu1Init()
     g_on = v && v[0] == '1';
     const char *n = std::getenv("HCTP_NATIVE_P08");
     g_native = n && n[0] == '1' && !g_on;
+    const char *n18 = std::getenv("HCTP_NATIVE_P18");
+    g_p18 = n18 && n18[0] == '1';
     if (g_on || g_native)
         std::fprintf(stderr, "[nvu1] p08 spec verify %d native %d%c", g_on ? 1 : 0, g_native ? 1 : 0, 10);
 }
@@ -328,7 +350,7 @@ bool hctpNativeVu1TryDraw(const uint8_t *code, uint8_t *data, const VU1State &st
     // HCTP_NATIVE_P08_CLIP=0: clipped chunks stay on the VU1 (p05/p06)
     static const char *s_clipEnv = std::getenv("HCTP_NATIVE_P08_CLIP");
     static const bool s_clip = !(s_clipEnv && s_clipEnv[0] == '0');
-    if (g_chunkClip && (!s_clip || !buildClipPacket(data, st, top)))
+    if (g_chunkClip && (g_variant != 0 || !s_clip || !buildClipPacket(data, st, top)))
     {
         ++g_vuChunks;
         return false;
@@ -402,9 +424,9 @@ void hctpNativeVu1AfterResume(const uint8_t *data)
         if (!(okStq && okRgba && okXyz) && g_dumped < 12)
         {
             ++g_dumped;
-            std::fprintf(stderr, "[nvu1] mismatch top=0x%x k=%u: stq vu %g %g %g / spec %g %g %g | rgba vu %d %d %d %d / spec %d %d %d %d"
+            std::fprintf(stderr, "[nvu1] mismatch p%d top=0x%x k=%u: stq vu %g %g %g / spec %g %g %g | rgba vu %d %d %d %d / spec %d %d %d %d"
                                  " | xyzf vu %d %d %d %x / spec %d %d %d %x%c",
-                         g_top, k, stq[0], stq[1], stq[2], e.stq[0], e.stq[1], e.stq[2], rgba[0], rgba[1], rgba[2], rgba[3],
+                         g_variant ? 18 : 8, g_top, k, stq[0], stq[1], stq[2], e.stq[0], e.stq[1], e.stq[2], rgba[0], rgba[1], rgba[2], rgba[3],
                          e.rgba[0], e.rgba[1], e.rgba[2], e.rgba[3], xyz[0], xyz[1], xyz[2], xyz[3], e.xyz[0], e.xyz[1],
                          e.xyz[2], e.xyz[3], 10);
         }
