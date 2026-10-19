@@ -25,4 +25,4 @@ void hctpNativeVu1Census(const uint8_t *code, uint32_t pc, bool mscal);
 // runs them instead of the VU1 (true = skip the VU1); HCTP_NATIVE_VERIFY=1 runs them on a copy and compares the GS
 // packets they would send with the ones the VU1 sends ([nvu1g] lines every 5 s).
 bool hctpNativeVu1MscalGeneric(const uint8_t *code, uint8_t *data, uint32_t startPC, GS &gs);
-void hctpNativeVu1AfterMscalGeneric();
+void hctpNativeVu1AfterMscalGeneric(const uint8_t *data = nullptr);

@@ -454,6 +454,7 @@ namespace ps2_host_settings
             fillSwitch("HCTP_NATIVE_P09", "1");
             fillSwitch("HCTP_NATIVE_P15", "1");
             fillSwitch("HCTP_NATIVE_LINES", "1");
+            fillSwitch("HCTP_NATIVE_P07", "1"); // morph weights (MSCAL 0x2800)
             fillSwitch("HCTP_NATIVE_P01", "1");
             fillSwitch("HCTP_NATIVE_S1", "15");
             fillSwitch("HCTP_S1_ANYHASH", "1");

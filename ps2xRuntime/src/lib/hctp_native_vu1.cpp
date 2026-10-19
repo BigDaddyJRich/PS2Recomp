@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <xmmintrin.h>
 
 namespace
 {
@@ -1182,6 +1183,40 @@ namespace
         return true;
     }
 
+    // p07 Sp_Loop (morph weights), MSCAL 0x2800: converts the integer weights in .w of [480..480+N) (N = [1009].x, a
+    // multiple of 4, groups of 4) in place: w = MAX(FTOI0(ITOF0(w) * c.z + c.x), c.w), c = [1011]; other fields are
+    // untouched. Ends at [E] 0x2900 (the second entry 0x2908, the target blend, needs register state: stays on the VU1).
+    bool runP07(uint8_t *data, Kicks &)
+    {
+        const int32_t n = ilw(data, 1009u, 0);
+        if (n <= 0 || (n & 3) != 0 || 480 + n > 1009)
+            return false;
+        const float *c = qwf(data, 1011u);
+        const __m128 cw = _mm_set_ss(c[3]);
+        // the VU1 path rounds these toward zero (ITOF0 of the raw weight bits and the product: verified against it)
+        const unsigned int savedCsr = _mm_getcsr();
+        _mm_setcsr((savedCsr & ~0x6000u) | 0x6000u);
+        for (int32_t j = 0; j < n; ++j)
+        {
+            int32_t *q = qwi(data, 480u + static_cast<uint32_t>(j));
+            // SSE intrinsics (not C++ float maths): kept in order with the MXCSR change around them
+            const __m128 prod = _mm_mul_ss(_mm_cvtsi32_ss(_mm_setzero_ps(), q[3]), _mm_set_ss(c[2]));
+            const float v = _mm_cvtss_f32(_mm_add_ss(prod, _mm_set_ss(c[0])));
+            const int32_t iv = ftoi(v, 1.0f);
+            // MAX takes its operands as floats with denormals flushed to signed zero (the FTOI'd weight's bits are
+            // usually a denormal)
+            // (and Inf / NaN bits - a saturated FTOI - clamped to the signed largest float), as the VU1 path's operand()
+            const int32_t sign = iv & static_cast<int32_t>(0x80000000u), expo = iv & 0x7F800000;
+            const int32_t flushed = expo == 0 ? sign : expo == 0x7F800000 ? (sign | 0x7F7FFFFF) : iv;
+            float f;
+            std::memcpy(&f, &flushed, 4);
+            f = _mm_cvtss_f32(_mm_max_ss(_mm_set_ss(f), cw)); // MAX on the bit patterns, as the VU1 path does
+            std::memcpy(&q[3], &f, 4);
+        }
+        _mm_setcsr(savedCsr);
+        return true;
+    }
+
     struct Generic
     {
         const char *name;
@@ -1191,10 +1226,12 @@ namespace
         const char *env;
         bool on;
         uint64_t runs, nativeRuns, qwords, okQwords, fails;
+        bool memCompare = false; // verify VU1 data memory (programs that only write memory, no GS packets)
     };
     Generic g_generic[] = {
         {"p17 Audience", 0x2a00u, 0x200u, 0x2a00u, 0x6d85202f7ec6d013ull, runP17, "HCTP_NATIVE_P17", false, 0, 0, 0, 0, 0},
         {"p16 Particle", 0x2a00u, 0x200u, 0x2a00u, 0x7d42d0fa68ec24e5ull, runP16, "HCTP_NATIVE_P16", false, 0, 0, 0, 0, 0},
+        {"p07 MorphWeights", 0x2800u, 0x190u, 0x2800u, 0xffbdc4d8743d017aull, runP07, "HCTP_NATIVE_P07", false, 0, 0, 0, 0, 0, true},
     };
     bool g_genericInit = false;
     Generic *g_genPending = nullptr;
@@ -1284,13 +1321,40 @@ bool hctpNativeVu1MscalGeneric(const uint8_t *code, uint8_t *data, uint32_t star
     return false;
 }
 
-void hctpNativeVu1AfterMscalGeneric()
+void hctpNativeVu1AfterMscalGeneric(const uint8_t *data)
 {
     if (!g_genPending)
         return;
     g_hctpPath1Capture = nullptr;
     Generic &g = *g_genPending;
     g_genPending = nullptr;
+    if (g.memCompare && data && g_genScratch.size() >= 0x4000u)
+    {
+        // the native's data memory vs the VU1's after the run, per qword (floats within a relative 1e-5)
+        uint64_t ok = 0;
+        for (uint32_t i = 0; i < 1024u; ++i)
+        {
+            const uint8_t *a = g_genScratch.data() + i * 16u, *b = data + i * 16u;
+            bool same = std::memcmp(a, b, 16) == 0;
+            if (!same)
+            {
+                static int s_dump = 0;
+                if (s_dump++ < 8)
+                {
+                    uint32_t ua[4], ub[4];
+                    std::memcpy(ua, a, 16);
+                    std::memcpy(ub, b, 16);
+                    std::fprintf(stderr, "[nvu1g] %s mem mismatch qw %u: native %08x %08x %08x %08x vu %08x %08x %08x %08x%c", g.name, i,
+                                 ua[0], ua[1], ua[2], ua[3], ub[0], ub[1], ub[2], ub[3], 10);
+                }
+            }
+            ok += same;
+        }
+        g.qwords += 1024u;
+        g.okQwords += ok;
+        genericReport();
+        return;
+    }
     // qword compare; FTOI'd integers may differ by 1 (DIV / rounding), floats by a relative 1e-5
     const size_t n = std::min(g_genExpected.size(), g_genCaptured.size()) / 16u;
     uint64_t ok = 0;

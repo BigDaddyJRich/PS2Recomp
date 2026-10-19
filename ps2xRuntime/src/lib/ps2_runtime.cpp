@@ -1056,7 +1056,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
                                      hctpNativeVu1AfterMscal(m_memory.getVU1Data());
-                                     hctpNativeVu1AfterMscalGeneric();
+                                     hctpNativeVu1AfterMscalGeneric(m_memory.getVU1Data());
                                      m_chain.noteVu1Run((m_vu1.state().stoppedByD ? 0x0200u : 0u) |
                                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u)); });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
