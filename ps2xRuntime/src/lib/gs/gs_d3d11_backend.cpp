@@ -2094,7 +2094,26 @@ struct GSD3D11Backend::Impl
                     createTexture(td.Width, td.Height, D3D11_BIND_SHADER_RESOURCE, feedbackTex);
                     dev->CreateShaderResourceView(feedbackTex.Get(), nullptr, &feedbackSrv);
                 }
-                ctx->CopyResource(feedbackTex.Get(), rt->tex.Get());
+                // Only the draw's bounding box (clipped to its scissor) matters: copy and mark that region alone
+                // instead of the whole (upscaled) target - HCTP issues ~16 DATE shadow draws per frame.
+                float bx0 = 1e9f, by0 = 1e9f, bx1 = -1e9f, by1 = -1e9f;
+                for (const Vtx &v : pending)
+                {
+                    bx0 = std::min(bx0, v.x); by0 = std::min(by0, v.y);
+                    bx1 = std::max(bx1, v.x); by1 = std::max(by1, v.y);
+                }
+                const LONG rx0 = std::max<LONG>(static_cast<LONG>(c.scissor.x0), static_cast<LONG>(std::floor(bx0)) - 1) * scale;
+                const LONG ry0 = std::max<LONG>(static_cast<LONG>(c.scissor.y0), static_cast<LONG>(std::floor(by0)) - 1) * scale;
+                const LONG rx1 = std::min<LONG>({static_cast<LONG>(c.scissor.x1 + 1u), static_cast<LONG>(std::ceil(bx1)) + 1,
+                                                 static_cast<LONG>(rt->w)}) * scale;
+                const LONG ry1 = std::min<LONG>({static_cast<LONG>(c.scissor.y1 + 1u), static_cast<LONG>(std::ceil(by1)) + 1,
+                                                 static_cast<LONG>(rt->h)}) * scale;
+                const bool boxOk = rx1 > rx0 && ry1 > ry0 && rx0 >= 0 && ry0 >= 0;
+                if (boxOk)
+                {
+                    D3D11_BOX box{static_cast<UINT>(rx0), static_cast<UINT>(ry0), 0, static_cast<UINT>(rx1), static_cast<UINT>(ry1), 1};
+                    ctx->CopySubresourceRegion(feedbackTex.Get(), 0, static_cast<UINT>(rx0), static_cast<UINT>(ry0), 0, rt->tex.Get(), 0, &box);
+                }
                 ctx->ClearDepthStencilView(dt->dsv.Get(), D3D11_CLEAR_STENCIL, 0.0f, 0);
                 D3D11_MAPPED_SUBRESOURCE bm{};
                 if (SUCCEEDED(ctx->Map(blitCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &bm)))
@@ -2105,8 +2124,7 @@ struct GSD3D11Backend::Impl
                 }
                 D3D11_VIEWPORT dvp{0, 0, static_cast<float>(rt->w * scale), static_cast<float>(rt->h * scale), 0, 1};
                 ctx->RSSetViewports(1, &dvp);
-                D3D11_RECT dsc{static_cast<LONG>(c.scissor.x0 * scale), static_cast<LONG>(c.scissor.y0 * scale),
-                               static_cast<LONG>((c.scissor.x1 + 1u) * scale), static_cast<LONG>((c.scissor.y1 + 1u) * scale)};
+                D3D11_RECT dsc{boxOk ? rx0 : 0, boxOk ? ry0 : 0, boxOk ? rx1 : 0, boxOk ? ry1 : 0};
                 ctx->RSSetScissorRects(1, &dsc);
                 ctx->RSSetState(raster.Get());
                 ID3D11RenderTargetView *drtv = rt->rtv.Get();
