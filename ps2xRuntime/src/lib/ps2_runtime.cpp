@@ -1046,10 +1046,17 @@ bool PS2Runtime::syncCoreSubsystems()
                                          m_chain.noteVu1Run(0u);
                                          return;
                                      }
+                                     if (hctpNativeVu1MscalGeneric(m_memory.getVU1Code(), m_memory.getVU1Data(), startPC, m_gs))
+                                     {
+                                         m_chain.noteVu1Run(0u);
+                                         return;
+                                     }
+                                     hctpNativeVu1Census(m_memory.getVU1Code(), startPC, true);
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
                                      hctpNativeVu1AfterMscal(m_memory.getVU1Data());
+                                     hctpNativeVu1AfterMscalGeneric();
                                      m_chain.noteVu1Run((m_vu1.state().stoppedByD ? 0x0200u : 0u) |
                                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u)); });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
@@ -1065,6 +1072,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                          m_chain.noteVu1Run(0u);
                                          return;
                                      }
+                                     hctpNativeVu1Census(m_memory.getVU1Code(), m_vu1.state().pc, false);
                                      hctpNativeVu1BeforeResume(m_memory.getVU1Code(), m_memory.getVU1Data(),
                                                                m_vu1.state(), top);
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,

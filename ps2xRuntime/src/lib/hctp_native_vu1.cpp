@@ -27,7 +27,39 @@ namespace
     // S = [1009].x + n.x * [1009].z, T = [1009].y + n.y * [1009].w, STQ = (S, T, 1) * q
     constexpr uint64_t kP10Hash = 0x76528d9e4a4a138full;
     constexpr uint32_t kP10LoopHead = 0x3d80u;
-    int g_variant = 0; // 0 = p08, 1 = p18, 2 = p10 (the chunk computeChunk last accepted)
+    // p11 (overlay 0x2a00): p08 without the ST scroll and without the strip-parity flip in the backface test
+    constexpr uint64_t kP11Hash = 0x1c814dd03a6b2482ull;
+    constexpr uint32_t kP11LoopHead = 0x2fb0u;
+    bool g_p11 = false; // HCTP_NATIVE_P11=1
+    uint64_t g_p11Seen = 0;
+    // p09 (resident at VU 0x3040): light-relative reflection map: ST = ([1009].xy + L * n) * [1009].zw, then * q;
+    // L columns = [1012], [1013], [1014] (.xy)
+    constexpr uint64_t kP09Hash = 0xe50add3f88ac1641ull;
+    constexpr uint32_t kP09LoopHead = 0x3720u;
+    bool g_p09 = false; // HCTP_NATIVE_P09=1
+    uint64_t g_p09Seen = 0;
+    // p19 My_Code_TriStripChar_NonClip (overlay 0x2a00): p18's math, but no backface test, no clipping and no ADC
+    // (the microcode has no ISW): every corner is drawn
+    constexpr uint64_t kP19Hash = 0x43232620e643a207ull;
+    constexpr uint32_t kP19LoopHead = 0x2d50u;
+    bool g_p19 = false; // HCTP_NATIVE_P19=1
+    uint64_t g_p19Seen = 0;
+    // p15 My_Code_TriStripProjectionMap (overlay 0x2a00): projector T = [1005] + [1002]*V.x + [1003]*V.y + [1004]*V.z
+    // (V = view position [index]), STQ = (T.x/T.w*q, T.y/T.w*q, q); RGBA = min([1006]' * light + [1007]*[1019], 255)
+    // (no corner colour); position / clip / backface as p08
+    constexpr uint64_t kP15Hash = 0x8c043e47d2d51d3aull;
+    constexpr uint32_t kP15LoopHead = 0x30f0u;
+    bool g_p15 = false; // HCTP_NATIVE_P15=1
+    uint64_t g_p15Seen = 0;
+    int g_variant = 0; // 0 = p08, 1 = p18, 2 = p10, 3 = p11, 4 = p09, 5 = p19, 6 = p15 (the chunk computeChunk last accepted)
+
+    uint64_t hashAt(const uint8_t *code, uint32_t at)
+    {
+        uint64_t h = 1469598103934665603ull;
+        for (uint32_t i = 0; i < 0x200u; ++i)
+            h = (h ^ code[at + i]) * 1099511628211ull;
+        return h;
+    }
     bool g_p18 = false; // HCTP_NATIVE_P18=1
     bool g_p10 = false; // HCTP_NATIVE_P10=1
     uint64_t g_p10Seen = 0;
@@ -114,7 +146,22 @@ namespace
             ++g_p18PcLog;
             std::fprintf(stderr, "[nvu1] p18 candidate pc=0x%x top=0x%x%c", st.pc, top, 10);
         }
-        if (st.pc == kP10LoopHead)
+        if (st.pc == kP09LoopHead)
+        {
+            static uint64_t s_sig09 = 0, s_hash09 = 0;
+            uint64_t sig09;
+            std::memcpy(&sig09, code + 0x3050u, 8);
+            if (sig09 != s_sig09)
+            {
+                s_sig09 = sig09;
+                s_hash09 = hashAt(code, 0x3040u);
+            }
+            if (s_hash09 != kP09Hash || !(g_p09 || g_on))
+                return false;
+            g_variant = 4;
+            ++g_p09Seen;
+        }
+        else if (st.pc == kP10LoopHead)
         {
             static uint64_t s_sig10 = 0, s_hash10 = 0;
             uint64_t sig10;
@@ -132,6 +179,21 @@ namespace
             g_variant = 2;
             ++g_p10Seen;
         }
+        else if (st.pc == kP15LoopHead && s_hash == kP15Hash && (g_p15 || g_on))
+        {
+            g_variant = 6;
+            ++g_p15Seen;
+        }
+        else if (st.pc == kP19LoopHead && s_hash == kP19Hash && (g_p19 || g_on))
+        {
+            g_variant = 5;
+            ++g_p19Seen;
+        }
+        else if (st.pc == kP11LoopHead && s_hash == kP11Hash && (g_p11 || g_on))
+        {
+            g_variant = 3;
+            ++g_p11Seen;
+        }
         else if (st.pc != kP08LoopHead && st.pc != kP18LoopHead)
             return false;
         else if (s_hash == kP08Hash && st.pc == kP08LoopHead)
@@ -143,7 +205,7 @@ namespace
         }
         else
             return false;
-        const bool p18 = g_variant == 1;
+        const bool p18 = g_variant == 1 || g_variant == 5; // p19 = p18's colour / STQ
 
         uint32_t header;
         std::memcpy(&header, data + (top & 0x3FFu) * 16u, 4);
@@ -173,14 +235,43 @@ namespace
             Corner &o = g_expected[k];
             for (int c = 0; c < 4; ++c)
             {
-                float col = c1[c] * s1[c] * light[c] + c1[c] * s2[c];
+                float col = g_variant == 6 ? s1[c] * light[c] + s2[c] : c1[c] * s1[c] * light[c] + c1[c] * s2[c];
                 col = std::fmin(col, 255.0f);
                 o.rgba[c] = ftoi(col, 1.0f);
                 o.col[c] = col;
             }
             const float *Nn = q(data, cornerIndex(data, top, k) + 160u);
-            const float st3[3] = {g_variant == 2 ? scroll[0] + Nn[0] * scroll[2] : c0[0] + scroll[0],
+            float st3[3] = {g_variant == 2 ? scroll[0] + Nn[0] * scroll[2] : c0[0] + scroll[0],
                                   g_variant == 2 ? scroll[1] + Nn[1] * scroll[3] : c0[1] + scroll[1], g_variant == 2 ? 1.0f : c0[2]};
+            if (g_variant == 4)
+            {
+                const float *L0 = q(data, 1012), *L1 = q(data, 1013), *L2 = q(data, 1014);
+                st3[0] = (scroll[0] + L0[0] * Nn[0] + L1[0] * Nn[1] + L2[0] * Nn[2]) * scroll[2];
+                st3[1] = (scroll[1] + L0[1] * Nn[0] + L1[1] * Nn[1] + L2[1] * Nn[2]) * scroll[3];
+                st3[2] = 1.0f;
+            }
+            if (g_variant == 6)
+            {
+                const float *V = q(data, cornerIndex(data, top, k));
+                const float *m2 = q(data, 1002), *m3 = q(data, 1003), *m4 = q(data, 1004), *m5 = q(data, 1005);
+                float T[4];
+                for (int c = 0; c < 4; ++c)
+                {
+                    float acc = m5[c] * 1.0f;
+                    acc += m2[c] * V[0];
+                    acc += m3[c] * V[1];
+                    T[c] = acc + m4[c] * V[2];
+                }
+                const float qd = 1.0f / T[3];
+                st3[0] = T[0] * qd;
+                st3[1] = T[1] * qd;
+                st3[2] = 1.0f;
+            }
+            if (g_variant == 3)
+            {
+                st3[0] = c0[0];
+                st3[1] = c0[1];
+            }
             for (int c = 0; c < 3; ++c)
             {
                 o.stq[c] = p18 ? st3[c] : st3[c] * N[3];
@@ -195,7 +286,7 @@ namespace
                 o.xyz[c] = ftoi(P[c], 16.0f);
             // CLIP vs 1024 (x/y: needs the clipper) and vs 2047 (z-): any flag -> the chunk stays on the VU1
             const float cx = P[0] + offXY, cy = P[1] + offXY, cz = q(data, idx)[2] + offZ;
-            o.flagged = std::fabs(cx) > band || std::fabs(cy) > band || cz < -guard;
+            o.flagged = g_variant != 5 && (std::fabs(cx) > band || std::fabs(cy) > band || cz < -guard);
             if (o.flagged)
                 g_chunkClip = true;
             else if (g_on && o.clip[3] != 0.0f)
@@ -204,13 +295,13 @@ namespace
                 g_projOk += std::fabs(o.clip[0] / o.clip[3] - P[0]) < 0.05f && std::fabs(o.clip[1] / o.clip[3] - P[1]) < 0.05f;
             }
             // backface (3rd corner on): cross z of (P[k-2]-P[k-1]) x (P[k-1]-P[k]), sign + strip parity, & vi8 -> ADC
-            if (k >= 2u)
+            if (k >= 2u && g_variant != 5)
             {
                 const float *P0 = q(data, cornerIndex(data, top, k - 2u) + 320u);
                 const float *P1 = q(data, cornerIndex(data, top, k - 1u) + 320u);
                 const float ax = P0[0] - P1[0], ay = P0[1] - P1[1], bx = P1[0] - P[0], by = P1[1] - P[1];
                 const float crossZ = ax * by - bx * ay;
-                const int32_t v = (crossZ < 0.0f ? 32 : 0) + (((k - 2u) & 1u) ? 32 : 0);
+                const int32_t v = (crossZ < 0.0f ? 32 : 0) + ((g_variant != 3 && ((k - 2u) & 1u)) ? 32 : 0);
                 if (v & cullMask)
                     o.xyz[3] = (o.xyz[3] & 0xFFFF) | 0x8000;
             }
@@ -354,6 +445,14 @@ namespace
         if (g_projN)
             std::fprintf(stderr, "[nvu1] p08 clip-space check: %.2f%% of %llu corners%c", 100.0 * g_projOk / g_projN,
                          static_cast<unsigned long long>(g_projN), 10);
+        if (g_p15Seen)
+            std::fprintf(stderr, "[nvu1] p15 chunks seen=%llu%c", static_cast<unsigned long long>(g_p15Seen), 10);
+        if (g_p19Seen)
+            std::fprintf(stderr, "[nvu1] p19 chunks seen=%llu%c", static_cast<unsigned long long>(g_p19Seen), 10);
+        if (g_p09Seen)
+            std::fprintf(stderr, "[nvu1] p09 chunks seen=%llu%c", static_cast<unsigned long long>(g_p09Seen), 10);
+        if (g_p11Seen)
+            std::fprintf(stderr, "[nvu1] p11 chunks seen=%llu%c", static_cast<unsigned long long>(g_p11Seen), 10);
         if (g_p10Seen)
             std::fprintf(stderr, "[nvu1] p10 chunks seen=%llu%c", static_cast<unsigned long long>(g_p10Seen), 10);
         if (g_p18Seen)
@@ -363,6 +462,96 @@ namespace
             std::fprintf(stderr, "[nvu1] p08 native chunks=%llu (clipped tris %llu) vu chunks=%llu%c",
                          static_cast<unsigned long long>(g_nativeChunks), static_cast<unsigned long long>(g_clipTris),
                          static_cast<unsigned long long>(g_vuChunks), 10);
+    }
+}
+
+
+// ---------------------------------------------------------------------------------------------------------------
+// p12 My_Code_LineStrip / p13 My_Code_LineList (overlay 0x2a00, MSCNT chunks like p08): corner records at TOP+1
+// (ST + index in .w, colour), packet at TOP+33. Per corner: STQ = ST * P.w, RGBA = FTOI0(min(colour * [1006] *
+// (255,255,255,128), 255)), XYZF2 = FTOI4(P), P = [index+320]. CLIP of (P.x-2048, P.y-2048, [index].z-2048) against
+// 2047; ADC (w = 0x8000) when FCAND 1007 hits: this corner's +x -x +y -y -z or the previous corner's x / y bits.
+// p12 tests every corner (against the previous one, across chunks); p13 only the second corner of each pair.
+namespace
+{
+    constexpr uint64_t kP12Hash = 0xcbfc02991d763c2dull; // 472 bytes
+    constexpr uint64_t kP13Hash = 0x1cf36cba54f38a53ull; // 512 bytes
+    constexpr uint32_t kP12LoopHead = 0x2bc8u, kP13LoopHead = 0x2c60u;
+    bool g_lines = false; // HCTP_NATIVE_LINES=1
+    uint32_t g_lineFlags = 0; // CLIP flag history (6 bits per CLIP), carried across p12 chunks
+    std::vector<uint8_t> g_linePacket;
+    bool g_linePending = false;
+    uint32_t g_lineTop = 0;
+    uint64_t g_lineChunks = 0, g_lineQw = 0, g_lineOk = 0;
+
+    uint32_t lineClip(const float *v) // CLIP.xyz against w = 2047
+    {
+        const float a = 2047.0f;
+        return (v[0] > a ? 1u : 0u) | (v[0] < -a ? 2u : 0u) | (v[1] > a ? 4u : 0u) | (v[1] < -a ? 8u : 0u) |
+               (v[2] > a ? 16u : 0u) | (v[2] < -a ? 32u : 0u);
+    }
+
+    // 12 / 13 when the overlay + resume PC is one of them (packet in g_linePacket), else 0
+    int lineChunk(const uint8_t *code, const uint8_t *data, const VU1State &st, uint32_t top)
+    {
+        if (!code || !data || (st.pc != kP12LoopHead && st.pc != kP13LoopHead))
+            return 0;
+        static uint64_t s_sig = 0, s_h12 = 0, s_h13 = 0;
+        uint64_t sig;
+        std::memcpy(&sig, code + 0x2a10u, 8);
+        if (sig != s_sig)
+        {
+            s_sig = sig;
+            uint64_t h = 1469598103934665603ull, h2 = 0;
+            for (uint32_t i = 0; i < 0x200u; ++i)
+            {
+                h = (h ^ code[0x2a00u + i]) * 1099511628211ull;
+                if (i == 471u)
+                    h2 = h;
+            }
+            s_h12 = h2;
+            s_h13 = h;
+        }
+        const int prog = (st.pc == kP12LoopHead && s_h12 == kP12Hash) ? 12 : (st.pc == kP13LoopHead && s_h13 == kP13Hash) ? 13 : 0;
+        if (!prog)
+            return 0;
+        uint32_t header;
+        std::memcpy(&header, data + (top & 0x3FFu) * 16u, 4);
+        const uint32_t count = header & 0x7FFFu;
+        if (count == 0u || count > 48u || (prog == 13 && (count & 1u)))
+            return 0;
+        const float *v1 = q(data, 1006);
+        const float s1[4] = {v1[0] * 255.0f, v1[1] * 255.0f, v1[2] * 255.0f, v1[3] * 128.0f};
+        g_linePacket.resize((1u + 3u * count) * 16u);
+        uint8_t *o = g_linePacket.data();
+        std::memcpy(o, data + (top & 0x3FFu) * 16u, 16);
+        uint32_t flags = g_lineFlags;
+        for (uint32_t k = 0; k < count; ++k)
+        {
+            const float *c0 = q(data, top + 1u + 2u * k), *c1 = q(data, top + 2u + 2u * k);
+            const uint32_t idx = cornerIndex(data, top, k);
+            const float *P = q(data, idx + 320u);
+            float stq[4];
+            int32_t rgba[4], xyz[4];
+            for (int c = 0; c < 4; ++c)
+            {
+                stq[c] = c0[c] * P[3];
+                rgba[c] = ftoi(std::fmin(c1[c] * s1[c], 255.0f), 1.0f);
+                xyz[c] = ftoi(P[c], 16.0f);
+            }
+            const float cv[3] = {P[0] - 2048.0f, P[1] - 2048.0f, q(data, idx)[2] - 2048.0f};
+            flags = ((flags << 6) | lineClip(cv)) & 0xFFFFFFu;
+            const bool test = prog == 12 || (k & 1u);
+            if (test && (flags & 1007u))
+                xyz[3] = 0x8000;
+            uint8_t *c = o + (1u + 3u * k) * 16u;
+            std::memcpy(c, stq, 16);
+            std::memcpy(c + 16, rgba, 16);
+            std::memcpy(c + 32, xyz, 16);
+        }
+        if (prog == 12)
+            g_lineFlags = flags;
+        return prog;
     }
 }
 
@@ -376,12 +565,30 @@ void hctpNativeVu1Init()
     g_p18 = n18 && n18[0] == '1';
     const char *n10 = std::getenv("HCTP_NATIVE_P10");
     g_p10 = n10 && n10[0] == '1';
+    const char *n11 = std::getenv("HCTP_NATIVE_P11");
+    g_p11 = n11 && n11[0] == '1';
+    const char *n09 = std::getenv("HCTP_NATIVE_P09");
+    g_p09 = n09 && n09[0] == '1';
+    const char *n19 = std::getenv("HCTP_NATIVE_P19");
+    g_p19 = n19 && n19[0] == '1';
+    const char *n15 = std::getenv("HCTP_NATIVE_P15");
+    g_p15 = n15 && n15[0] == '1';
+    const char *nl = std::getenv("HCTP_NATIVE_LINES");
+    g_lines = nl && nl[0] == '1';
     if (g_on || g_native)
         std::fprintf(stderr, "[nvu1] p08 spec verify %d native %d%c", g_on ? 1 : 0, g_native ? 1 : 0, 10);
 }
 
 bool hctpNativeVu1TryDraw(const uint8_t *code, uint8_t *data, const VU1State &st, uint32_t top, GS &gs)
 {
+    if (g_lines && !g_on && lineChunk(code, data, st, top))
+    {
+        for (size_t i = 0; i < g_linePacket.size() / 16u; ++i)
+            std::memcpy(data + ((top + 33u + static_cast<uint32_t>(i)) & 0x3FFu) * 16u, g_linePacket.data() + i * 16u, 16);
+        gs.processGIFPacket(g_linePacket.data(), static_cast<uint32_t>(g_linePacket.size()), 1u);
+        ++g_lineChunks;
+        return true;
+    }
     if (!g_native || !computeChunk(code, data, st, top))
         return false;
     // HCTP_NATIVE_P08_CLIP=0: clipped chunks stay on the VU1 (p05/p06)
@@ -421,6 +628,12 @@ bool hctpNativeVu1TryDraw(const uint8_t *code, uint8_t *data, const VU1State &st
 
 void hctpNativeVu1BeforeResume(const uint8_t *code, const uint8_t *data, const VU1State &st, uint32_t top)
 {
+    g_linePending = false;
+    if (g_on && lineChunk(code, data, st, top))
+    {
+        g_linePending = true;
+        g_lineTop = top;
+    }
     g_pending = false;
     if (!g_on)
         return;
@@ -434,6 +647,36 @@ void hctpNativeVu1BeforeResume(const uint8_t *code, const uint8_t *data, const V
 
 void hctpNativeVu1AfterResume(const uint8_t *data)
 {
+    if (g_linePending && data)
+    {
+        g_linePending = false;
+        ++g_lineChunks;
+        for (size_t i = 1; i < g_linePacket.size() / 16u; ++i)
+        {
+            const uint8_t *vu = data + ((g_lineTop + 33u + static_cast<uint32_t>(i)) & 0x3FFu) * 16u;
+            const uint8_t *nat = g_linePacket.data() + i * 16u;
+            bool same = true;
+            for (int c = 0; c < 4 && same; ++c)
+            {
+                int32_t a, b;
+                std::memcpy(&a, nat + c * 4, 4);
+                std::memcpy(&b, vu + c * 4, 4);
+                float fa, fb;
+                std::memcpy(&fa, &a, 4);
+                std::memcpy(&fb, &b, 4);
+                same = std::abs(static_cast<int64_t>(a) - b) <= 1 || (i % 3u == 1u && std::fabs(fa - fb) <= 1e-4f * std::fmax(1.0f, std::fabs(fa)));
+            }
+            ++g_lineQw;
+            g_lineOk += same;
+        }
+        static auto s_last = std::chrono::steady_clock::now();
+        if (std::chrono::steady_clock::now() - s_last > std::chrono::seconds(5))
+        {
+            s_last = std::chrono::steady_clock::now();
+            std::fprintf(stderr, "[nvu1] lines chunks=%llu qwords=%llu match=%.3f%%%c", static_cast<unsigned long long>(g_lineChunks),
+                         static_cast<unsigned long long>(g_lineQw), g_lineQw ? 100.0 * g_lineOk / g_lineQw : 0.0, 10);
+        }
+    }
     if (!g_pending || !data)
         return;
     g_pending = false;
@@ -465,7 +708,7 @@ void hctpNativeVu1AfterResume(const uint8_t *data)
             ++g_dumped;
             std::fprintf(stderr, "[nvu1] mismatch p%d top=0x%x k=%u: stq vu %g %g %g / spec %g %g %g | rgba vu %d %d %d %d / spec %d %d %d %d"
                                  " | xyzf vu %d %d %d %x / spec %d %d %d %x%c",
-                         g_variant == 1 ? 18 : g_variant == 2 ? 10 : 8, g_top, k, stq[0], stq[1], stq[2], e.stq[0], e.stq[1], e.stq[2], rgba[0], rgba[1], rgba[2], rgba[3],
+                         g_variant == 1 ? 18 : g_variant == 2 ? 10 : g_variant == 3 ? 11 : g_variant == 4 ? 9 : g_variant == 5 ? 19 : g_variant == 6 ? 15 : 8, g_top, k, stq[0], stq[1], stq[2], e.stq[0], e.stq[1], e.stq[2], rgba[0], rgba[1], rgba[2], rgba[3],
                          e.rgba[0], e.rgba[1], e.rgba[2], e.rgba[3], xyz[0], xyz[1], xyz[2], xyz[3], e.xyz[0], e.xyz[1],
                          e.xyz[2], e.xyz[3], 10);
         }
@@ -705,4 +948,390 @@ void hctpNativeVu1AfterMscal(const uint8_t *data)
         }
     }
     p01Report();
+}
+
+#include <algorithm>
+#include <map>
+#include <mutex>
+
+void hctpNativeVu1Census(const uint8_t *code, uint32_t pc, bool mscal)
+{
+    static const bool s_on = std::getenv("HCTP_VU1_CENSUS") != nullptr;
+    if (!s_on || !code)
+        return;
+    static std::mutex s_lock;
+    static std::map<uint64_t, uint64_t> s_counts; // (hash of the 512 bytes at the program base) ^ pc -> runs
+    static std::map<uint64_t, std::pair<uint32_t, uint64_t>> s_keys;
+    static auto s_last = std::chrono::steady_clock::now();
+    // program base: the overlay slot 0x2a00 for PCs inside it, the resident programs' own starts otherwise
+    const uint32_t base = (pc >= 0x2a00u && pc < 0x3040u) ? 0x2a00u : (pc >= 0x3040u && pc < 0x3740u) ? 0x3040u
+                          : (pc >= 0x3740u && pc < 0x3d90u) ? 0x3740u : (pc & ~0xFFu);
+    uint64_t h = 1469598103934665603ull;
+    for (uint32_t i = 0; i < 0x200u && base + i < 0x4000u; ++i)
+        h = (h ^ code[base + i]) * 1099511628211ull;
+    const uint64_t key = h ^ (static_cast<uint64_t>(pc) << 1) ^ (mscal ? 1u : 0u);
+    std::lock_guard<std::mutex> lock(s_lock);
+    ++s_counts[key];
+    s_keys[key] = {pc | (mscal ? 0x80000000u : 0u), h};
+    const auto now = std::chrono::steady_clock::now();
+    if (now - s_last < std::chrono::seconds(10))
+        return;
+    s_last = now;
+    std::vector<std::pair<uint64_t, uint64_t>> v(s_counts.begin(), s_counts.end());
+    std::sort(v.begin(), v.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+    for (size_t i = 0; i < v.size() && i < 16; ++i)
+    {
+        const auto &k = s_keys[v[i].first];
+        std::fprintf(stderr, "[vu1census] %s pc=0x%04x hash=%016llx runs=%llu%c", (k.first & 0x80000000u) ? "MSCAL" : "MSCNT",
+                     k.first & 0xFFFFu, static_cast<unsigned long long>(k.second), static_cast<unsigned long long>(v[i].second), 10);
+    }
+    s_counts.clear();
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Whole-program natives (MSCAL-started VU1 programs; names from the ELF's symbol table, notes\VU1_PROGRAMS.md).
+// Each native reads / writes VU1 data memory like the microcode and returns the GS packets it would XGKICK.
+extern thread_local std::vector<uint8_t> *g_hctpPath1Capture;
+
+namespace
+{
+    using Kicks = std::vector<std::vector<uint8_t>>;
+
+    float *qwf(uint8_t *data, uint32_t qw) { return reinterpret_cast<float *>(data + (qw & 0x3FFu) * 16u); }
+    int32_t *qwi(uint8_t *data, uint32_t qw) { return reinterpret_cast<int32_t *>(data + (qw & 0x3FFu) * 16u); }
+    int32_t ilw(const uint8_t *data, uint32_t qw, int field) // ILW: the low 16 bits of a field, sign-extended
+    {
+        int32_t v;
+        std::memcpy(&v, data + (qw & 0x3FFu) * 16u + field * 4, 4);
+        return static_cast<int16_t>(v & 0xFFFF);
+    }
+
+    // qwords of the GIF packet starting at qw (tags until EOP; PACKED nloop*nreg, REGLIST nloop*nreg/2, IMAGE nloop)
+    uint32_t gifPacketQwords(const uint8_t *data, uint32_t qw)
+    {
+        uint32_t n = 0;
+        for (int guard = 0; guard < 64; ++guard)
+        {
+            uint64_t tag;
+            std::memcpy(&tag, data + ((qw + n) & 0x3FFu) * 16u, 8);
+            const uint32_t nloop = static_cast<uint32_t>(tag & 0x7FFFu);
+            const uint32_t flg = static_cast<uint32_t>((tag >> 58) & 3u);
+            uint32_t nreg = static_cast<uint32_t>((tag >> 60) & 0xFu);
+            if (nreg == 0u)
+                nreg = 16u;
+            n += 1u;
+            if (flg == 0u)
+                n += nloop * nreg;
+            else if (flg == 1u)
+                n += (nloop * nreg + 1u) / 2u;
+            else
+                n += nloop;
+            if ((tag >> 15) & 1u)
+                break;
+        }
+        return n;
+    }
+
+    void kickAt(const uint8_t *data, uint32_t qw, Kicks &out)
+    {
+        const uint32_t n = gifPacketQwords(data, qw);
+        std::vector<uint8_t> p(n * 16u);
+        for (uint32_t i = 0; i < n; ++i)
+            std::memcpy(p.data() + i * 16u, data + ((qw + i) & 0x3FFu) * 16u, 16);
+        out.push_back(std::move(p));
+    }
+
+    int32_t ftoi4(float v) { return ftoi(v, 16.0f); }
+
+    // p17 My_Code_Audience (the crowd), MSCAL 0x2a00. Kicks the register packet at 256; per batch ([850].x
+    // batches, 5 qwords each from 851: matrix rows + one register value stored to 261) kicks 260, then per group
+    // ([850].y groups, headers from 262, vertex pairs (attr, pos) from 267, the same for every batch):
+    // out = header, then per vertex attr and (FTOI4(xyz / w of M*pos), attr.w); double buffered at 0 / 128.
+    bool runP17(uint8_t *data, Kicks &kicks)
+    {
+        int32_t batches = ilw(data, 850u, 0);
+        if (batches <= 0 || batches > 64)
+            return false;
+        kickAt(data, 256u, kicks);
+        uint32_t vi9 = 851u, vi12 = 0u;
+        for (; batches > 0; --batches, vi9 += 5u)
+        {
+            const float *m[4] = {qwf(data, vi9), qwf(data, vi9 + 1u), qwf(data, vi9 + 2u), qwf(data, vi9 + 3u)};
+            std::memcpy(data + 261u * 16u, data + (vi9 + 4u) * 16u, 16);
+            kickAt(data, 260u, kicks);
+            uint32_t vi11 = 262u, vi5 = 267u;
+            int32_t groups = ilw(data, 850u, 1);
+            if (groups <= 0 || groups > 512)
+                return false;
+            for (; groups > 0; --groups, ++vi11, vi12 = 128u - vi12)
+            {
+                const uint32_t count = static_cast<uint32_t>(ilw(data, vi11, 0)) & 255u;
+                if ((count & 3u) != 0u || count == 0u)
+                    return false; // the microcode loops in fours until zero
+                std::memcpy(data + vi12 * 16u, data + (vi11 & 0x3FFu) * 16u, 16);
+                for (uint32_t k = 0; k < count; ++k, vi5 += 2u)
+                {
+                    const float *a = qwf(data, vi5), *pos = qwf(data, vi5 + 1u);
+                    float r[4];
+                    for (int c = 0; c < 4; ++c)
+                    {
+                        float acc = m[0][c] * pos[0];
+                        acc += m[1][c] * pos[1];
+                        acc += m[2][c] * pos[2];
+                        r[c] = acc + m[3][c] * pos[3];
+                    }
+                    const float qv = 1.0f / r[3];
+                    const uint32_t o = vi12 + 1u + 2u * k;
+                    float attr[4];
+                    std::memcpy(attr, a, 16);
+                    std::memcpy(data + (o & 0x3FFu) * 16u, attr, 16);
+                    int32_t *x = qwi(data, o + 1u);
+                    std::memcpy(x, attr, 16);
+                    x[0] = ftoi4(r[0] * qv);
+                    x[1] = ftoi4(r[1] * qv);
+                    x[2] = ftoi4(r[2] * qv);
+                }
+                kickAt(data, vi12, kicks);
+            }
+        }
+        return true;
+    }
+
+
+    // CLIP of fs.xyz against |w|: 6 flag bits (+x -x +y -y +z -z)
+    uint32_t clipBits(const float *v, float w)
+    {
+        const float a = std::fabs(w);
+        return (v[0] > a ? 1u : 0u) | (v[0] < -a ? 2u : 0u) | (v[1] > a ? 4u : 0u) | (v[1] < -a ? 8u : 0u) |
+               (v[2] > a ? 16u : 0u) | (v[2] < -a ? 32u : 0u);
+    }
+
+    // p16 My_dma_Particle (sprites), MSCAL 0x2a00. Matrix rows [485..488], corner offsets [494] / [495], UV qwords
+    // [490] / [493], packet tag [489], [480].x outer x [480].y inner particles, scale [480].z, clip bounds [481].w /
+    // [482].w around the centre [483]. Inputs: position from 0, colour from 80, size from 160 (one qword each).
+    // Output from 501, 5 qwords per particle: colour, UV0, FTOI4 corner A, UV1, FTOI4 corner B; a particle whose
+    // corner A is above +bound or corner B below -bound (y, against [482].w) gets zero corners. One kick at 500.
+    bool runP16(uint8_t *data, Kicks &kicks)
+    {
+        const int32_t outer = ilw(data, 480u, 0), inner = ilw(data, 480u, 1);
+        if (outer <= 0 || inner <= 0 || outer * inner > 100)
+            return false;
+        const float *m[4] = {qwf(data, 485u), qwf(data, 486u), qwf(data, 487u), qwf(data, 488u)};
+        const float *off0 = qwf(data, 494u), *off1 = qwf(data, 495u), *centre = qwf(data, 483u);
+        const float scale = qwf(data, 480u)[2], b23 = qwf(data, 481u)[3], b24 = qwf(data, 482u)[3];
+        float uv0[4], uv1[4];
+        std::memcpy(uv0, qwf(data, 490u), 16);
+        std::memcpy(uv1, qwf(data, 493u), 16);
+        auto project = [&](const float *v, float *r)
+        {
+            for (int c = 0; c < 4; ++c)
+            {
+                float acc = m[0][c] * v[0];
+                acc += m[1][c] * v[1];
+                acc += m[2][c] * v[2];
+                r[c] = acc + m[3][c] * v[3];
+            }
+            const float qv = 1.0f / r[3];
+            for (int c = 0; c < 4; ++c)
+                r[c] *= qv;
+        };
+        uint32_t in = 0u, out = 501u;
+        for (int32_t i = 0; i < outer * inner; ++i, ++in, out += 5u)
+        {
+            const float *size = qwf(data, 160u + in), *pos = qwf(data, in);
+            float colour[4], base[4], ca[4], cb[4], pa[4], pb[4];
+            std::memcpy(colour, qwf(data, 80u + in), 16);
+            for (int c = 0; c < 4; ++c)
+            {
+                base[c] = pos[c] - size[c] * scale;
+                ca[c] = off0[c] + base[c];
+                cb[c] = off1[c] + base[c];
+            }
+            project(ca, pa);
+            project(cb, pb);
+            float da[4], db[4];
+            for (int c = 0; c < 4; ++c)
+            {
+                da[c] = pa[c] - centre[c];
+                db[c] = pb[c] - centre[c];
+            }
+            // flags after the 4 CLIPs: [vf4 vs 23][vf13 vs 23][vf4 vs 24][vf13 vs 24]; FCAND 0x108 = bit 3 (-y of the
+            // last) | bit 8 (+y of the third)
+            const uint32_t flags = (clipBits(da, b23) << 18) | (clipBits(db, b23) << 12) | (clipBits(da, b24) << 6) | clipBits(db, b24);
+            int32_t xa[4], xb[4];
+            if (flags & 0x108u)
+            {
+                const int32_t z[4] = {0, 0, 0, 16};
+                std::memcpy(xa, z, 16);
+                std::memcpy(xb, z, 16);
+            }
+            else
+                for (int c = 0; c < 4; ++c)
+                {
+                    xa[c] = ftoi4(pa[c]);
+                    xb[c] = ftoi4(pb[c]);
+                }
+            std::memcpy(data + (out & 0x3FFu) * 16u, colour, 16);
+            std::memcpy(data + ((out + 1u) & 0x3FFu) * 16u, uv0, 16);
+            std::memcpy(data + ((out + 2u) & 0x3FFu) * 16u, xa, 16);
+            std::memcpy(data + ((out + 3u) & 0x3FFu) * 16u, uv1, 16);
+            std::memcpy(data + ((out + 4u) & 0x3FFu) * 16u, xb, 16);
+        }
+        std::memcpy(data + 500u * 16u, data + 489u * 16u, 16);
+        kickAt(data, 500u, kicks);
+        return true;
+    }
+
+    struct Generic
+    {
+        const char *name;
+        uint32_t base, bytes, entry;
+        uint64_t hash;
+        bool (*run)(uint8_t *, Kicks &);
+        const char *env;
+        bool on;
+        uint64_t runs, nativeRuns, qwords, okQwords, fails;
+    };
+    Generic g_generic[] = {
+        {"p17 Audience", 0x2a00u, 0x200u, 0x2a00u, 0x6d85202f7ec6d013ull, runP17, "HCTP_NATIVE_P17", false, 0, 0, 0, 0, 0},
+        {"p16 Particle", 0x2a00u, 0x200u, 0x2a00u, 0x7d42d0fa68ec24e5ull, runP16, "HCTP_NATIVE_P16", false, 0, 0, 0, 0, 0},
+    };
+    bool g_genericInit = false;
+    Generic *g_genPending = nullptr;
+    std::vector<uint8_t> g_genExpected, g_genCaptured;
+    std::vector<uint8_t> g_genScratch;
+    auto g_genLast = std::chrono::steady_clock::now();
+
+    uint64_t hashRange(const uint8_t *code, uint32_t at, uint32_t bytes)
+    {
+        uint64_t h = 1469598103934665603ull;
+        for (uint32_t i = 0; i < bytes; ++i)
+            h = (h ^ code[at + i]) * 1099511628211ull;
+        return h;
+    }
+
+    void genericReport()
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - g_genLast < std::chrono::seconds(5))
+            return;
+        g_genLast = now;
+        for (const Generic &g : g_generic)
+            if (g.runs)
+                std::fprintf(stderr, "[nvu1g] %s runs=%llu native=%llu fails=%llu qwords=%llu match=%.3f%%%c", g.name,
+                             static_cast<unsigned long long>(g.runs), static_cast<unsigned long long>(g.nativeRuns),
+                             static_cast<unsigned long long>(g.fails), static_cast<unsigned long long>(g.qwords),
+                             g.qwords ? 100.0 * g.okQwords / g.qwords : 0.0, 10);
+    }
+}
+
+bool hctpNativeVu1MscalGeneric(const uint8_t *code, uint8_t *data, uint32_t startPC, GS &gs)
+{
+    if (!g_genericInit)
+    {
+        g_genericInit = true;
+        for (Generic &g : g_generic)
+            g.on = std::getenv(g.env) && std::getenv(g.env)[0] == '1';
+    }
+    if (!code || !data)
+        return false;
+    for (Generic &g : g_generic)
+    {
+        if (g.entry != startPC || (!g.on && !g_on))
+            continue;
+        // the overlay changes rarely: hash only when its first words change
+        static uint64_t s_sig[8] = {}, s_hash[8] = {};
+        const size_t gi = static_cast<size_t>(&g - g_generic);
+        uint64_t sig;
+        std::memcpy(&sig, code + g.base + 8u, 8);
+        if (sig != s_sig[gi])
+        {
+            s_sig[gi] = sig;
+            s_hash[gi] = hashRange(code, g.base, g.bytes);
+        }
+        if (s_hash[gi] != g.hash)
+            continue;
+        ++g.runs;
+        Kicks kicks;
+        if (g_on)
+        {
+            // verify: run on a copy, capture what the VU1 sends, compare in hctpNativeVu1AfterMscalGeneric
+            g_genScratch.assign(data, data + 0x4000u);
+            if (!g.run(g_genScratch.data(), kicks))
+            {
+                ++g.fails;
+                return false;
+            }
+            g_genExpected.clear();
+            for (const auto &k : kicks)
+                g_genExpected.insert(g_genExpected.end(), k.begin(), k.end());
+            g_genCaptured.clear();
+            g_hctpPath1Capture = &g_genCaptured;
+            g_genPending = &g;
+            return false;
+        }
+        if (!g.run(data, kicks))
+        {
+            ++g.fails;
+            return false; // inputs outside what the native handles: the VU1 runs it
+        }
+        for (const auto &k : kicks)
+            gs.processGIFPacket(k.data(), static_cast<uint32_t>(k.size()), 1u);
+        ++g.nativeRuns;
+        genericReport();
+        return true;
+    }
+    return false;
+}
+
+void hctpNativeVu1AfterMscalGeneric()
+{
+    if (!g_genPending)
+        return;
+    g_hctpPath1Capture = nullptr;
+    Generic &g = *g_genPending;
+    g_genPending = nullptr;
+    // qword compare; FTOI'd integers may differ by 1 (DIV / rounding), floats by a relative 1e-5
+    const size_t n = std::min(g_genExpected.size(), g_genCaptured.size()) / 16u;
+    uint64_t ok = 0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        const uint8_t *a = g_genExpected.data() + i * 16u, *b = g_genCaptured.data() + i * 16u;
+        bool same = std::memcmp(a, b, 16) == 0;
+        if (!same)
+        {
+            same = true;
+            for (int c = 0; c < 4 && same; ++c)
+            {
+                int32_t x, y;
+                std::memcpy(&x, a + c * 4, 4);
+                std::memcpy(&y, b + c * 4, 4);
+                float fx, fy;
+                std::memcpy(&fx, &x, 4);
+                std::memcpy(&fy, &y, 4);
+                same = std::abs(static_cast<int64_t>(x) - y) <= 1 ||
+                       (std::isfinite(fx) && std::isfinite(fy) && std::fabs(fx - fy) <= 1e-5f * std::fmax(1.0f, std::fabs(fx)));
+            }
+        }
+        ok += same;
+        static int s_dump = 0;
+        if (!same && s_dump < 8)
+        {
+            ++s_dump;
+            uint32_t ua[4], ub[4];
+            std::memcpy(ua, a, 16);
+            std::memcpy(ub, b, 16);
+            std::fprintf(stderr, "[nvu1g] %s mismatch qw %zu/%zu: native %08x %08x %08x %08x vu %08x %08x %08x %08x%c", g.name, i, n,
+                         ua[0], ua[1], ua[2], ua[3], ub[0], ub[1], ub[2], ub[3], 10);
+        }
+    }
+    if (g_genExpected.size() != g_genCaptured.size())
+    {
+        static int s_len = 0;
+        if (s_len++ < 8)
+            std::fprintf(stderr, "[nvu1g] %s packet bytes native %zu vu %zu%c", g.name, g_genExpected.size(), g_genCaptured.size(), 10);
+    }
+    g.qwords += std::max(g_genExpected.size(), g_genCaptured.size()) / 16u;
+    g.okQwords += ok;
+    genericReport();
 }

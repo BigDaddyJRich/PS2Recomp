@@ -1100,8 +1100,13 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     return true;
 }
 
+// HCTP native-VU1 verify: while set (per thread), PATH1 packets are also appended here (hctp_native_vu1.cpp)
+thread_local std::vector<uint8_t> *g_hctpPath1Capture = nullptr;
+
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint8_t path)
 {
+    if (path == 1u && g_hctpPath1Capture && data && sizeBytes)
+        g_hctpPath1Capture->insert(g_hctpPath1Capture->end(), data, data + sizeBytes);
     gateForeignCall();
     ps2_host_profile::Scope profile(ps2_host_profile::GsLock);
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
