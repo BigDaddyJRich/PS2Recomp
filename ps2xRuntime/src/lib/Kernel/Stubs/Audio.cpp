@@ -172,7 +172,22 @@ namespace ps2_stubs
                 return FAST_READ32(recv);
             }
             else if (cmd >= 0x9000u && cmd - 0x9000u < 241u)
+            {
+                // TEMP diag HCTP_SKLOG=<lines>: the sound kit's 64-byte command blocks (sceSkSs* -> sdrdrv/modhsyn),
+                // for the native synth: "[sklog] cmd size w0..w15"
+                static const uint32_t skCap = std::getenv("HCTP_SKLOG") ? static_cast<uint32_t>(std::strtoul(std::getenv("HCTP_SKLOG"), nullptr, 10)) : 0u;
+                static uint32_t skLines = 0u;
+                if (skLines < skCap)
+                {
+                    ++skLines;
+                    char line[400];
+                    int n = std::snprintf(line, sizeof(line), "[sklog] 0x%x size %u", cmd, arg[2]);
+                    for (uint32_t w = 0; w < 16u && w * 4u < arg[2] && n < static_cast<int>(sizeof(line)) - 12; ++w)
+                        n += std::snprintf(line + n, sizeof(line) - n, " %08x", FAST_READ32(arg[1] + w * 4u));
+                    std::fprintf(stderr, "%s\n", line);
+                }
                 sdrCall(rdram, ctx, runtime, cmd, arg[1], arg[2], buf, 16u); // user command (sound kit)
+            }
             else
                 sdrCall(rdram, ctx, runtime, cmd, buf, 64u, buf, 16u);
             return haveResult ? result : FAST_READ32(buf);
