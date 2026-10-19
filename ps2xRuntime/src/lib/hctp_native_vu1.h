@@ -26,3 +26,6 @@ void hctpNativeVu1Census(const uint8_t *code, uint32_t pc, bool mscal);
 // packets they would send with the ones the VU1 sends ([nvu1g] lines every 5 s).
 bool hctpNativeVu1MscalGeneric(const uint8_t *code, uint8_t *data, uint32_t startPC, GS &gs);
 void hctpNativeVu1AfterMscalGeneric(const uint8_t *data = nullptr);
+// p14 shadow volumes (MSCNT at 0x2a18 / 0x3038): HCTP_NATIVE_P14=1 runs the batch natively (true = skip the VU1; the
+// registers are updated in st); HCTP_NATIVE_VERIFY=1 runs it on copies and compares the PATH1 packets
+bool hctpNativeVu1MscntP14(const uint8_t *code, uint8_t *data, VU1State &st, uint32_t top, GS &gs);

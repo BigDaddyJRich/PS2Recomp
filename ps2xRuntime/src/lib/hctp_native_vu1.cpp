@@ -7,6 +7,7 @@
 #include "hctp_native_vu1.h"
 
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/ps2_vu1_compiled.h"
 
 #include <chrono>
 #include <cmath>
@@ -1232,6 +1233,8 @@ namespace
         {"p17 Audience", 0x2a00u, 0x200u, 0x2a00u, 0x6d85202f7ec6d013ull, runP17, "HCTP_NATIVE_P17", false, 0, 0, 0, 0, 0},
         {"p16 Particle", 0x2a00u, 0x200u, 0x2a00u, 0x7d42d0fa68ec24e5ull, runP16, "HCTP_NATIVE_P16", false, 0, 0, 0, 0, 0},
         {"p07 MorphWeights", 0x2800u, 0x190u, 0x2800u, 0xffbdc4d8743d017aull, runP07, "HCTP_NATIVE_P07", false, 0, 0, 0, 0, 0, true},
+        // p14 runs from MSCNT (hctpNativeVu1MscntP14, hctp_native_vu1_p14.inl): here for its switch and verify counters
+        {"p14 Shadow", 0x2a00u, 0x200u, 0xFFFFFFFFu, 0x00e7b7f008461125ull, nullptr, "HCTP_NATIVE_P14", false, 0, 0, 0, 0, 0},
     };
     bool g_genericInit = false;
     Generic *g_genPending = nullptr;
@@ -1399,3 +1402,5 @@ void hctpNativeVu1AfterMscalGeneric(const uint8_t *data)
     g.okQwords += ok;
     genericReport();
 }
+
+#include "hctp_native_vu1_p14.inl"
