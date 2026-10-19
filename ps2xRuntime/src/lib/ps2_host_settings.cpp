@@ -448,6 +448,12 @@ namespace ps2_host_settings
             fillSwitch("HCTP_NATIVE_P10", "1");
             fillSwitch("HCTP_NATIVE_P17", "1"); // crowd, verified 100% (Oct 19)
             fillSwitch("HCTP_NATIVE_P16", "1"); // particles, verified 100% where handled
+            // written, not yet seen in a test match (Jordan: everything native that exists); =0 turns one off
+            fillSwitch("HCTP_NATIVE_P19", "1");
+            fillSwitch("HCTP_NATIVE_P11", "1");
+            fillSwitch("HCTP_NATIVE_P09", "1");
+            fillSwitch("HCTP_NATIVE_P15", "1");
+            fillSwitch("HCTP_NATIVE_LINES", "1");
             fillSwitch("HCTP_NATIVE_P01", "1");
             fillSwitch("HCTP_NATIVE_S1", "15");
             fillSwitch("HCTP_S1_ANYHASH", "1");
