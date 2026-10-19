@@ -444,6 +444,8 @@ namespace ps2_host_settings
             fillSwitch("HCTP_MOVIES", "1");
             fillSwitch("HCTP_VU1_FAST", "1");
             fillSwitch("HCTP_NATIVE_P08", "1");
+            fillSwitch("HCTP_NATIVE_P18", "1");
+            fillSwitch("HCTP_NATIVE_P10", "1");
             fillSwitch("HCTP_NATIVE_P01", "1");
             fillSwitch("HCTP_NATIVE_S1", "15");
             fillSwitch("HCTP_S1_ANYHASH", "1");

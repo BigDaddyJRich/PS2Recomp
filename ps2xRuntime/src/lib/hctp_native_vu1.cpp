@@ -23,9 +23,16 @@ namespace
     // multiplied by q (affine: STQ = (S + scroll, T + scroll, corner Q)); chunks that need clipping stay on the VU1
     constexpr uint64_t kP18Hash = 0x0aa9d7fc6939ef27ull;
     constexpr uint32_t kP18LoopHead = 0x2e30u;
-    int g_variant = 0; // 0 = p08, 1 = p18 (the chunk computeChunk last accepted)
+    // p10 (resident at VU 0x3740, next to p08): p08 with reflection-mapped ST from the vertex normal:
+    // S = [1009].x + n.x * [1009].z, T = [1009].y + n.y * [1009].w, STQ = (S, T, 1) * q
+    constexpr uint64_t kP10Hash = 0x76528d9e4a4a138full;
+    constexpr uint32_t kP10LoopHead = 0x3d80u;
+    int g_variant = 0; // 0 = p08, 1 = p18, 2 = p10 (the chunk computeChunk last accepted)
     bool g_p18 = false; // HCTP_NATIVE_P18=1
+    bool g_p10 = false; // HCTP_NATIVE_P10=1
+    uint64_t g_p10Seen = 0;
     int g_p18PcLog = 0;
+    uint64_t g_p18Seen = 0, g_p18Native = 0; // p18 chunks accepted by computeChunk / drawn natively
 
     struct Corner
     {
@@ -107,12 +114,33 @@ namespace
             ++g_p18PcLog;
             std::fprintf(stderr, "[nvu1] p18 candidate pc=0x%x top=0x%x%c", st.pc, top, 10);
         }
-        if (st.pc != kP08LoopHead && st.pc != kP18LoopHead)
+        if (st.pc == kP10LoopHead)
+        {
+            static uint64_t s_sig10 = 0, s_hash10 = 0;
+            uint64_t sig10;
+            std::memcpy(&sig10, code + 0x3750u, 8);
+            if (sig10 != s_sig10)
+            {
+                s_sig10 = sig10;
+                uint64_t h = 1469598103934665603ull;
+                for (uint32_t i = 0; i < 0x200u; ++i)
+                    h = (h ^ code[0x3740u + i]) * 1099511628211ull;
+                s_hash10 = h;
+            }
+            if (s_hash10 != kP10Hash || !(g_p10 || g_on))
+                return false;
+            g_variant = 2;
+            ++g_p10Seen;
+        }
+        else if (st.pc != kP08LoopHead && st.pc != kP18LoopHead)
             return false;
-        if (s_hash == kP08Hash && st.pc == kP08LoopHead)
+        else if (s_hash == kP08Hash && st.pc == kP08LoopHead)
             g_variant = 0;
         else if (s_hash == kP18Hash && st.pc == kP18LoopHead && (g_p18 || g_on))
+        {
             g_variant = 1;
+            ++g_p18Seen;
+        }
         else
             return false;
         const bool p18 = g_variant == 1;
@@ -150,7 +178,9 @@ namespace
                 o.rgba[c] = ftoi(col, 1.0f);
                 o.col[c] = col;
             }
-            const float st3[3] = {c0[0] + scroll[0], c0[1] + scroll[1], c0[2]};
+            const float *Nn = q(data, cornerIndex(data, top, k) + 160u);
+            const float st3[3] = {g_variant == 2 ? scroll[0] + Nn[0] * scroll[2] : c0[0] + scroll[0],
+                                  g_variant == 2 ? scroll[1] + Nn[1] * scroll[3] : c0[1] + scroll[1], g_variant == 2 ? 1.0f : c0[2]};
             for (int c = 0; c < 3; ++c)
             {
                 o.stq[c] = p18 ? st3[c] : st3[c] * N[3];
@@ -324,6 +354,11 @@ namespace
         if (g_projN)
             std::fprintf(stderr, "[nvu1] p08 clip-space check: %.2f%% of %llu corners%c", 100.0 * g_projOk / g_projN,
                          static_cast<unsigned long long>(g_projN), 10);
+        if (g_p10Seen)
+            std::fprintf(stderr, "[nvu1] p10 chunks seen=%llu%c", static_cast<unsigned long long>(g_p10Seen), 10);
+        if (g_p18Seen)
+            std::fprintf(stderr, "[nvu1] p18 chunks seen=%llu native=%llu%c", static_cast<unsigned long long>(g_p18Seen),
+                         static_cast<unsigned long long>(g_p18Native), 10);
         if (g_nativeChunks)
             std::fprintf(stderr, "[nvu1] p08 native chunks=%llu (clipped tris %llu) vu chunks=%llu%c",
                          static_cast<unsigned long long>(g_nativeChunks), static_cast<unsigned long long>(g_clipTris),
@@ -339,6 +374,8 @@ void hctpNativeVu1Init()
     g_native = n && n[0] == '1' && !g_on;
     const char *n18 = std::getenv("HCTP_NATIVE_P18");
     g_p18 = n18 && n18[0] == '1';
+    const char *n10 = std::getenv("HCTP_NATIVE_P10");
+    g_p10 = n10 && n10[0] == '1';
     if (g_on || g_native)
         std::fprintf(stderr, "[nvu1] p08 spec verify %d native %d%c", g_on ? 1 : 0, g_native ? 1 : 0, 10);
 }
@@ -376,6 +413,8 @@ bool hctpNativeVu1TryDraw(const uint8_t *code, uint8_t *data, const VU1State &st
     if (g_chunkClip)
         gs.processGIFPacket(g_clipPacket.data(), static_cast<uint32_t>(g_clipPacket.size()), 1u);
     ++g_nativeChunks;
+    if (g_variant == 1)
+        ++g_p18Native;
     report();
     return true;
 }
@@ -426,7 +465,7 @@ void hctpNativeVu1AfterResume(const uint8_t *data)
             ++g_dumped;
             std::fprintf(stderr, "[nvu1] mismatch p%d top=0x%x k=%u: stq vu %g %g %g / spec %g %g %g | rgba vu %d %d %d %d / spec %d %d %d %d"
                                  " | xyzf vu %d %d %d %x / spec %d %d %d %x%c",
-                         g_variant ? 18 : 8, g_top, k, stq[0], stq[1], stq[2], e.stq[0], e.stq[1], e.stq[2], rgba[0], rgba[1], rgba[2], rgba[3],
+                         g_variant == 1 ? 18 : g_variant == 2 ? 10 : 8, g_top, k, stq[0], stq[1], stq[2], e.stq[0], e.stq[1], e.stq[2], rgba[0], rgba[1], rgba[2], rgba[3],
                          e.rgba[0], e.rgba[1], e.rgba[2], e.rgba[3], xyz[0], xyz[1], xyz[2], xyz[3], e.xyz[0], e.xyz[1],
                          e.xyz[2], e.xyz[3], 10);
         }

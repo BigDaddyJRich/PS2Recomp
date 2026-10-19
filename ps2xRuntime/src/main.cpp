@@ -218,6 +218,17 @@ int main(int argc, char *argv[])
     try
     {
         std::filesystem::path pathObj = getExecutablePath(argc, argv);
+        {
+            // the game reads its disc files relative to the current folder: run from the ELF's folder (a shortcut
+            // or a double-click elsewhere would otherwise start in the wrong place)
+            std::error_code cwdError;
+            const std::filesystem::path elfFolder = std::filesystem::absolute(pathObj, cwdError).parent_path();
+            if (!cwdError && !elfFolder.empty() && std::filesystem::exists(elfFolder / pathObj.filename(), cwdError))
+            {
+                std::filesystem::current_path(elfFolder, cwdError);
+                pathObj = pathObj.filename();
+            }
+        }
 
         std::string filePathStr = pathObj.string();
         std::string elfName = pathObj.filename().string();
