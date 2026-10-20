@@ -97,9 +97,12 @@ namespace
             case kPbpStop:
                 if (inMatch_ || !queue_.empty())
                     std::fprintf(stderr, "[hctp-pbp] stop: match torn down%c", 10);
+                // ReleaseGameLinkObj also fires on the scene change between two entrances: keep the entrants then,
+                // or Finkel opens the 2nd intro with "scheduled for one fall" again instead of "and his opponent"
+                if (inMatch_)
+                    entrants_.clear();
                 inMatch_ = false;
                 queue_.clear();
-                entrants_.clear();
                 busyUntil_ = now;
                 return;
             case kPbpTag:
