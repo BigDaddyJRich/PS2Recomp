@@ -742,6 +742,13 @@ namespace ps2_stubs
             for (uint32_t i = 0; i < pendingCount; ++i)
             {
                 const Ps2SifDmaTransfer &xfer = pending[i];
+                // HCTP_SIFLOG=<n>: the first n EE->IOP SetDma transfers (src, dest, size, attr, caller)
+                if (static int sifLog = std::getenv("HCTP_SIFLOG") ? std::atoi(std::getenv("HCTP_SIFLOG")) : 0; sifLog > 0)
+                {
+                    --sifLog;
+                    std::fprintf(stderr, "[siflog] src 0x%x dest 0x%x size 0x%x attr 0x%x ra 0x%x%c", xfer.src, xfer.dest,
+                                 static_cast<uint32_t>(xfer.size), xfer.attr, getRegU32(ctx, 31), 10);
+                }
                 if (runtime)
                 {
                     PS2IopTransport::notifyTransfer(runtime, rdram, {

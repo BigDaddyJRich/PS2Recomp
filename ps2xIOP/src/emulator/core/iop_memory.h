@@ -44,6 +44,8 @@ namespace ps2x::iop::detail
             int core = 0; // the SPU2 core (AutoDMA: whose input the pcm feeds)
             uint64_t delayCycles = 0;
             std::vector<int16_t> pcm; // AutoDMA: the stereo frames (L, R interleaved, 48 kHz) the SPU2 plays
+            uint32_t pcmSource = 0;   // AutoDMA: IOP RAM of the L/R blocks (pcm is re-read from here at completion)
+            uint32_t pcmBytes = 0;
         };
 
         IopMemory();

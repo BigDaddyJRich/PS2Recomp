@@ -450,6 +450,20 @@ namespace ps2x::iop::detail
                     }
                 }
                 start.delayCycles = static_cast<uint64_t>(bytes / 4u) * kIopCyclesPerSpuFrame;
+                start.pcmSource = source;
+                start.pcmBytes = bytes;
+                if (static int admaLog = std::getenv("HCTP_ADMALOG") ? std::atoi(std::getenv("HCTP_ADMALOG")) : 0; admaLog > 0)
+                {
+                    --admaLog;
+                    std::fprintf(stderr, "[admalog] core %d src 0x%x bytes 0x%x tadr 0x%x%c", core, source, bytes,
+                                 m_hardware.count(address + 4u) ? m_hardware[address + 4u] : 0u, 10);
+                }
+                // HCTP_ADMADUMP=<file>: the AutoDMA stream as captured (s16le stereo 48 kHz; FMV L/R sync check)
+                if (static std::FILE *dump = [] { const char *p = std::getenv("HCTP_ADMADUMP"); return p ? std::fopen(p, "wb") : nullptr; }(); dump)
+                {
+                    std::fwrite(start.pcm.data(), sizeof(int16_t), start.pcm.size(), dump);
+                    std::fflush(dump);
+                }
                 {
                     // HCTP: [adma] every ~5 s per core: stream blocks fed and their peak (0 = the driver feeds silence)
                     static uint32_t kicks[2] = {0u, 0u};

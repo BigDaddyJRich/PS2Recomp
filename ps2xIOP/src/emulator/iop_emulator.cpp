@@ -257,7 +257,22 @@ namespace ps2x::iop::detail
                 dmaDueFloor = std::min(dmaDueFloor, totalCycles + dma->delayCycles);
                 idleKnown = false;
                 if (!dma->pcm.empty())
-                    memory.spu2().queueInput(dma->core, dma->pcm.data(), dma->pcm.size() / 2u);
+                {
+                    // HCTP: the SPU2 reads an AutoDMA transfer while it plays it, not at the kick. CRI's movie (Sofdec
+                    // ADX) driver is still writing the R half of the ring's last block when it kicks the transfer, so a
+                    // snapshot here gave every 32nd block a stale R (FMV right channel out of sync + pops). Read the
+                    // blocks when the transfer completes instead. EXPERIMENT, opt-in (HCTP_ADMA_LATE=1): it did not fix the
+                    // FMV R channel (R is a whole ring lap, 8192 samples, ahead of L in CRI's PCM ring itself).
+                    static const bool early = std::getenv("HCTP_ADMA_LATE") == nullptr;
+                    if (early || dma->pcmBytes == 0u)
+                        memory.spu2().queueInput(dma->core, dma->pcm.data(), dma->pcm.size() / 2u);
+                    else
+                    {
+                        if (auto old = pendingAdma.find(dma->irq); old != pendingAdma.end())
+                            queueAdma(old->second); // a new transfer before the last one completed: keep its data
+                        pendingAdma[dma->irq] = {dma->core, dma->pcmSource, dma->pcmBytes};
+                    }
+                }
             }
         }
 
@@ -900,6 +915,12 @@ namespace ps2x::iop::detail
             }
             // Exact for what is left; a handler below that starts a new DMA lowers it again (schedulePendingDma).
             dmaDueFloor = remainingFloor;
+            for (const int irq : completed)
+                if (auto adma = pendingAdma.find(irq); adma != pendingAdma.end())
+                {
+                    queueAdma(adma->second);
+                    pendingAdma.erase(adma);
+                }
             try
             {
                 for (const int irq : completed)
@@ -1210,6 +1231,34 @@ namespace ps2x::iop::detail
         IopLoadcore loadcore;
         std::map<int, Module> modules;
         std::map<int, uint64_t> pendingDmaInterrupts;
+        struct PendingAdma
+        {
+            int core = 0;
+            uint32_t source = 0u;
+            uint32_t bytes = 0u;
+        };
+        std::map<int, PendingAdma> pendingAdma; // AutoDMA transfers whose blocks are read at completion (by irq)
+        void queueAdma(const PendingAdma &adma)
+        {
+            const auto ram = memory.ram();
+            if (adma.bytes == 0u || adma.source >= ram.size() || adma.bytes > ram.size() - adma.source)
+                return;
+            std::vector<int16_t> pcm(adma.bytes / 2u);
+            size_t out = 0u;
+            for (uint32_t block = 0u; block < adma.bytes; block += 0x400u) // 512 bytes L then 512 bytes R
+                for (uint32_t i = 0u; i < 256u; ++i)
+                {
+                    int16_t l, r;
+                    std::memcpy(&l, ram.data() + adma.source + block + i * 2u, sizeof(l));
+                    std::memcpy(&r, ram.data() + adma.source + block + 0x200u + i * 2u, sizeof(r));
+                    pcm[out++] = l;
+                    pcm[out++] = r;
+                }
+            // HCTP_ADMADUMP2=<file>: the stream as queued (s16le stereo 48 kHz)
+            if (static std::FILE *dump = [] { const char *p = std::getenv("HCTP_ADMADUMP2"); return p ? std::fopen(p, "wb") : nullptr; }(); dump)
+                std::fwrite(pcm.data(), sizeof(int16_t), pcm.size(), dump);
+            memory.spu2().queueInput(adma.core, pcm.data(), pcm.size() / 2u);
+        }
         std::unordered_map<uint32_t, uint64_t> profileCounts;
         uint64_t profileSamples = 0u;
         uint64_t profileHostNs = 0u;

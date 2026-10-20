@@ -405,6 +405,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_vfs.cpp
     src/lib/ps2_runtime.cpp
     src/lib/hctp_commentary.cpp
+    src/lib/hctp_native_movie.cpp
     src/lib/ps2_host_settings.cpp
     src/lib/ps2_host_update.cpp
     src/lib/ps2_host_window.cpp
