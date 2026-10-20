@@ -2574,7 +2574,23 @@ struct GSD3D11Backend::Impl
         const uint32_t fbp = static_cast<uint32_t>(dispfb & 0x1FFu);
         const uint32_t fbw = static_cast<uint32_t>((dispfb >> 9) & 0x3Fu);
         const uint32_t dbx = static_cast<uint32_t>((dispfb >> 32) & 0x7FFu);
-        const uint32_t dby = static_cast<uint32_t>((dispfb >> 43) & 0x7FFu);
+        uint32_t dby = static_cast<uint32_t>((dispfb >> 43) & 0x7FFu);
+        {
+            // Interlaced frame mode: games alternate DISPFB.DBY by one line per field (invisible on a TV, a one-line
+            // bounce when every field is shown as a progressive frame - all movies, the legal screen). Keep the even line.
+            static const bool s_noStable = std::getenv("HCTP_NO_DBY_STABLE") != nullptr;
+            static uint32_t s_lastDby = 0xFFFFFFFFu;
+            static int s_dbyLogs = 0;
+            if (dby != s_lastDby && s_dbyLogs < 40)
+            {
+                ++s_dbyLogs;
+                std::printf("[dby] %u -> %u smode2=%llx fbp=%u\n", s_lastDby, dby, static_cast<unsigned long long>(req.smode2),
+                            static_cast<unsigned>(dispfb & 0x1FFu));
+            }
+            s_lastDby = dby;
+            if (!s_noStable && (req.smode2 & 3u) == 1u)
+                dby &= ~1u;
+        }
         const uint32_t magh = static_cast<uint32_t>((display >> 23) & 0xFu);
         const uint32_t magv = static_cast<uint32_t>((display >> 27) & 0x3u);
         const uint32_t dw = static_cast<uint32_t>((display >> 32) & 0xFFFu);
