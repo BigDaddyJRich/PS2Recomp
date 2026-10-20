@@ -404,6 +404,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_rom_device.cpp
     src/lib/ps2_vfs.cpp
     src/lib/ps2_runtime.cpp
+    src/lib/hctp_commentary.cpp
     src/lib/ps2_host_settings.cpp
     src/lib/ps2_host_update.cpp
     src/lib/ps2_host_window.cpp
@@ -598,6 +599,10 @@ if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     )
     target_link_libraries(ps2EntryRunner PRIVATE rlImGui imgui)
     target_compile_definitions(ps2EntryRunner PRIVATE PS2X_ENABLE_DEBUG_UI=1)
+    if(NOT TARGET parallel-gs)
+        # no Vulkan present bridge: ps2_debug_panel.cpp supplies the setPresentUi stub
+        target_compile_definitions(ps2EntryRunner PRIVATE PS2X_NO_PRESENT_UI=1)
+    endif()
     # on the Vulkan window (VENDETTA_PRESENT=vulkan): Dear ImGui's GLFW back end for the panel's input, and the
     # presenter (in the runtime) draws its frame
     if(DEFINED raylib_SOURCE_DIR AND EXISTS "${raylib_SOURCE_DIR}/src/external/glfw/include/GLFW/glfw3.h")

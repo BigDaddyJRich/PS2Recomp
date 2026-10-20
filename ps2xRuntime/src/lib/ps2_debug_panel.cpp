@@ -39,6 +39,14 @@
 #include <string>
 #include <vector>
 
+// The debug panel is also built for the OpenGL/raylib target, where the
+// Vulkan present bridge (the owner of the real UI handoff) is not linked.
+// Keep the panel linkable there; the UI is already rendered by its normal
+// raylib path and there is no present bridge to update.
+#if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA) && defined(PS2X_NO_PRESENT_UI)
+void setPresentUi(ImDrawData *) {}
+#endif
+
 namespace
 {
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
