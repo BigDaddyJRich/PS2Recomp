@@ -1872,7 +1872,13 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
 
     const uint32_t mode = (chcr >> 2u) & 0x3u;
     if (mode != 0u)
+    {
+        static std::atomic<int> s_logged{0};
+        if (s_logged.fetch_add(1) < 20)
+            std::fprintf(stderr, "[sprdma] unhandled mode=%u ch=%08x chcr=%08x qwc=%u madr=%08x sadr=%04x\n", mode, channelBase, chcr,
+                         m_ioRegisters[channelBase + 0x20u] & 0xFFFFu, m_ioRegisters[channelBase + 0x10u], m_ioRegisters[channelBase + 0x80u]);
         return false;
+    }
 
     const uint32_t qwc = m_ioRegisters[channelBase + 0x20u] & 0xFFFFu;
     const uint32_t byteCount = qwc * 16u;

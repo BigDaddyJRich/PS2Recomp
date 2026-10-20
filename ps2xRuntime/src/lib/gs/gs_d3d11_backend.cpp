@@ -966,6 +966,60 @@ struct GSD3D11Backend::Impl
         ++syncReasons[syncReason];
     }
 
+    // A local->host transfer of a Z buffer (CGmLensFlare::ReadZbuffer 0x228d40 / CFlash::SynchCallBack 0x22bd20
+    // StoreImage a 4x4 PSMZ24 block at the flash's screen position to hide flashes behind wrestlers): GS depth
+    // lives only on the GPU, so write the requested rect of the depth target back to GS memory first.
+    ComPtr<ID3D11Texture2D> depthStaging;
+    uint32_t depthStagingW = 0, depthStagingH = 0;
+    void syncDepthRect(uint32_t sbp, uint32_t sbw, uint32_t spsm, uint32_t x0, uint32_t y0, uint32_t w, uint32_t h)
+    {
+        static const bool s_off = std::getenv("PS2X_NO_ZREADBACK") != nullptr;
+        if (s_off || (spsm != GS_PSM_Z32 && spsm != GS_PSM_Z24 && spsm != GS_PSM_Z16 && spsm != GS_PSM_Z16S))
+            return;
+        static std::atomic<int> s_logged{0};
+        if (s_logged.fetch_add(1) < 10)
+            std::printf("[zreadback] sbp=%u sbw=%u psm=%u (%u,%u) %ux%u\n", sbp, sbw, spsm, x0, y0, w, h);
+        DepthTarget *dt = nullptr;
+        for (auto &d : depths)
+            if (d.zbpBlock == sbp)
+                dt = &d;
+        if (!dt || !dt->tex || w == 0u || h == 0u)
+            return;
+        flushPending();
+        D3D11_TEXTURE2D_DESC td{};
+        dt->tex->GetDesc(&td);
+        if (!depthStaging || depthStagingW != td.Width || depthStagingH != td.Height)
+        {
+            depthStaging.Reset();
+            td.Usage = D3D11_USAGE_STAGING;
+            td.BindFlags = 0;
+            td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            td.MiscFlags = 0;
+            if (FAILED(dev->CreateTexture2D(&td, nullptr, &depthStaging)))
+                return;
+            depthStagingW = td.Width;
+            depthStagingH = td.Height;
+        }
+        ctx->CopyResource(depthStaging.Get(), dt->tex.Get()); // depth-stencil copies must be whole-resource
+        D3D11_MAPPED_SUBRESOURCE m{};
+        if (FAILED(ctx->Map(depthStaging.Get(), 0, D3D11_MAP_READ, 0, &m)))
+            return;
+        const double top = spsm == GS_PSM_Z32 ? 4294967295.0 : spsm == GS_PSM_Z24 ? 16777215.0 : 65535.0;
+        for (uint32_t y = y0; y < y0 + h && y < dt->h; ++y)
+        {
+            const uint32_t sy = y * scale + scale / 2u;
+            const uint8_t *row = static_cast<const uint8_t *>(m.pData) + sy * m.RowPitch;
+            for (uint32_t x = x0; x < x0 + w && x < dt->w; ++x)
+            {
+                float f;
+                std::memcpy(&f, row + (x * scale + scale / 2u) * 8u, 4); // D32_FLOAT_S8X24: float + stencil/pad
+                const double z = std::clamp(static_cast<double>(f) * 4294967296.0, 0.0, top);
+                mem.WriteVram(spsm, sbp, sbw, x, y, static_cast<uint32_t>(z));
+            }
+        }
+        ctx->Unmap(depthStaging.Get(), 0);
+    }
+
     void syncOverlapping(uint32_t first, uint32_t last)
     {
         for (auto &rt : rts)
@@ -2711,6 +2765,7 @@ void GSD3D11Backend::BeginTransfer(const GSTransferCommand &command)
     else if (command.direction == 1u)
     {
         d.syncOverlapping(sf, sl);
+        d.syncDepthRect(bb.sbp, bb.sbw, bb.spsm, tp.ssax, tp.ssay, tr.rrw, tr.rrh);
     }
     else if (command.direction == 2u)
     {
