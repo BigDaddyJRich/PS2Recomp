@@ -2588,7 +2588,7 @@ struct GSD3D11Backend::Impl
                             static_cast<unsigned>(dispfb & 0x1FFu));
             }
             s_lastDby = dby;
-            if (!s_noStable && (req.smode2 & 3u) == 1u)
+            if (!s_noStable && (req.smode2 & 1u) != 0u) // interlaced, frame or field mode
                 dby &= ~1u;
         }
         const uint32_t magh = static_cast<uint32_t>((display >> 23) & 0xFu);
