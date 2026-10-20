@@ -1,3 +1,4 @@
+#include <atomic>
 #include "Common.h"
 #include "LibC.h"
 #include "ps2_log.h"
@@ -1174,13 +1175,40 @@ namespace ps2_stubs
         setReturnU32(ctx, 0u);
     }
 
+    // EE newlib rand(): 64-bit LCG, 31-bit result (RAND_MAX 0x7FFFFFFF). The host CRT's 15-bit rand broke game code
+    // that shifts the result: randMTfi_Fast 0x140650 = (rand() >> 16) / 32767.0 was always 0, so every pyro spark /
+    // particle got the same "random" direction.
+    // State lives where the game's own rand 0x126b58 keeps it: (*_impure_ptr 0x40dad0) + 0xa8, 64-bit.
+    static uint8_t *randState(uint8_t *rdram)
+    {
+        uint32_t reent = 0;
+        std::memcpy(&reent, getConstMemPtr(rdram, 0x40dad0u), 4);
+        return reent ? getMemPtr(rdram, reent + 0xa8u) : nullptr;
+    }
+
     void rand(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx, std::rand() & 0x7FFF);
+        static const bool s_hostRand = std::getenv("HCTP_HOST_RAND") != nullptr; // A/B: old 15-bit host rand
+        uint8_t *st = s_hostRand ? nullptr : randState(rdram);
+        if (!st)
+        {
+            setReturnS32(ctx, std::rand() & 0x7FFF);
+            return;
+        }
+        uint64_t next;
+        std::memcpy(&next, st, 8);
+        next = next * 6364136223846793005ull + 1u;
+        std::memcpy(st, &next, 8);
+        setReturnS32(ctx, static_cast<int32_t>((next >> 32) & 0x7FFFFFFFu));
     }
 
     void srand(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (uint8_t *st = randState(rdram))
+        {
+            const uint64_t seed = getRegU32(ctx, 4);
+            std::memcpy(st, &seed, 8);
+        }
         std::srand(getRegU32(ctx, 4));
         setReturnS32(ctx, 0);
     }
