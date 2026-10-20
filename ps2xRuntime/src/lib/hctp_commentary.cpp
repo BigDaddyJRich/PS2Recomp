@@ -83,6 +83,7 @@ namespace
                     enqueueRow(team().prediction, arena_ < 10 ? 1.5 : 0.0);
                     nextBanter_ = now + std::chrono::seconds(25);
                     banterCount_ = 0; // first banter of the match is about a wrestler in it
+                    heard_.clear();
                 }
                 else
                 {
@@ -157,7 +158,7 @@ namespace
             for (uint32_t key : {id, id & kRosterMask, alias})
             {
                 for (const Row &r : tables_[t])
-                    if (r.w[0] == key && r.w[1] < clipCount(r.part))
+                    if (r.w[0] == key && r.w[1] < clipCount(r.part) && !heard_.count({r.part, r.w[1]}))
                         rows.push_back(&r);
                 if (!rows.empty())
                     break;
@@ -168,6 +169,7 @@ namespace
                 return;
             }
             const Row &r = *rows[std::uniform_int_distribution<size_t>(0, rows.size() - 1)(rng_)];
+            heard_.insert({r.part, r.w[1]});
             queue_.push_back({r.w[1], 0.0, r.part});
             if (r.w[2] != kNone && r.w[2] < clipCount(r.part)) // the partner's reply (pairBanter)
                 queue_.push_back({r.w[2], 0.4, r.part});
@@ -776,7 +778,16 @@ namespace
         {
             if (table < 0 || size_t(table) >= tables_.size() || tables_[table].empty())
                 return;
-            const Row &row = tables_[table][std::uniform_int_distribution<size_t>(0, tables_[table].size() - 1)(rng_)];
+            // no repeats within a match: pick among rows not heard yet (all heard: start over)
+            std::vector<const Row *> fresh;
+            for (const Row &r : tables_[table])
+                if (!heard_.count({r.part, r.w[1]}))
+                    fresh.push_back(&r);
+            if (fresh.empty())
+                for (const Row &r : tables_[table])
+                    fresh.push_back(&r);
+            const Row &row = *fresh[std::uniform_int_distribution<size_t>(0, fresh.size() - 1)(rng_)];
+            heard_.insert({row.part, row.w[1]});
             bool first = true;
             for (int k = 1; k <= 2; ++k)
             {
@@ -814,7 +825,8 @@ namespace
                     if (const int t = team().wrestlerBanter; t >= 0 && size_t(t) < tables_.size())
                         for (uint32_t id : participants_)
                             for (const Row &r : tables_[t])
-                                if (r.w[0] == id || r.w[0] == (id & kRosterMask) || ((id & kRosterMask) == 0x48u && r.w[0] == 0x03u))
+                                if ((r.w[0] == id || r.w[0] == (id & kRosterMask) || ((id & kRosterMask) == 0x48u && r.w[0] == 0x03u)) &&
+                                    !heard_.count({r.part, r.w[1]})) // only wrestlers with lines not heard yet
                                 {
                                     withLines.push_back(id);
                                     break;
@@ -854,6 +866,7 @@ namespace
         std::vector<uint32_t> entrants_;
         std::map<uint32_t, uint32_t> lastMove_;
         std::map<uint32_t, std::pair<uint32_t, bool>> moveMap_;
+        std::set<std::pair<uint32_t, uint32_t>> heard_; // (partition, clip) said this match - no repeats
     public:
         std::map<uint32_t, uint32_t> charaRoster_; // CChar guest address -> roster id
     private:
