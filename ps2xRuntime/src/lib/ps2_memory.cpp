@@ -22,6 +22,8 @@ namespace ps2_stubs { void mpegIpuToDmaStart(uint8_t *rdram, uint32_t &chcr, uin
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
 #else
 #include <sys/mman.h>
 #endif
@@ -83,6 +85,22 @@ namespace
                          "- something relied on RAM wrapping at 32 MB\n",
                          rec->ExceptionInformation[0] == 1 ? "write" : "read",
                          static_cast<unsigned>(host - base));
+            // Which host (= recompiled game) function did it: symbol + call stack from the PDB.
+            HANDLE proc = GetCurrentProcess();
+            SymInitialize(proc, nullptr, TRUE);
+            alignas(SYMBOL_INFO) char symBuf[sizeof(SYMBOL_INFO) + 256] = {};
+            auto *sym = reinterpret_cast<SYMBOL_INFO *>(symBuf);
+            sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+            sym->MaxNameLen = 255;
+            void *frames[24] = {};
+            const USHORT n = CaptureStackBackTrace(0, 24, frames, nullptr);
+            frames[0] = rec->ExceptionAddress;
+            for (USHORT i = 0; i < n; ++i)
+            {
+                DWORD64 disp = 0;
+                if (SymFromAddr(proc, reinterpret_cast<DWORD64>(frames[i]), &disp, sym))
+                    std::fprintf(stderr, "[ram]   #%u %s+0x%llx\n", i, sym->Name, static_cast<unsigned long long>(disp));
+            }
             std::fflush(stderr);
         }
         return EXCEPTION_CONTINUE_SEARCH;
