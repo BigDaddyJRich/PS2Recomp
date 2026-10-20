@@ -80,7 +80,8 @@ namespace
                     if (arena_ < 10)
                         enqueueRow(team().welcome, 0.0);
                     enqueueRow(team().prediction, arena_ < 10 ? 1.5 : 0.0);
-                    nextBanter_ = now + std::chrono::seconds(35);
+                    nextBanter_ = now + std::chrono::seconds(25);
+                    banterCount_ = 0; // first banter of the match is about a wrestler in it
                 }
                 else
                 {
@@ -202,7 +203,7 @@ namespace
                             rows.push_back(&r);
             if (rows.empty())
             {
-                moveReaction(moveId, always);
+                moveReaction(moveId, always, performer);
                 return;
             }
             // attacker and receiver both carry the move id while it happens: one call per move
@@ -220,7 +221,7 @@ namespace
 
         // an ordinary move: the team's reaction line for it, by the game's own chance (w2 %), only when nobody is
         // talking and at most every 10 s (banter and finisher calls come first). Called with m_ held.
-        void moveReaction(uint32_t moveId, bool always)
+        void moveReaction(uint32_t moveId, bool always, uint32_t performer)
         {
             const int t = team().moveReaction;
             const auto now = Clock::now();
@@ -237,7 +238,7 @@ namespace
                 return;
             std::vector<const Row *> rows;
             for (const Row &r : tables_[t])
-                if (r.w[0] == moveId && r.w[1] < clipCount(r.part))
+                if (r.w[0] == moveId && r.w[1] < clipCount(r.part) && (r.owner == 0xFFFFu || r.owner == performer))
                     rows.push_back(&r);
             if (rows.empty())
                 return;
@@ -415,6 +416,8 @@ namespace
             loadBeta();
             loadExtra();
             loadMoveMap();
+            loadLineOwners();
+            dropMisfiledBanter();
             loadFinkel();
             const char *teamEnv = std::getenv("HCTP_PBP_TEAM");
             raw_ = teamEnv && (teamEnv[0] == 'r' || teamEnv[0] == 'R');
@@ -471,6 +474,60 @@ namespace
         uint32_t clipCount(uint32_t part) const
         {
             return uint32_t(part == 15 ? betaSeconds_.size() : part == 16 ? extraSeconds_.size() : seconds_.size());
+        }
+
+        // BGM/PBP_BANTER_DROP.csv (tools/build_banter_drop.py): wrestler-banter lines SvR files under a number that is a
+        // different wrestler in HCTP (Beefcake under Hogan (Legend), Mankind under DiBiase...) - removed
+        void dropMisfiledBanter()
+        {
+            std::ifstream f("BGM/PBP_BANTER_DROP.csv");
+            std::string row;
+            std::getline(f, row);
+            std::set<std::pair<uint32_t, uint32_t>> drop;
+            while (std::getline(f, row))
+            {
+                std::stringstream ss(row);
+                std::string a, b;
+                if (std::getline(ss, a, ',') && std::getline(ss, b, ','))
+                    drop.insert({uint32_t(std::strtoul(a.c_str(), nullptr, 10)), uint32_t(std::strtoul(b.c_str(), nullptr, 10))});
+            }
+            size_t n = 0;
+            for (const TeamTables *t : {&kColeTazz, &kJrKing})
+                if (t->wrestlerBanter >= 0 && size_t(t->wrestlerBanter) < tables_.size())
+                {
+                    auto &v = tables_[t->wrestlerBanter];
+                    const size_t before = v.size();
+                    v.erase(std::remove_if(v.begin(), v.end(), [&](const Row &r) { return drop.count({r.part, r.w[1]}) != 0; }), v.end());
+                    n += before - v.size();
+                }
+            std::cerr << "[hctp-pbp] misfiled banter dropped: " << n << std::endl;
+        }
+
+        // BGM/PBP_LINE_OWNERS.csv (tools/map_moves.py): partition, clip, roster id - retail move lines that name a
+        // wrestler ("Kane with the chokeslam", Edge's spear) only play when that wrestler did the move
+        void loadLineOwners()
+        {
+            std::ifstream f("BGM/PBP_LINE_OWNERS.csv");
+            std::string row;
+            std::getline(f, row);
+            std::map<std::pair<uint32_t, uint32_t>, uint16_t> own;
+            while (std::getline(f, row))
+            {
+                std::stringstream ss(row);
+                std::string a, b, c;
+                if (std::getline(ss, a, ',') && std::getline(ss, b, ',') && std::getline(ss, c, ','))
+                    own[{uint32_t(std::strtoul(a.c_str(), nullptr, 10)), uint32_t(std::strtoul(b.c_str(), nullptr, 10))}] =
+                        uint16_t(std::strtoul(c.c_str(), nullptr, 16));
+            }
+            size_t n = 0;
+            for (const TeamTables *t : {&kColeTazz, &kJrKing})
+                for (const auto &[table, col] : {std::pair{t->finisherA, 2}, std::pair{t->finisherB, 2}, std::pair{t->moveReaction, 1}})
+                    if (table >= 0 && size_t(table) < tables_.size())
+                        for (Row &r : tables_[table])
+                            if (r.owner == 0xFFFFu)
+                                if (const auto it = own.find({r.part, r.w[col]}); it != own.end())
+                                    r.owner = it->second, ++n;
+            std::cerr << "[hctp-pbp] owner-only move lines: " << n << " rows" << std::endl;
         }
 
         // BGM/PBP_MOVEMAP.csv (tools/map_moves.py): hctp_move, svr_move, always
@@ -537,6 +594,8 @@ namespace
                     r.w[0] = 0x04u; // "...RVD's gonna smoke this guy" was filed under the Undertaker
                 else if (r.w[1] == 394u && r.w[0] == 0x53u)
                     r.w[0] = 0x55u; // the Ultimo Dragon line was filed under Rhyno
+                else if (r.w[1] == 306u && r.w[0] == 0x09u)
+                    r.w[0] = 0x53u; // "the man beast from Detroit" (Rhyno) was filed under Benoit
             }
             std::set<uint32_t> inBeta;
             for (uint32_t s : samples)
@@ -551,6 +610,10 @@ namespace
                 if (size_t(m[0]) >= beta.size() || size_t(m[1]) >= tables_.size())
                     continue;
                 std::vector<Row> merged = beta[m[0]];
+                if (m[2] == 2) // beta finisher rows: w0 = the HCTP roster id the line is about -> owner-only
+                    for (Row &r : merged)
+                        if (r.w[0] < 0x56u)
+                            r.owner = r.w[0];
                 added += merged.size();
                 for (const Row &r : tables_[m[1]])
                 {
@@ -714,11 +777,13 @@ namespace
                                     withLines.push_back(id);
                                     break;
                                 }
-                    if (!withLines.empty() && (banterCount_++ % 2) == 1)
+                    // two of every three banters are about someone in the match (Jordan: Brock came up too rarely), the
+                    // first one right after the opening lines; every third stays general banter
+                    if (!withLines.empty() && (banterCount_++ % 3) != 2)
                         enqueueWrestlerLine(withLines[std::uniform_int_distribution<size_t>(0, withLines.size() - 1)(rng_)]);
                     else
                         enqueueRow(team().banter, 0.0);
-                    nextBanter_ = now + std::chrono::seconds(25 + std::uniform_int_distribution<int>(0, 20)(rng_));
+                    nextBanter_ = now + std::chrono::seconds(20 + std::uniform_int_distribution<int>(0, 15)(rng_));
                 }
                 if (queue_.empty())
                     continue;
