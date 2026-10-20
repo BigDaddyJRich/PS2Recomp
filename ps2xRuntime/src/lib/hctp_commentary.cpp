@@ -94,6 +94,14 @@ namespace
                     enqueueRow(t.matchEnd, 1.0);
                 }
                 break;
+            case kPbpStop:
+                if (inMatch_ || !queue_.empty())
+                    std::fprintf(stderr, "[hctp-pbp] stop: match torn down%c", 10);
+                inMatch_ = false;
+                queue_.clear();
+                entrants_.clear();
+                busyUntil_ = now;
+                return;
             case kPbpTag:
                 if (inMatch_ && queue_.empty())
                     enqueueRow(t.tag, 0.3);
@@ -840,7 +848,17 @@ namespace
                     nextBanter_ = now + std::chrono::seconds(20 + std::uniform_int_distribution<int>(0, 15)(rng_));
                 }
                 if (queue_.empty())
+                {
+                    // quiet: give the audio player back so the commentary never holds one between lines
+                    if (playerHeld_)
+                    {
+                        playerHeld_ = false;
+                        lock.unlock();
+                        hctpNativeStopCommentary();
+                        lock.lock();
+                    }
                     continue;
+                }
                 Line line = queue_.front();
                 if (now < busyUntil_ + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(line.gapBefore)))
                     continue;
@@ -852,6 +870,7 @@ namespace
                 busyUntil_ = now + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(len));
                 lock.unlock();
                 const bool ok = hctpNativePlayAfsClip(line.partition, line.clip);
+                playerHeld_ = ok;
                 std::fprintf(stderr, "[hctp-pbp] line %u/%u (%.1f s)%s%c", line.partition, line.clip, len, ok ? "" : " REJECTED", 10);
                 lock.lock();
             }
@@ -876,7 +895,7 @@ namespace
         Clock::time_point lastEntrance_{};
         std::deque<Line> queue_;
         std::mt19937 rng_{std::random_device{}()};
-        bool loaded_ = false, raw_ = false, inMatch_ = false, teamForced_ = false;
+        bool loaded_ = false, raw_ = false, inMatch_ = false, teamForced_ = false, playerHeld_ = false;
         int arena_ = 0;
         Clock::time_point lastBell_{}, matchStart_{}, nextBanter_{}, busyUntil_{}, lastActivity_{}, lastCalledAt_{}, nextReaction_{};
         uint32_t lastCalledMove_ = 0;

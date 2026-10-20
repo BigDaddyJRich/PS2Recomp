@@ -10,6 +10,8 @@
 extern "C" bool hctpNativePlayPbpClip(uint32_t clipIndex);
 // Any host AFS partition (14 = BGM/FINKEL.afs).
 extern "C" bool hctpNativePlayAfsClip(uint32_t partition, uint32_t clipIndex);
+// Stops the commentary line and frees its player (teardown, and whenever the engine goes quiet).
+extern "C" void hctpNativeStopCommentary();
 
 enum HctpPbpEvent : uint32_t
 {
@@ -17,6 +19,7 @@ enum HctpPbpEvent : uint32_t
     kPbpTag = 2,       // tag made
     kPbpInterfere = 3, // someone not in the match gets involved
     kPbpOutside = 4,   // action outside the ring
+    kPbpStop = 5,      // match / demo torn down (skip, quit, restart): stop at once
 };
 
 // Called by the overrides on game events (any thread).
