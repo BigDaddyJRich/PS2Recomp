@@ -47,4 +47,17 @@ namespace ps2x::iop
     }
 
     void registerNativeHook(const NativeHook &hook);
+
+    // A native sound driver on the host side (HCTP's native sound kit) driving the IOP's SPU2: register writes queued
+    // from any thread, applied in order at the start of the IOP's next time slice (before the SPU2 plays on).
+    void spu2QueueWrite(uint32_t offset, uint16_t value);
+    // what such a driver reads back: per core, ENVX of the 24 voices and ENDX (voices that reached their end flag);
+    // refreshed about every millisecond of IOP time
+    struct Spu2Snapshot
+    {
+        uint16_t envx[2][24] = {};
+        uint32_t endx[2] = {};
+        uint64_t serial = 0;
+    };
+    [[nodiscard]] Spu2Snapshot spu2Snapshot();
 }

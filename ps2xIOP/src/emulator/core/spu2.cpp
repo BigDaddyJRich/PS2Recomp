@@ -241,6 +241,18 @@ namespace ps2x::iop::detail
             Voice &voice = core.voices[index];
             const uint32_t fieldBase = base + 0x1C0u + static_cast<uint32_t>(index) * 12u;
             voice.nextAddress = composeAddress(reg(fieldBase), reg(fieldBase + 2u)); // SSA
+            {
+                // HCTP_KONLOG=<n>: each key-on's registers (A/B of the native sound kit vs the IOP's modhsyn)
+                static const int konCap = std::getenv("HCTP_KONLOG") ? std::atoi(std::getenv("HCTP_KONLOG")) : 0;
+                static int konLines = 0;
+                if (konLines < konCap)
+                {
+                    ++konLines;
+                    const uint32_t vb = base + static_cast<uint32_t>(index) * 0x10u;
+                    std::fprintf(stderr, "[konlog] c%d v%02d volL %04x volR %04x pitch %04x adsr %04x %04x ssa %05x%c", coreIndex,
+                                 index, reg(vb), reg(vb + 2u), reg(vb + 4u), reg(vb + 6u), reg(vb + 8u), voice.nextAddress, 10);
+                }
+            }
             voice.phase = Phase::Attack;
             voice.envelope = 0;
             voice.envelopeCounter = 0u;

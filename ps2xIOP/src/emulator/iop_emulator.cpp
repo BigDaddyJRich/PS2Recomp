@@ -33,6 +33,54 @@
 #include <sstream>
 #include <utility>
 #include <vector>
+#include <mutex>
+
+namespace ps2x::iop
+{
+    namespace
+    {
+        // the host-side sound driver's SPU2 writes (spu2QueueWrite) and the read-back snapshot (spu2Snapshot)
+        std::mutex g_spu2NativeLock;
+        std::vector<std::pair<uint32_t, uint16_t>> g_spu2NativeQueue;
+        Spu2Snapshot g_spu2Snapshot;
+        uint64_t g_spu2SnapshotCycle = 0;
+    }
+
+    void spu2QueueWrite(uint32_t offset, uint16_t value)
+    {
+        std::lock_guard<std::mutex> lock(g_spu2NativeLock);
+        g_spu2NativeQueue.emplace_back(offset, value);
+    }
+
+    Spu2Snapshot spu2Snapshot()
+    {
+        std::lock_guard<std::mutex> lock(g_spu2NativeLock);
+        return g_spu2Snapshot;
+    }
+}
+
+namespace ps2x::iop::detail
+{
+    // at the start of each IOP time slice: the queued writes, in order; the snapshot every ~1 ms (36,864 IOP cycles)
+    static void spu2NativeService(Spu2 &spu2, uint64_t iopCycle)
+    {
+        std::lock_guard<std::mutex> lock(g_spu2NativeLock);
+        for (const auto &w : g_spu2NativeQueue)
+            spu2.write16(w.first, w.second);
+        g_spu2NativeQueue.clear();
+        if (iopCycle - g_spu2SnapshotCycle < 36864u && g_spu2Snapshot.serial != 0)
+            return;
+        g_spu2SnapshotCycle = iopCycle;
+        for (int core = 0; core < 2; ++core)
+        {
+            const uint32_t base = static_cast<uint32_t>(core) * 0x400u;
+            for (int v = 0; v < 24; ++v)
+                g_spu2Snapshot.envx[core][v] = spu2.read16(base + static_cast<uint32_t>(v) * 0x10u + 0xAu);
+            g_spu2Snapshot.endx[core] = spu2.read16(base + 0x340u) | (static_cast<uint32_t>(spu2.read16(base + 0x342u)) << 16u);
+        }
+        ++g_spu2Snapshot.serial;
+    }
+}
 
 namespace ps2x::iop::detail
 {
@@ -1260,6 +1308,7 @@ namespace ps2x::iop::detail
             return;
         }
         m_impl->eeCycleCarry = total % 8u;
+        spu2NativeService(m_impl->memory.spu2(), m_impl->totalCycles);
         static const bool profile = std::getenv("VENDETTA_IOPPROF") != nullptr;
         if (!profile)
         {
