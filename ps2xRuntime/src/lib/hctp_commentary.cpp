@@ -496,6 +496,16 @@ namespace
         void pairBanter()
         {
             size_t n = 0;
+            std::vector<std::pair<uint16_t, uint16_t>> pairs; // (clip, reply), partition 13
+            {
+                std::ifstream f("BGM/PBP_BANTER_PAIRS.csv");
+                std::string line;
+                std::getline(f, line); // header
+                unsigned part = 0, clip = 0, reply = 0;
+                while (std::getline(f, line))
+                    if (std::sscanf(line.c_str(), "%u,%u,%u", &part, &clip, &reply) == 3 && part == 13u)
+                        pairs.push_back({uint16_t(clip), uint16_t(reply)});
+            }
             for (const TeamTables *t : {&kColeTazz, &kJrKing})
                 for (int table : {t->banter, t->wrestlerBanter})
                 {
@@ -507,9 +517,27 @@ namespace
                         if (v[i].w[2] == kNone)
                             at[{v[i].part, v[i].w[0], v[i].w[1]}] = i;
                     std::vector<bool> gone(v.size(), false);
+                    if (table == kJrKing.wrestlerBanter) // no parity there: BGM/PBP_BANTER_PAIRS.csv (tools/build_banter_pairs.py)
+                    {
+                        std::map<uint16_t, size_t> clipAt;
+                        for (size_t i = 0; i < v.size(); ++i)
+                            if (v[i].part == 13 && v[i].w[2] == kNone)
+                                clipAt[v[i].w[1]] = i;
+                        for (const auto &[clip, reply] : pairs)
+                        {
+                            const auto a = clipAt.find(clip), b = clipAt.find(reply);
+                            if (a == clipAt.end() || b == clipAt.end() || gone[a->second] || gone[b->second])
+                                continue;
+                            v[a->second].w[2] = reply;
+                            gone[b->second] = true;
+                            ++n;
+                        }
+                    }
                     for (size_t i = 0; i < v.size(); ++i)
                     {
                         Row &r = v[i];
+                        if (table == kJrKing.wrestlerBanter) // even/odd there is mostly one man talking twice
+                            break;
                         if (gone[i] || r.w[2] != kNone || (r.w[1] & 1u) != 0u)
                             continue;
                         const auto it = at.find({r.part, r.w[0], uint16_t(r.w[1] + 1u)});
@@ -839,9 +867,10 @@ namespace
                                     withLines.push_back(id);
                                     break;
                                 }
-                    // two of every three banters are about someone in the match (Jordan: Brock came up too rarely), the
-                    // first one right after the opening lines; every third stays general banter
-                    if (!withLines.empty() && (banterCount_++ % 3) != 2)
+                    // the first banter is about someone in the match, then one of every two (Cole/Tazz) or every three
+                    // (JR/King, whose wrestler lines are many) - general banter dominates (Jordan, Oct 20)
+                    const uint32_t every = team().wrestlerBanter == kJrKing.wrestlerBanter ? 3u : 2u;
+                    if (!withLines.empty() && (banterCount_++ % every) == 0)
                         enqueueWrestlerLine(withLines[std::uniform_int_distribution<size_t>(0, withLines.size() - 1)(rng_)]);
                     else
                         enqueueRow(team().banter, 0.0);
