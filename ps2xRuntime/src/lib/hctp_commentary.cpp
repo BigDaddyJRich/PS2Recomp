@@ -82,7 +82,7 @@ namespace
                         enqueueRow(team().welcome, 0.0);
                     enqueueRow(team().prediction, arena_ < 10 ? 1.5 : 0.0);
                     nextBanter_ = now + std::chrono::seconds(25);
-                    banterCount_ = 0; // first banter of the match is about a wrestler in it
+                    spoken_.clear(); // SvR: one superstar line per wrestler per match
                     heard_.clear();
                 }
                 else
@@ -181,9 +181,7 @@ namespace
             }
             const Row &r = *rows[std::uniform_int_distribution<size_t>(0, rows.size() - 1)(rng_)];
             heard_.insert({r.part, r.w[1]});
-            queue_.push_back({r.w[1], 0.0, r.part});
-            if (r.w[2] != kNone && r.w[2] < clipCount(r.part)) // the partner's reply (pairBanter)
-                queue_.push_back({r.w[2], 0.4, r.part});
+            pushSequence(r, 1, 0.0);
         }
 
         // finisher / signature move calls: rows (w0 wrestler, w1 move id, w2 clip, w3 delay) of the team's two tables
@@ -210,16 +208,23 @@ namespace
             // timeline for mapping moves by hand ("the Spear was at 1:32"): every new move, seconds since the bell
             std::fprintf(stderr, "[hctp-pbp] mv %4.0fs %u chara %08x%c",
                          std::chrono::duration<double>(Clock::now() - matchStart_).count(), moveId, chara, 10);
+            // SvR 0x213870: ONE of the two finisher tables at random, a row with w0 == the performer's roster id and
+            // w1 == the move (retail rows; w0 255 = anyone); beta / extra rows carry their owner instead
+            (void)always;
             std::vector<const Row *> rows;
+            const uint32_t who = performer == 0x48u ? 0x03u : performer; // Undertaker (Legend) uses Taker's lines
+            const int coin = std::uniform_int_distribution<int>(0, 1)(rng_) ? team().finisherB : team().finisherA;
             for (int t : {team().finisherA, team().finisherB})
                 if (t >= 0 && size_t(t) < tables_.size())
-                    for (const Row &r : tables_[t])
-                        if (r.w[1] == moveId && r.w[2] < clipCount(r.part) &&
-                            (r.owner == 0xFFFFu || r.owner == performer))
-                            rows.push_back(&r);
+                for (const Row &r : tables_[t])
+                    if ((t == coin || r.part != 13) && // the coin is SvR's rule for its own rows; added packs always
+                        r.w[1] == moveId && r.w[2] < clipCount(r.part) &&
+                        (r.part == 13 && r.owner == 0xFFFFu ? (r.w[0] == 0xFFu || r.w[0] == who)
+                                                             : (r.owner == 0xFFFFu || r.owner == performer)))
+                        rows.push_back(&r);
             if (rows.empty())
             {
-                moveReaction(moveId, always, performer);
+                moveReaction(moveId, false, performer);
                 return;
             }
             // attacker and receiver both carry the move id while it happens: one call per move
@@ -231,7 +236,8 @@ namespace
             const Row &r = *rows[std::uniform_int_distribution<size_t>(0, rows.size() - 1)(rng_)];
             std::fprintf(stderr, "[hctp-pbp] finisher move %u -> line %u/%u%c", moveId, r.part, r.w[2], 10);
             queue_.clear(); // a finisher call beats whatever banter was waiting
-            queue_.push_back({r.w[2], 0.2, r.part});
+            // w3 = the row's delay in frames (SvR counts it down before speaking)
+            queue_.push_back({r.w[2], r.part == 13 && r.w[3] != kNone && r.w[3] < 600u ? r.w[3] / 60.0 : 0.2, r.part});
             cv_.notify_all();
         }
 
@@ -250,7 +256,7 @@ namespace
                 if (moveId == lastCalledMove_ && now - lastCalledAt_ < std::chrono::seconds(8))
                     return;
             }
-            else if (!queue_.empty() || now < busyUntil_ || now < nextReaction_)
+            else if (!queue_.empty() || now < busyUntil_) // SvR 0x213ae0: only while nobody is talking
                 return;
             std::vector<const Row *> rows;
             for (const Row &r : tables_[t])
@@ -262,7 +268,6 @@ namespace
             const int chance = always ? 100 : r.w[2] <= 100u ? int(r.w[2]) : 25;
             if (std::uniform_int_distribution<int>(0, 99)(rng_) >= chance)
                 return;
-            nextReaction_ = now + std::chrono::seconds(10);
             if (always)
             {
                 lastCalledMove_ = moveId;
@@ -499,16 +504,6 @@ namespace
         void pairBanter()
         {
             size_t n = 0;
-            std::vector<std::pair<uint16_t, uint16_t>> pairs; // (clip, reply), partition 13
-            {
-                std::ifstream f("BGM/PBP_BANTER_PAIRS.csv");
-                std::string line;
-                std::getline(f, line); // header
-                unsigned part = 0, clip = 0, reply = 0;
-                while (std::getline(f, line))
-                    if (std::sscanf(line.c_str(), "%u,%u,%u", &part, &clip, &reply) == 3 && part == 13u)
-                        pairs.push_back({uint16_t(clip), uint16_t(reply)});
-            }
             for (const TeamTables *t : {&kColeTazz, &kJrKing})
                 for (int table : {t->banter, t->wrestlerBanter})
                 {
@@ -520,26 +515,10 @@ namespace
                         if (v[i].w[2] == kNone)
                             at[{v[i].part, v[i].w[0], v[i].w[1]}] = i;
                     std::vector<bool> gone(v.size(), false);
-                    if (table == kJrKing.wrestlerBanter) // no parity there: BGM/PBP_BANTER_PAIRS.csv (tools/build_banter_pairs.py)
-                    {
-                        std::map<uint16_t, size_t> clipAt;
-                        for (size_t i = 0; i < v.size(); ++i)
-                            if (v[i].part == 13 && v[i].w[2] == kNone)
-                                clipAt[v[i].w[1]] = i;
-                        for (const auto &[clip, reply] : pairs)
-                        {
-                            const auto a = clipAt.find(clip), b = clipAt.find(reply);
-                            if (a == clipAt.end() || b == clipAt.end() || gone[a->second] || gone[b->second])
-                                continue;
-                            v[a->second].w[2] = reply;
-                            gone[b->second] = true;
-                            ++n;
-                        }
-                    }
                     for (size_t i = 0; i < v.size(); ++i)
                     {
                         Row &r = v[i];
-                        if (table == kJrKing.wrestlerBanter) // even/odd there is mostly one man talking twice
+                        if (t == &kJrKing) // SvR's JR/King rows already list their exchanges (w1, w2...); no guessing
                             break;
                         if (gone[i] || r.w[2] != kNone || (r.w[1] & 1u) != 0u)
                             continue;
@@ -827,11 +806,20 @@ namespace
                     fresh.push_back(&r);
             const Row &row = *fresh[std::uniform_int_distribution<size_t>(0, fresh.size() - 1)(rng_)];
             heard_.insert({row.part, row.w[1]});
+            pushSequence(row, row.w[1] == 0 && row.w[2] != kNone ? 2 : 1, gap);
+        }
+
+        // SvR plays a row as a sequence: clips w[from]..w7 in order until -1 (0x212930 / 0x212df0) - that is how its
+        // exchanges work (JR line, King's reply...)
+        void pushSequence(const Row &row, int from, double gap)
+        {
             bool first = true;
-            for (int k = 1; k <= 2; ++k)
+            for (int k = from; k < 8; ++k)
             {
                 const uint16_t c = row.w[k];
-                if (c == kNone || c >= clipCount(row.part) || (c == 0 && k == 1 && row.w[2] != kNone))
+                if (c == kNone)
+                    break;
+                if (c >= clipCount(row.part))
                     continue;
                 queue_.push_back({c, first ? gap : 0.4, row.part});
                 first = false;
@@ -865,19 +853,23 @@ namespace
                         for (uint32_t id : participants_)
                             for (const Row &r : tables_[t])
                                 if ((r.w[0] == id || r.w[0] == (id & kRosterMask) || ((id & kRosterMask) == 0x48u && r.w[0] == 0x03u)) &&
-                                    !heard_.count({r.part, r.w[1]})) // only wrestlers with lines not heard yet
+                                    !spoken_.count(id & kRosterMask) && !heard_.count({r.part, r.w[1]}))
                                 {
                                     withLines.push_back(id);
                                     break;
                                 }
-                    // the first banter is about someone in the match, then one of every two (Cole/Tazz) or every three
-                    // (JR/King, whose wrestler lines are many) - general banter dominates (Jordan, Oct 20)
-                    const uint32_t every = team().wrestlerBanter == kJrKing.wrestlerBanter ? 3u : 2u;
-                    if (!withLines.empty() && (banterCount_++ % every) == 0)
-                        enqueueWrestlerLine(withLines[std::uniform_int_distribution<size_t>(0, withLines.size() - 1)(rng_)]);
+                    // SvR (0x212f30, list 0x34c700): a topic is a superstar line or general banter 50/50; each wrestler
+                    // in the match gets one superstar line (queued once at match setup, removed when used), then the
+                    // topics are general banter; the next topic starts 30 s (0x708 frames) after this one started
+                    if (!withLines.empty() && std::uniform_int_distribution<int>(0, 1)(rng_) == 0)
+                    {
+                        const uint32_t id = withLines[std::uniform_int_distribution<size_t>(0, withLines.size() - 1)(rng_)];
+                        spoken_.insert(id & kRosterMask);
+                        enqueueWrestlerLine(id);
+                    }
                     else
                         enqueueRow(team().banter, 0.0);
-                    nextBanter_ = now + std::chrono::seconds(20 + std::uniform_int_distribution<int>(0, 15)(rng_));
+                    nextBanter_ = now + std::chrono::seconds(30);
                 }
                 if (queue_.empty())
                 {
@@ -922,7 +914,7 @@ namespace
         std::map<uint32_t, uint32_t> charaRoster_; // CChar guest address -> roster id
     private:
         std::vector<uint32_t> participants_;
-        uint32_t banterCount_ = 0;
+        std::set<uint32_t> spoken_; // wrestlers whose one superstar line this match was used
         std::set<uint32_t> loggedMoves_;
         Clock::time_point lastEntrance_{};
         std::deque<Line> queue_;
