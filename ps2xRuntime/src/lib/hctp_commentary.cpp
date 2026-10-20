@@ -18,6 +18,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 namespace
@@ -168,6 +169,8 @@ namespace
             }
             const Row &r = *rows[std::uniform_int_distribution<size_t>(0, rows.size() - 1)(rng_)];
             queue_.push_back({r.w[1], 0.0, r.part});
+            if (r.w[2] != kNone && r.w[2] < clipCount(r.part)) // the partner's reply (pairBanter)
+                queue_.push_back({r.w[2], 0.4, r.part});
         }
 
         // finisher / signature move calls: rows (w0 wrestler, w1 move id, w2 clip, w3 delay) of the team's two tables
@@ -418,6 +421,7 @@ namespace
             loadMoveMap();
             loadLineOwners();
             dropMisfiledBanter();
+            pairBanter();
             loadFinkel();
             const char *teamEnv = std::getenv("HCTP_PBP_TEAM");
             raw_ = teamEnv && (teamEnv[0] == 'r' || teamEnv[0] == 'R');
@@ -474,6 +478,44 @@ namespace
         uint32_t clipCount(uint32_t part) const
         {
             return uint32_t(part == 15 ? betaSeconds_.size() : part == 16 ? extraSeconds_.size() : seconds_.size());
+        }
+
+        // SvR records banter as exchanges: Cole (even clip) then Tazz's reply (the next, odd clip) - JR / King the same.
+        // Join each even line with the odd line right after it (same table, same wrestler) into one row that plays
+        // both in order, and drop the reply as a row of its own so it never plays without the line it answers.
+        void pairBanter()
+        {
+            size_t n = 0;
+            for (const TeamTables *t : {&kColeTazz, &kJrKing})
+                for (int table : {t->banter, t->wrestlerBanter})
+                {
+                    if (table < 0 || size_t(table) >= tables_.size())
+                        continue;
+                    auto &v = tables_[table];
+                    std::map<std::tuple<uint32_t, uint16_t, uint16_t>, size_t> at; // (part, w0, clip) -> row
+                    for (size_t i = 0; i < v.size(); ++i)
+                        if (v[i].w[2] == kNone)
+                            at[{v[i].part, v[i].w[0], v[i].w[1]}] = i;
+                    std::vector<bool> gone(v.size(), false);
+                    for (size_t i = 0; i < v.size(); ++i)
+                    {
+                        Row &r = v[i];
+                        if (gone[i] || r.w[2] != kNone || (r.w[1] & 1u) != 0u)
+                            continue;
+                        const auto it = at.find({r.part, r.w[0], uint16_t(r.w[1] + 1u)});
+                        if (it == at.end() || gone[it->second])
+                            continue;
+                        r.w[2] = uint16_t(r.w[1] + 1u);
+                        gone[it->second] = true;
+                        ++n;
+                    }
+                    std::vector<Row> kept;
+                    for (size_t i = 0; i < v.size(); ++i)
+                        if (!gone[i])
+                            kept.push_back(v[i]);
+                    v = std::move(kept);
+                }
+            std::cerr << "[hctp-pbp] banter exchanges paired: " << n << std::endl;
         }
 
         // BGM/PBP_BANTER_DROP.csv (tools/build_banter_drop.py): wrestler-banter lines SvR files under a number that is a
