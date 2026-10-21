@@ -609,6 +609,7 @@ struct GSD3D11Backend::Impl
 
     uint32_t lastUploadDbp = 0;
     uint32_t shownFbp[2] = {0xFFFFFFFFu, 0xFFFFFFFFu}; // frame pages of the last two presented buffers (upload-into-display log)
+    uint32_t shownPages[2] = {0u, 0u};                 // their size in pages (fbw * rows shown)
     // Page span of the host->local transfer in progress (pixel data arrives after BeginTransfer).
     uint32_t uploadFirst = 1u, uploadLast = 0u;
     uint64_t statNativeDraws = 0;
@@ -2641,11 +2642,6 @@ struct GSD3D11Backend::Impl
         const uint64_t dispfb = en1 ? req.dispfb1 : req.dispfb2;
         const uint64_t display = en1 ? req.display1 : req.display2;
         const uint32_t fbp = static_cast<uint32_t>(dispfb & 0x1FFu);
-        if (fbp != shownFbp[0])
-        {
-            shownFbp[1] = shownFbp[0];
-            shownFbp[0] = fbp;
-        }
         const uint32_t fbw = static_cast<uint32_t>((dispfb >> 9) & 0x3Fu);
         const uint32_t dbx = static_cast<uint32_t>((dispfb >> 32) & 0x7FFu);
         uint32_t dby = static_cast<uint32_t>((dispfb >> 43) & 0x7FFu);
@@ -2687,6 +2683,16 @@ struct GSD3D11Backend::Impl
         }
         if (w == 0u || h == 0u || fbw == 0u)
             return false;
+        {
+            const uint32_t pages = fbw * ((dby + h + 31u) / 32u); // 32-bit pages are 64 x 32: fbw pages per 32 rows
+            if (fbp != shownFbp[0])
+            {
+                shownFbp[1] = shownFbp[0];
+                shownPages[1] = shownPages[0];
+                shownFbp[0] = fbp;
+            }
+            shownPages[0] = pages;
+        }
 
         RenderTarget *rt = findRt(framePageBaseToBlock(fbp));
         std::snprintf(lastPresent, sizeof(lastPresent), "circuit=%d fbp=%u fbw=%u dbx=%u dby=%u w=%u h=%u rt=%s",
@@ -2860,7 +2866,7 @@ void GSD3D11Backend::BeginTransfer(const GSTransferCommand &command)
                 const uint32_t f = d.shownFbp[sb];
                 if (f == 0xFFFFFFFFu)
                     continue;
-                const uint32_t a = f, b = f + 112u; // a 512x448 32-bit buffer = 112 pages
+                const uint32_t a = f, b = f + std::max(d.shownPages[sb], 1u) - 1u;
                 if (dl < a || df > b)
                     continue;
                 ++s_shownLogs;
