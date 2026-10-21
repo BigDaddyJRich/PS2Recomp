@@ -867,8 +867,20 @@ void GS::presentUnlocked(const GSDisplayRegs &regs, uint64_t vsyncTick, bool for
         static const double s_dumpSec = s_dumpEnv ? std::atof(s_dumpEnv) : -1.0;
         static const auto s_t0 = std::chrono::steady_clock::now();
         static bool s_dumped = false;
-        if (s_dumpSec >= 0.0 && !s_dumped && (m_backend || m_gpu) &&
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - s_t0).count() >= s_dumpSec)
+        // HCTP_VRAM_DUMP_GO=1: also dump whenever vram_dump.go appears in the working directory (deleted after; to catch
+        // a screen that is hard to time, e.g. an entrance nameplate)
+        static const bool s_goEnv = std::getenv("HCTP_VRAM_DUMP_GO") != nullptr;
+        static uint32_t s_goCheck = 0;
+        bool goNow = false;
+        if (s_goEnv && (m_backend || m_gpu) && (++s_goCheck % 30u) == 0u)
+            if (FILE *g = std::fopen("vram_dump.go", "rb"))
+            {
+                std::fclose(g);
+                std::remove("vram_dump.go");
+                goNow = true;
+            }
+        if (goNow || (s_dumpSec >= 0.0 && !s_dumped && (m_backend || m_gpu) &&
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - s_t0).count() >= s_dumpSec))
         {
             s_dumped = true;
             std::vector<uint8_t> vram;

@@ -2089,7 +2089,9 @@ struct GSD3D11Backend::Impl
         // ---- depth
         const uint32_t ztest = static_cast<uint32_t>((c.test >> 16) & 1u);
         const uint32_t ztst = static_cast<uint32_t>((c.test >> 17) & 3u);
-        const bool depthNeeded = !(ztest && ztst == 1u && c.zbuf.zmask) && !(!ztest && c.zbuf.zmask);
+        // TEST.ZTE = 0: no depth test AND no depth write (PCSX2 GSRendererHW: zm = ZMSK || !ZTE). HCTP's rope shadows
+        // (ALPHA 0x62, TEST 0, ZMSK 0, z ~ 0) wrote depth here: floating clear quads hiding the ring behind them
+        const bool depthNeeded = ztest && !(ztst == 1u && c.zbuf.zmask);
         DepthTarget *dt = nullptr;
         if (depthNeeded)
             dt = getDepth(framePageBaseToBlock(c.zbuf.zbp), rt->w, rt->h);
@@ -2545,7 +2547,7 @@ struct GSD3D11Backend::Impl
                 return;
             }
         }
-        const bool zwrite = dt && !c.zbuf.zmask;
+        const bool zwrite = dt && !c.zbuf.zmask && ztest;
         if (ate && atst != 1u && afail != 0u)
         {
             drawPass(0.0f, zwrite, false, false);

@@ -1744,7 +1744,8 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
         WriteVramUnlocked(fpsm, fbp, fbw, x, y, pixel);
     }
 
-    if (writeMask.writeDepth && !ctx.zbuf.zmask)
+    // TEST.ZTE = 0 writes no depth either (PCSX2 GSRendererHW: zm = ZMSK || !ZTE)
+    if (writeMask.writeDepth && !ctx.zbuf.zmask && ((ctx.test >> 16) & 1u) != 0u)
     {
         WriteVramUnlocked(zpsm, zbp, fbw, x, y, z);
     }
