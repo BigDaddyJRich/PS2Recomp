@@ -48,6 +48,7 @@ using namespace GSInternal;
 namespace
 {
     std::atomic<GSD3D11Backend::Impl *> g_activeImpl{nullptr};
+    std::atomic<uint32_t> g_presentSmode2{0}; // SMODE2 INT|FFMD of the last presented frame (field-mode Y snap)
 
     // ------------------------------------------------------------------ helpers
     bool isIndexed4(uint8_t psm) { return psm == GS_PSM_T4 || psm == GS_PSM_T4HL || psm == GS_PSM_T4HH; }
@@ -1696,7 +1697,24 @@ struct GSD3D11Backend::Impl
 
         const auto &c = st.context;
         const float ofx = static_cast<float>(c.xyoffset.ofx) / 16.0f;
-        const float ofy = static_cast<float>(c.xyoffset.ofy) / 16.0f;
+        // Interlaced FIELD mode (SMODE2 = 3): games draw a half-height field and move XYOFFSET.Y by half a line
+        // every field (the interlace on a TV). Every field is shown as a whole frame here, so that half line is a
+        // bounce (caution screen, menus): snap the offset to whole pixels. HCTP_NO_OFY_SNAP=1 = raw offset.
+        uint32_t ofyRaw = c.xyoffset.ofy;
+        {
+            static const bool s_noSnap = std::getenv("HCTP_NO_OFY_SNAP") != nullptr;
+            static uint32_t s_lastOfy = 0xFFFFFFFFu;
+            static int s_ofyLogs = 0;
+            if (ofyRaw != s_lastOfy && s_ofyLogs < 40)
+            {
+                ++s_ofyLogs;
+                std::printf("[ofy] %u -> %u (1/16 px) smode2=%u%c", s_lastOfy, ofyRaw, g_presentSmode2.load(), 10);
+            }
+            s_lastOfy = ofyRaw;
+            if (!s_noSnap && g_presentSmode2.load() == 3u)
+                ofyRaw &= ~15u;
+        }
+        const float ofy = static_cast<float>(ofyRaw) / 16.0f;
         const uint8_t zpsm = c.zbuf.psm;
         auto mk = [&](const GSVertex &v, const GSVertex &colorSrc) -> Vtx
         {
@@ -2600,6 +2618,7 @@ struct GSD3D11Backend::Impl
         uint32_t h = (dh + 1u) / (magv + 1u);
         const bool interlaced = (req.smode2 & 1u) != 0u;
         const bool fieldMode = (req.smode2 & 2u) != 0u;
+        g_presentSmode2.store(static_cast<uint32_t>(req.smode2 & 3u));
         if (interlaced && fieldMode)
             h /= 2u;
         if (w == 0u || h == 0u || fbw == 0u)
