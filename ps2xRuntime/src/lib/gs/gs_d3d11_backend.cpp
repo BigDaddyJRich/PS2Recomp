@@ -1337,6 +1337,16 @@ struct GSD3D11Backend::Impl
         }
         uint32_t first, last;
         pageSpan(t.tbp0, t.tbw, t.psm, 0, th, first, last);
+        // A texture wider than its buffer width spills into the next page row (GS page index is
+        // (y/ph)*bufferPages + x/pw), past the span computed from the rows alone. Extended before the render-target
+        // sync below, or RT data in the spill page / the page past an unaligned TBP stays stale in VRAM.
+        {
+            uint32_t pw, ph;
+            pageSize(t.psm, pw, ph);
+            const uint32_t bwp = std::max<uint32_t>(1u, (std::max<uint32_t>(t.tbw, 1u) * 64u + pw - 1u) / pw);
+            const uint32_t widest = t.tbp0 / 32u + ((th - 1u) / ph) * bwp + (tw - 1u) / pw + ((t.tbp0 & 31u) ? 1u : 0u);
+            last = std::max(last, std::min<uint32_t>(widest, 511u));
+        }
         syncReason = "texture";
         if (syncLogEnabled)
             if (syncLogEnabled) std::snprintf(syncDetail, sizeof(syncDetail), "tbp=%u tbw=%u psm=%u %ux%u pages=%u-%u", t.tbp0, t.tbw, t.psm, tw, th,
@@ -1358,15 +1368,6 @@ struct GSD3D11Backend::Impl
         {
             const uint32_t k4[] = {st.texa.ta0, st.texa.ta1, st.texa.aem ? 1u : 0u};
             key = fnv1a(k4, sizeof(k4), key);
-        }
-        // A texture wider than its buffer width spills into the next page row (GS page index is
-        // (y/ph)*bufferPages + x/pw), past the span computed from the rows alone.
-        {
-            uint32_t pw, ph;
-            pageSize(t.psm, pw, ph);
-            const uint32_t bwp = std::max<uint32_t>(1u, (std::max<uint32_t>(t.tbw, 1u) * 64u + pw - 1u) / pw);
-            const uint32_t widest = t.tbp0 / 32u + ((th - 1u) / ph) * bwp + (tw - 1u) / pw + ((t.tbp0 & 31u) ? 1u : 0u);
-            last = std::max(last, std::min<uint32_t>(widest, 511u));
         }
         static const bool s_noCache = std::getenv("PS2X_TEX_NOCACHE") != nullptr; // debug: decode every lookup
         const uint64_t stamp = texturePageStamp(first, last);
