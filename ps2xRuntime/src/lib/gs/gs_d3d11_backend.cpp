@@ -610,6 +610,7 @@ struct GSD3D11Backend::Impl
     uint32_t lastUploadDbp = 0;
     uint32_t shownFbp[2] = {0xFFFFFFFFu, 0xFFFFFFFFu}; // frame pages of the last two presented buffers (upload-into-display log)
     uint32_t shownPages[2] = {0u, 0u};                 // their size in pages (fbw * rows shown)
+    uint32_t shownFbw[2] = {0u, 0u};                   // their buffer width
     // Page span of the host->local transfer in progress (pixel data arrives after BeginTransfer).
     uint32_t uploadFirst = 1u, uploadLast = 0u;
     uint64_t statNativeDraws = 0;
@@ -1874,7 +1875,7 @@ struct GSD3D11Backend::Impl
             for (int sb = 0; sb < 2 && s_sd < 200; ++sb)
             {
                 const uint32_t f = shownFbp[sb];
-                if (f == 0xFFFFFFFFu || (rt->fbpBlock / 32u == f && rt->fbw == 8u))
+                if (f == 0xFFFFFFFFu || (rt->fbpBlock / 32u == f && rt->fbw == shownFbw[sb]))
                     continue;
                 const uint32_t fe = f + std::max(shownPages[sb], 1u) - 1u;
                 if (b < f || a > fe)
@@ -2719,9 +2720,11 @@ struct GSD3D11Backend::Impl
             {
                 shownFbp[1] = shownFbp[0];
                 shownPages[1] = shownPages[0];
+                shownFbw[1] = shownFbw[0];
                 shownFbp[0] = fbp;
             }
             shownPages[0] = pages;
+            shownFbw[0] = fbw;
         }
 
         RenderTarget *rt = findRt(framePageBaseToBlock(fbp));
