@@ -2621,6 +2621,15 @@ struct GSD3D11Backend::Impl
         g_presentSmode2.store(static_cast<uint32_t>(req.smode2 & 3u));
         if (interlaced && fieldMode)
             h /= 2u;
+        // A TV shows at most ~480 lines of an interlaced frame. HCTP's post-match Now Loading sets DISPLAY.DH for
+        // 896 lines while flipping between buffers at fbp 0 and 112 (448 rows each): the 512-row target at 0 then
+        // showed 512 rows, the one at 112 only 448 - a different picture height every frame (flicker). Off-screen
+        // lines are cut, as on the CRT: anything taller than 480 is shown as the 448-line frame. HCTP_NO_DH_CLAMP=1 = raw.
+        {
+            static const bool s_noClamp = std::getenv("HCTP_NO_DH_CLAMP") != nullptr;
+            if (!s_noClamp && interlaced && !fieldMode && h > 480u)
+                h = 448u;
+        }
         if (w == 0u || h == 0u || fbw == 0u)
             return false;
 
@@ -3093,9 +3102,28 @@ bool GSD3D11Backend::PresentLatchedToHost()
     static const char *shotDir = std::getenv("HCTP_SHOT_DIR");
     static auto shotLast = std::chrono::steady_clock::now();
     static int shotN = 0;
-    if (shotDir && d->displayTex && std::chrono::steady_clock::now() - shotLast > std::chrono::seconds(10))
+    // <dir>\burst.go present: the next 30 presented frames back to back (bshot_NNN.ppm + a [burst] log line each),
+    // then the trigger file is removed - for flicker hunts (Now Loading after matches)
+    static int burstLeft = 0, burstN = 0;
+    static auto burstCheck = std::chrono::steady_clock::now();
+    if (shotDir && burstLeft == 0 && std::chrono::steady_clock::now() - burstCheck > std::chrono::milliseconds(500))
     {
-        shotLast = std::chrono::steady_clock::now();
+        burstCheck = std::chrono::steady_clock::now();
+        char trig[512];
+        std::snprintf(trig, sizeof(trig), "%s\\burst.go", shotDir);
+        if (std::remove(trig) == 0)
+            burstLeft = 30;
+    }
+    const bool burst = burstLeft > 0;
+    if (shotDir && d->displayTex && (burst || std::chrono::steady_clock::now() - shotLast > std::chrono::seconds(10)))
+    {
+        if (!burst)
+            shotLast = std::chrono::steady_clock::now();
+        else
+        {
+            --burstLeft;
+            std::printf("[burst] %d frame=%llu %s%c", 29 - burstLeft, static_cast<unsigned long long>(d->frameCounter), d->lastPresent, 10);
+        }
         D3D11_TEXTURE2D_DESC td{};
         d->displayTex->GetDesc(&td);
         td.Usage = D3D11_USAGE_STAGING;
@@ -3110,7 +3138,10 @@ bool GSD3D11Backend::PresentLatchedToHost()
             if (SUCCEEDED(d->ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m)))
             {
                 char path[512];
-                std::snprintf(path, sizeof(path), "%s\\nshot_%03d.ppm", shotDir, shotN++);
+                if (burst)
+                    std::snprintf(path, sizeof(path), "%s\\bshot_%03d.ppm", shotDir, burstN++);
+                else
+                    std::snprintf(path, sizeof(path), "%s\\nshot_%03d.ppm", shotDir, shotN++);
                 if (FILE *f = std::fopen(path, "wb"))
                 {
                     std::fprintf(f, "P6 %u %u 255%c", td.Width, td.Height, 10);
