@@ -1918,6 +1918,21 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
 
     const bool fromScratchpad = channelBase == kSprFromChannel;
     uint32_t scratchOffset = originalSadr;
+    if (fromScratchpad)
+    {
+        // [sprstat] rope-shadow stacking hunt: fromSPR copies per scratchpad half, and how many repeat the previous
+        // copy byte-for-byte (a stale half sent twice). Every 20000 copies.
+        static uint64_t s_n = 0, s_half[2] = {0, 0}, s_same = 0;
+        static std::vector<uint8_t> s_prev;
+        const uint32_t take = std::min<uint32_t>(byteCount, PS2_SCRATCHPAD_SIZE - originalSadr);
+        ++s_half[originalSadr >= 0x2000u ? 1 : 0];
+        if (s_prev.size() == take && take != 0u && std::memcmp(s_prev.data(), m_scratchpad + originalSadr, take) == 0)
+            ++s_same;
+        s_prev.assign(m_scratchpad + originalSadr, m_scratchpad + originalSadr + take);
+        if (++s_n % 20000u == 0u)
+            std::fprintf(stderr, "[sprstat] fromSPR copies=%llu half0=%llu half1=%llu repeats=%llu%c", static_cast<unsigned long long>(s_n),
+                         static_cast<unsigned long long>(s_half[0]), static_cast<unsigned long long>(s_half[1]), static_cast<unsigned long long>(s_same), 10);
+    }
     uint32_t bytesLeft = byteCount;
     uint32_t copied = 0u;
     while (bytesLeft != 0u)
