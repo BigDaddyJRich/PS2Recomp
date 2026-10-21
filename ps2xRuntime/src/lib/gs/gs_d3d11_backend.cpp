@@ -1863,6 +1863,29 @@ struct GSD3D11Backend::Impl
         const uint32_t drawnH = static_cast<uint32_t>(std::max(0.0f, std::ceil(maxY))) + 1u;
         const uint32_t needH = std::min<uint32_t>({2048u, static_cast<uint32_t>(c.scissor.y1) + 1u, drawnH});
         RenderTarget *rt = getRt(fbpBlock, c.frame.fbw, c.frame.psm, needH);
+        if (rt)
+        {
+            // [showndraw] a draw into the memory of a displayed buffer through a different frame setup (another
+            // width / format / base): D3D11 keeps that as a separate target, the shown one never sees it (pre-match
+            // loading screen black block hunt). First 200.
+            static int s_sd = 0;
+            uint32_t a, b;
+            rtPageSpan(*rt, a, b);
+            for (int sb = 0; sb < 2 && s_sd < 200; ++sb)
+            {
+                const uint32_t f = shownFbp[sb];
+                if (f == 0xFFFFFFFFu || (rt->fbpBlock / 32u == f && rt->fbw == 8u))
+                    continue;
+                const uint32_t fe = f + std::max(shownPages[sb], 1u) - 1u;
+                if (b < f || a > fe)
+                    continue;
+                ++s_sd;
+                std::printf("[showndraw] frame=%llu shown fbp=%u <- draw fbp=%u fbw=%u psm=%u pages %u-%u sc=%u,%u-%u,%u n=%zu abe=%d tme=%d%c",
+                            static_cast<unsigned long long>(frameCounter), f, rt->fbpBlock / 32u, rt->fbw, rt->psm, a, b,
+                            c.scissor.x0, c.scissor.y0, c.scissor.x1, c.scissor.y1, pending.size(), st.prim.abe ? 1 : 0, st.prim.tme ? 1 : 0, 10);
+                break;
+            }
+        }
         if (!rt)
         {
             pending.clear();
@@ -2423,7 +2446,8 @@ struct GSD3D11Backend::Impl
             if (s_traceVerts)
             {
                 std::printf("[gs-verts]");
-                for (size_t i = 0; i < pending.size() && i < 8; ++i)
+                static const size_t s_vmax = std::getenv("PS2X_GS_TRACE_VERTS_ALL") ? 100000u : 8u;
+                for (size_t i = 0; i < pending.size() && i < s_vmax; ++i)
                     std::printf(" (%.2f,%.2f,%.6f st %.4f,%.4f,%.5f)", pending[i].x, pending[i].y, pending[i].z, pending[i].s, pending[i].t, pending[i].q);
                 std::printf(" ");
             }
