@@ -2368,6 +2368,10 @@ struct GSD3D11Backend::Impl
         static const long s_traceFbp = std::getenv("PS2X_GS_TRACE_FBP") ? std::atol(std::getenv("PS2X_GS_TRACE_FBP")) : -1;
         if (s_traceFbp >= 0 && static_cast<long>(c.frame.fbp) != s_traceFbp)
             traceAbeOk = false;
+        // PS2X_GS_TRACE_ALPHA=<hex>: only blended draws with that ALPHA low byte (e.g. 62 = rope shadow Cd - Cs*FIX)
+        static const long s_traceAlpha = std::getenv("PS2X_GS_TRACE_ALPHA") ? std::strtol(std::getenv("PS2X_GS_TRACE_ALPHA"), nullptr, 16) : -1;
+        if (s_traceAlpha >= 0 && (!pendingState.prim.abe || static_cast<long>(c.alpha & 0xFFu) != s_traceAlpha))
+            traceAbeOk = false;
         if (s_traced < s_traceLimit && frameCounter >= s_traceFrame && traceTimeOk && traceTexOk && traceAbeOk && !pending.empty())
         {
             if (s_traced == 0)

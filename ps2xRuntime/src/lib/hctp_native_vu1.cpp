@@ -1234,6 +1234,7 @@ namespace
         bool on;
         uint64_t runs, nativeRuns, qwords, okQwords, fails;
         bool memCompare = false; // verify VU1 data memory (programs that only write memory, no GS packets)
+        bool off = false; // HCTP_NATIVE_Pxx=0
     };
     Generic g_generic[] = {
         {"p17 Audience", 0x2a00u, 0x200u, 0x2a00u, 0x6d85202f7ec6d013ull, runP17, "HCTP_NATIVE_P17", false, 0, 0, 0, 0, 0},
@@ -1277,13 +1278,16 @@ bool hctpNativeVu1MscalGeneric(const uint8_t *code, uint8_t *data, uint32_t star
     {
         g_genericInit = true;
         for (Generic &g : g_generic)
+        {
             g.on = std::getenv(g.env) && std::getenv(g.env)[0] == '1';
+            g.off = std::getenv(g.env) && std::getenv(g.env)[0] == '0'; // =0: always the VU1, even with natives on
+        }
     }
     if (!code || !data)
         return false;
     for (Generic &g : g_generic)
     {
-        if (g.entry != startPC || (!g.on && !g_on))
+        if (g.entry != startPC || g.off || (!g.on && !g_on))
             continue;
         // the overlay changes rarely: hash only when its first words change
         static uint64_t s_sig[8] = {}, s_hash[8] = {};
