@@ -77,6 +77,7 @@ private:
     {
         uint32_t begin = 0;
         uint32_t end = 0;
+        uint64_t layout = 0; // targets: base block, width and page shape - which row y a word of these pages is on
         bool overlaps(const PageRange &other) const noexcept { return begin < other.end && other.begin < end; }
     };
     static constexpr uint32_t kBandShift = 3u;              // 8-row bands

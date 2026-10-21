@@ -454,7 +454,9 @@ namespace ps2_host_settings
             fillSwitch("HCTP_NATIVE_P09", "1");
             fillSwitch("HCTP_NATIVE_P15", "1");
             fillSwitch("HCTP_NATIVE_LINES", "1");
-            fillSwitch("HCTP_NATIVE_P07", "1"); // morph weights (MSCAL 0x2800)
+            // morph weights (MSCAL 0x2800): OFF - leg/arm/finger shake (Oct 21 split test, Jordan); likely the VU1's
+            // 0x2908 blend reading registers the skipped 0x2800 run would have set. =1 turns it back on
+            fillSwitch("HCTP_NATIVE_P07", "0");
             fillSwitch("HCTP_NATIVE_P01", "1");
             fillSwitch("HCTP_NATIVE_S1", "15");
             fillSwitch("HCTP_S1_ANYHASH", "1");

@@ -765,8 +765,17 @@ void GSCpuBackend::QueueBatchUnlocked(const GSPrimitiveBatch &batch)
     const uint32_t height = static_cast<uint32_t>(ctx.scissor.y1) + 1u;
     const auto framePages = bufferPages(ctx.frame.fbp * 32u, ctx.frame.fbw, ctx.frame.psm, height);
     const auto depthPages = bufferPages(ctx.zbuf.zbp * 32u, ctx.frame.fbw, ctx.zbuf.psm, height);
-    const PageRange frame{framePages.first, framePages.second};
-    const PageRange depth{depthPages.first, depthPages.second};
+    // the layout a target's words are drawn through: the bands split by row y, and one word is on different rows
+    // in two layouts (HCTP's 640-wide Z24 buffer and the PSMT4HL/HH font + HUD textures drawn into its top byte)
+    auto targetLayout = [](uint32_t baseBlock, uint32_t bw, uint32_t psm)
+    {
+        uint32_t pageWidth = 64u, pageHeight = 32u;
+        pageSize(psm, pageWidth, pageHeight);
+        return (static_cast<uint64_t>(baseBlock) << 32u) | (static_cast<uint64_t>(bw & 0xFFFFu) << 16u) |
+               (static_cast<uint64_t>(pageWidth) << 8u) | static_cast<uint64_t>(pageHeight & 0xFFu);
+    };
+    const PageRange frame{framePages.first, framePages.second, targetLayout(ctx.frame.fbp * 32u, ctx.frame.fbw, ctx.frame.psm)};
+    const PageRange depth{depthPages.first, depthPages.second, targetLayout(ctx.zbuf.zbp * 32u, ctx.frame.fbw, ctx.zbuf.psm)};
     PageRange texture{};
     const bool textured = batch.state.prim.tme != 0u;
     if (textured)
@@ -787,6 +796,16 @@ void GSCpuBackend::QueueBatchUnlocked(const GSPrimitiveBatch &batch)
     if (!full && !hazard)
         for (const PageRange &read : m_queuedTextures)
             if (read.overlaps(frame) || read.overlaps(depth))
+            {
+                hazard = true;
+                break;
+            }
+    // write after write through another layout: the two draws' bands would own the same words on different rows,
+    // so threads raced their read-modify-writes (the dots on menu / HUD fonts: row 0 of each page lost its top byte)
+    if (!full && !hazard)
+        for (const PageRange &target : m_queuedTargets)
+            if ((target.overlaps(frame) && target.layout != frame.layout) ||
+                (target.overlaps(depth) && target.layout != depth.layout))
             {
                 hazard = true;
                 break;
@@ -814,7 +833,7 @@ void GSCpuBackend::QueueBatchUnlocked(const GSPrimitiveBatch &batch)
     auto addRange = [](std::vector<PageRange> &ranges, const PageRange &range)
     {
         for (const PageRange &known : ranges)
-            if (known.begin == range.begin && known.end == range.end)
+            if (known.begin == range.begin && known.end == range.end && known.layout == range.layout)
                 return;
         ranges.push_back(range);
     };
