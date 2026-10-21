@@ -1289,6 +1289,26 @@ bool hctpNativeVu1MscalGeneric(const uint8_t *code, uint8_t *data, uint32_t star
     {
         if (g.entry != startPC || g.off || (!g.on && !g_on))
             continue;
+        {
+            // live switch: <HCTP_SHOT_DIR>\\vu17 present = p17 on the real VU1 (A/B of the native port)
+            static const char *s_dir = std::getenv("HCTP_SHOT_DIR");
+            static bool s_vu17 = false;
+            static auto s_chk = std::chrono::steady_clock::now();
+            if (s_dir && std::chrono::steady_clock::now() - s_chk > std::chrono::milliseconds(500))
+            {
+                s_chk = std::chrono::steady_clock::now();
+                char path[512];
+                std::snprintf(path, sizeof(path), "%s\\vu17", s_dir);
+                FILE *f = std::fopen(path, "rb");
+                if ((f != nullptr) != s_vu17)
+                    std::fprintf(stderr, "[abswitch] vu17=%d%c", f != nullptr, 10);
+                s_vu17 = f != nullptr;
+                if (f)
+                    std::fclose(f);
+            }
+            if (s_vu17 && g.run == runP17)
+                continue;
+        }
         // the overlay changes rarely: hash only when its first words change
         static uint64_t s_sig[8] = {}, s_hash[8] = {};
         const size_t gi = static_cast<size_t>(&g - g_generic);

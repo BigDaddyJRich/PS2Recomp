@@ -608,6 +608,7 @@ struct GSD3D11Backend::Impl
     bool hasDisplay = false;
 
     uint32_t lastUploadDbp = 0;
+    uint32_t shownFbp[2] = {0xFFFFFFFFu, 0xFFFFFFFFu}; // frame pages of the last two presented buffers (upload-into-display log)
     // Page span of the host->local transfer in progress (pixel data arrives after BeginTransfer).
     uint32_t uploadFirst = 1u, uploadLast = 0u;
     uint64_t statNativeDraws = 0;
@@ -2327,11 +2328,28 @@ struct GSD3D11Backend::Impl
         static const double s_traceAnchor = std::getenv("PS2X_GS_TRACE_ANCHOR") ? std::atof(std::getenv("PS2X_GS_TRACE_ANCHOR")) : -1.0;
         const double bank1At = g_ps2xBank1LoadedAt.load();
         const double anchorAt = g_ps2xTraceAnchorAt.load();
-        const bool traceTimeOk = s_traceAnchor >= 0.0 ? (anchorAt >= 0.0 && ps2host::timeSeconds() - anchorAt >= s_traceAnchor)
+        // <HCTP_SHOT_DIR>	race.go: start the trace now (and restart its count) - like burst.go, for in-match captures
+        static bool s_traceArmed = false;
+        {
+            static const char *s_shotDir = std::getenv("HCTP_SHOT_DIR");
+            static auto s_lastCheck = std::chrono::steady_clock::now();
+            if (s_shotDir && s_traceLimit > 0 && std::chrono::steady_clock::now() - s_lastCheck > std::chrono::milliseconds(500))
+            {
+                s_lastCheck = std::chrono::steady_clock::now();
+                char trig[512];
+                std::snprintf(trig, sizeof(trig), "%s\\trace.go", s_shotDir);
+                if (std::remove(trig) == 0)
+                {
+                    s_traceArmed = true;
+                    s_traced = 0;
+                }
+            }
+        }
+        const bool traceTimeOk = s_traceArmed || (s_traceAnchor >= 0.0 ? (anchorAt >= 0.0 && ps2host::timeSeconds() - anchorAt >= s_traceAnchor)
                                  : s_traceBank1 >= 0.0
                                      ? (bank1At >= 0.0 && ps2host::timeSeconds() - bank1At >= s_traceBank1)
                                      : (s_traceSec <= 0.0 ||
-                                        std::chrono::duration<double>(std::chrono::steady_clock::now() - s_firstDraw).count() >= s_traceSec);
+                                        std::chrono::duration<double>(std::chrono::steady_clock::now() - s_firstDraw).count() >= s_traceSec));
         // PS2X_GS_TRACE_TBP=<tbp>: only draws sampling that texture address count (e.g. a locked env map).
         static const long s_traceTbp = std::getenv("PS2X_GS_TRACE_TBP") ? std::atol(std::getenv("PS2X_GS_TRACE_TBP")) : -1;
         const bool traceTexOk = (s_traceTbp < 0 || (pendingState.prim.tme && static_cast<long>(pendingState.context.tex0.tbp0) == s_traceTbp));
@@ -2467,6 +2485,34 @@ struct GSD3D11Backend::Impl
             }
         }
 
+        // live A/B switches (rope-shadow hunt): <HCTP_SHOT_DIR>\\skip62 = skip ALPHA 0x62 draws (rope shadow, Cd-Cs),
+        // skipfb = skip draws that texture from another render target, skip64 = skip ALPHA 0x64 blends. Checked twice a second.
+        {
+            static const char *s_dir = std::getenv("HCTP_SHOT_DIR");
+            static bool s62 = false, sfb = false, s64 = false;
+            static auto s_chk = std::chrono::steady_clock::now();
+            if (s_dir && std::chrono::steady_clock::now() - s_chk > std::chrono::milliseconds(500))
+            {
+                s_chk = std::chrono::steady_clock::now();
+                auto has = [](const char *d, const char *n) { char p[512]; std::snprintf(p, sizeof(p), "%s\\%s", d, n); FILE *f = std::fopen(p, "rb"); if (f) std::fclose(f); return f != nullptr; };
+                const bool a = has(s_dir, "skip62"), b = has(s_dir, "skipfb"), c4 = has(s_dir, "skip64");
+                if (a != s62 || b != sfb || c4 != s64)
+                    std::printf("[abswitch] skip62=%d skipfb=%d skip64=%d%c", a, b, c4, 10);
+                s62 = a; sfb = b; s64 = c4;
+            }
+            const uint32_t al = static_cast<uint32_t>(c.alpha & 0xFFu);
+            if ((s62 && st.prim.abe && al == 0x62u) || (sfb && texFromRt) || (s64 && st.prim.abe && al == 0x64u))
+            {
+                if (texFromRt)
+                {
+                    ID3D11ShaderResourceView *nullSrv = nullptr;
+                    ctx->PSSetShaderResources(0, 1, &nullSrv);
+                    bound.srv = nullptr;
+                }
+                pending.clear();
+                return;
+            }
+        }
         const bool zwrite = dt && !c.zbuf.zmask;
         if (ate && atst != 1u && afail != 0u)
         {
@@ -2595,6 +2641,11 @@ struct GSD3D11Backend::Impl
         const uint64_t dispfb = en1 ? req.dispfb1 : req.dispfb2;
         const uint64_t display = en1 ? req.display1 : req.display2;
         const uint32_t fbp = static_cast<uint32_t>(dispfb & 0x1FFu);
+        if (fbp != shownFbp[0])
+        {
+            shownFbp[1] = shownFbp[0];
+            shownFbp[0] = fbp;
+        }
         const uint32_t fbw = static_cast<uint32_t>((dispfb >> 9) & 0x3Fu);
         const uint32_t dbx = static_cast<uint32_t>((dispfb >> 32) & 0x7FFu);
         uint32_t dby = static_cast<uint32_t>((dispfb >> 43) & 0x7FFu);
@@ -2800,6 +2851,25 @@ void GSD3D11Backend::BeginTransfer(const GSTransferCommand &command)
         }
         d.syncOverlapping(df, dl);
         d.recordWriter('U', bb.dbp, bb.dbw, bb.dpsm, tp.dsax, tp.dsay, tr.rrw, tr.rrh);
+        {
+            // [shownup] an upload into the pages of a buffer that is being displayed (the pre-match loading screen's
+            // black top-left block: which transfer lands there, and when). Always on, first 300.
+            static int s_shownLogs = 0;
+            for (int sb = 0; sb < 2 && s_shownLogs < 300; ++sb)
+            {
+                const uint32_t f = d.shownFbp[sb];
+                if (f == 0xFFFFFFFFu)
+                    continue;
+                const uint32_t a = f, b = f + 112u; // a 512x448 32-bit buffer = 112 pages
+                if (dl < a || df > b)
+                    continue;
+                ++s_shownLogs;
+                std::printf("[shownup] frame=%llu shown fbp=%u (%s) <- dbp=%u dbw=%u dpsm=%u at (%u,%u) %ux%u pages %u-%u%c",
+                            static_cast<unsigned long long>(d.frameCounter), f, sb == 0 ? "front" : "back", bb.dbp, bb.dbw, bb.dpsm,
+                            tp.dsax, tp.dsay, tr.rrw, tr.rrh, df, dl, 10);
+                break;
+            }
+        }
         d.invalidateOverlapping(df, dl);
         d.markPagesDirty(df, dl);
         d.uploadFirst = df;
