@@ -40,6 +40,10 @@ namespace
     constexpr uint32_t kP09LoopHead = 0x3720u;
     bool g_p09 = false; // HCTP_NATIVE_P09=1
     uint64_t g_p09Seen = 0;
+    // Imported wrestler materials can carry the reflection-map path even when their
+    // source model was authored without the game's intended skin treatment.  Keep
+    // this opt-in: it is a broad VU model-path switch, not a renderer default.
+    bool g_noGloss = false; // HCTP_NO_GLOSS=1
     // p19 My_Code_TriStripChar_NonClip (overlay 0x2a00): p18's math, but no backface test, no clipping and no ADC
     // (the microcode has no ISW): every corner is drawn
     constexpr uint64_t kP19Hash = 0x43232620e643a207ull;
@@ -160,7 +164,7 @@ namespace
             }
             if (s_hash09 != kP09Hash || !(g_p09 || g_on))
                 return false;
-            g_variant = 4;
+            g_variant = g_noGloss ? 0 : 4;
             ++g_p09Seen;
         }
         else if (st.pc == kP10LoopHead)
@@ -178,7 +182,7 @@ namespace
             }
             if (s_hash10 != kP10Hash || !(g_p10 || g_on))
                 return false;
-            g_variant = 2;
+            g_variant = g_noGloss ? 0 : 2;
             ++g_p10Seen;
         }
         else if (st.pc == kP15LoopHead && s_hash == kP15Hash && (g_p15 || g_on))
@@ -571,6 +575,8 @@ void hctpNativeVu1Init()
     g_p11 = n11 && n11[0] == '1';
     const char *n09 = std::getenv("HCTP_NATIVE_P09");
     g_p09 = n09 && n09[0] == '1';
+    const char *ng = std::getenv("HCTP_NO_GLOSS");
+    g_noGloss = ng && ng[0] == '1';
     const char *n19 = std::getenv("HCTP_NATIVE_P19");
     g_p19 = n19 && n19[0] == '1';
     const char *n15 = std::getenv("HCTP_NATIVE_P15");

@@ -3028,7 +3028,11 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
                 if (!copySource(s_prevField, origin, width, readHeight, false, preserveAlpha, prevSelected, previous, prevPreferred))
                     previous.clear();
             }
-            const uint32_t parity = static_cast<uint32_t>(request.vsyncTick & 1u);
+            // The host presents a complete woven frame, not individual CRT fields.  Do not use
+            // the host/vsync counter here: it advances independently of the GS field buffer and
+            // made an unchanged movie/menu frame alternate its vertical phase every refresh.
+            // The displayed field buffer is already tracked above, so keep a stable weave phase.
+            constexpr uint32_t parity = 0u;
             for (uint32_t y = height; y-- > 0u;)
             {
                 if ((y + 1u) * rowBytes > pixels.size())
