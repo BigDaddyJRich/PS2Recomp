@@ -1072,6 +1072,12 @@ struct GSD3D11Backend::Impl
             const uint32_t rowY1 = (hi / pagesPerRow + 1u) * ph - 1u;
             if (rowY0 >= rt.h)
                 continue;
+            // A pending re-upload for OTHER rows: do it now instead of widening the range over the rows in between.
+            // Those were never written back (the GPU may own them), so re-uploading them from GS memory put stale
+            // or black pixels on screen (pre-match loading screen: 4-bit HH/HL textures uploaded into the shown
+            // buffer in separate row bands -> black top-left block every other frame).
+            if (rt.needsUpload && rt.upY0 != 0xFFFFFFFFu && (rowY0 > rt.upY1 + 1u || rowY1 + 1u < rt.upY0))
+                uploadRtFromVram(rt);
             rt.needsUpload = true;
             rt.upY0 = std::min(rt.upY0, rowY0);
             rt.upY1 = std::max(rt.upY1, std::min(rowY1, rt.h - 1u));
