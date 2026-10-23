@@ -80,9 +80,8 @@ namespace ps2_stubs
         {
             std::string currentDir = "/";
             bool formatted = true;
-            // libmc's sceMcGetInfo reports a card it has not seen since sceMcInit as "changed" (-1, formatted),
-            // and 0 only for the same card again. Games read the type / free / format on that first report
-            // (Def Jam Vendetta asks for them only when the result is non-zero).
+            // Host folders are permanently mounted rather than hot-swappable cards. Keep this field for debug
+            // snapshots, but GetInfo reports a stable formatted device from its first query.
             bool infoReported = false;
         };
 
@@ -897,9 +896,7 @@ namespace ps2_stubs
                 cardType = kMcTypePs2;
                 freeBlocks = state.formatted ? kMcFreeClusters : 0;
                 format = state.formatted ? kMcFormatted : kMcUnformatted;
-                result = !state.formatted        ? kMcResultNoFormat
-                         : !state.infoReported   ? kMcResultChangedCard
-                                                 : kMcResultSucceed;
+                result = !state.formatted ? kMcResultNoFormat : kMcResultSucceed;
                 state.infoReported = true;
             }
 

@@ -156,6 +156,25 @@ namespace
             std::fprintf(stderr, "%c", 10);
         }
 
+        void setTagMatch(bool tag)
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            tagMatch_ = tag;
+        }
+
+        void setTeamSize(uint32_t size)
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            teamSize_ = size == 3u ? 3u : 2u;
+        }
+
+        void setMatchRule(uint32_t rule)
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            matchRule_ = rule & 0xFFu;
+            std::fprintf(stderr, "[hctp-pbp] entrance match rule 0x%02X%c", matchRule_, 10);
+        }
+
         // one of the team's lines about this wrestler (rows with w0 == roster id; w1 = clip). id may carry an attire
         // variant (kVariantShift): that attire's own lines when it has any (nWo Hogan), else the wrestler's lines.
         void enqueueWrestlerLine(uint32_t id)
@@ -286,6 +305,13 @@ namespace
             std::lock_guard<std::mutex> lock(m_);
             if (!loaded_ || inMatch_)
                 return;
+            // HCTP eRuleType 0x52 is Royal Rumble (ConvSelectPosition special-cases the same value). Only the first two entrants
+            // receive the pre-match entrance sequence; later entrants are
+            // handled by the Rumble scene itself rather than Finkel's normal
+            // opponent/team connectors.
+            const bool royalRumble = matchRule_ == 0x52u;
+            if (royalRumble && entrants_.size() >= 2u)
+                return;
             auto pick = [&](uint32_t who, const std::string &kind, bool noTitle) -> int {
                 std::vector<int> c;
                 const auto it = finkel_.find(who);
@@ -322,6 +348,33 @@ namespace
                 title = pick(kConnectors, "title_half_b" + b, false); // tag belts: "one half of the ... Champions"
                 if (title < 0)
                     title = pick(kConnectors, "title_b" + b, false);
+                // The shipped HCTP FINKEL_LINES.csv labels these clips as
+                // generic rows, not title_bN keys. Keep the holder lookup
+                // dynamic, but provide the verified nine-belt fallback.
+                if (title < 0)
+                {
+                    static constexpr int kTitleClips[9][2] = {
+                        {461, 462}, // undisputed WWE title
+                        {463, 464}, // WWE/world heavyweight title
+                        {477, 478}, // WWE Tag Team title / one half
+                        {477, 478}, // World Tag Team title / one half (overridden by title_b3 when imported)
+                        {467, 468}, // Intercontinental title
+                        {-1, -1},   // United States title (provided by imported title_b5 clips)
+                        {479, 480}, // Cruiserweight title
+                        {471, 472}, // Hardcore title
+                        {473, 474}, // Women's title
+                    };
+                    const uint32_t beltIndex = belt - 1u;
+                    if (beltIndex < 9u)
+                    {
+                        const bool tagBelt = beltIndex == 2u || beltIndex == 3u;
+                        title = kTitleClips[beltIndex][tagBelt ? 1 :
+                            std::uniform_int_distribution<int>(0, 1)(rng_)];
+                        if (title >= 0)
+                            std::fprintf(stderr, "[hctp-pbp] dynamic title belt %u -> Finkel clip %d%c",
+                                         beltIndex, title, 10);
+                    }
+                }
             }
             std::vector<int> intro;
             const int from = best(who, "from", true), weight = best(who, "weight", true),
@@ -362,21 +415,101 @@ namespace
             std::vector<int> seq;
             if (entrants_.empty())
             {
-                if (int c = pick(kConnectors, "open", false); c >= 0) seq.push_back(c);
+                if (royalRumble)
+                    seq.push_back(1369); // "Ladies and gentlemen, it is now time for the Royal Rumble..."
+                else if (int c = pick(kConnectors, tagMatch_ ? "open_tag" : "open", false); c >= 0) seq.push_back(c);
+            }
+            else if (royalRumble)
+            {
+                seq.push_back(1418); // "And now, here is the individual who drew number two."
             }
             else
             {
                 const bool prevFemale = isFemale(entrants_.front() & kRosterMask);
-                if (int c = pick(kConnectors, prevFemale ? "and_her_opponent" : "and_his_opponent", false); c >= 0)
+                // Team boundaries come from the match cast count: 2-v-2 groups by two,
+                // 3-v-3 groups by three. The first entrant of the next group is an
+                // opponent; the remaining entrants in that group are partners.
+                const bool opposingTeamFirst = tagMatch_ && entrants_.size() == teamSize_;
+                const char *kind = tagMatch_ && !opposingTeamFirst
+                                       ? (prevFemale ? "and_her_tag_partner" : "and_his_tag_partner")
+                                       : (prevFemale ? "and_her_opponent" : "and_his_opponent");
+                if (int c = pick(kConnectors, kind, false); c >= 0)
                     seq.push_back(c);
             }
             if (int c = pick(kConnectors, female ? "making_her" : "making_his", false); c >= 0) seq.push_back(c);
             seq.insert(seq.end(), intro.begin(), intro.end());
+            // SvR's ring-announcer table has a separate category for a known two-person team:
+            // after both individual introductions, it plays the team's name clip.  Keep this
+            // lookup pair-based (order independent); an unknown pairing retains the normal
+            // partner wording instead of guessing a team name.
+            int teamPbpClip = -1;
+            int stablePbpClip = -1;
+            // A two-person clip is valid only when the entrance group is exactly two.
+            // Do not call the Dudley Boys/Hardy Boys name for a trio (for example,
+            // Dudleys + Spike or Hardy Boys + Lita); those require their own stable clip.
+            if (tagMatch_ && entrants_.size() + 1u == teamSize_)
+            {
+                std::vector<uint32_t> group;
+                for (uint32_t id : entrants_) group.push_back(id & kRosterMask);
+                group.push_back(rosterId & kRosterMask);
+                std::sort(group.begin(), group.end());
+                const uint32_t a = group.front();
+                const uint32_t b = group.size() > 1 ? group[1] : 0;
+                const uint32_t lo = a, hi = b;
+                int teamClip = -1;
+                // SvR retail PBPSVR clip 1358 is the verified recording:
+                // "Bubba Ray and D-Von, the Dudley Boys."
+                if (teamSize_ == 2u && lo == 0x0F && hi == 0x10) teamPbpClip = 1358;
+                // FINKEL.afs LoW section begins at 529. These are the verified LoW team-name rows.
+                if (teamSize_ == 2u && lo == 0x02 && hi == 0x2D) teamClip = 529 + 777; // D-Generation X
+                else if (teamSize_ == 2u && lo == 0x0C && hi == 0x0D) teamClip = 237; // the Hardy Boys (SYM)
+                // SVR PBPSVR has an Evolution call even though HCTP stores its members
+                // as separate teams. Match only exact members of the four-person stable.
+                const auto evolutionMember = [](uint32_t id) {
+                    return id == 0x02 || id == 0x1E || id == 0x3C || id == 0x3D;
+                };
+                if (std::all_of(group.begin(), group.end(), evolutionMember) &&
+                    std::adjacent_find(group.begin(), group.end()) == group.end())
+                {
+                    stablePbpClip = 1361; // "Evolution!"
+                    if (teamSize_ == 2u && lo == 0x1E && hi == 0x3C) stablePbpClip = 1494;
+                    else if (teamSize_ == 2u && lo == 0x02 && hi == 0x3C) stablePbpClip = 1496;
+                    else if (teamSize_ == 2u && lo == 0x02 && hi == 0x1E) stablePbpClip = 1497;
+                    std::fprintf(stderr, "[hctp-pbp] Evolution set size %zu -> PBPSVR clip %d%c",
+                                 group.size(), stablePbpClip, 10);
+                }
+                if (teamClip >= 0)
+                {
+                    seq.push_back(teamClip);
+                    std::fprintf(stderr, "[hctp-pbp] known team pair 0x%02X+0x%02X -> Finkel team clip %d%c",
+                                 lo, hi, teamClip, 10);
+                }
+                if (teamPbpClip >= 0)
+                {
+                    std::fprintf(stderr, "[hctp-pbp] known SVR team pair 0x%02X+0x%02X -> PBPSVR clip %d%c",
+                                 lo, hi, teamPbpClip, 10);
+                }
+                else if (teamClip < 0 && teamPbpClip < 0 && stablePbpClip < 0)
+                {
+                    std::fprintf(stderr, "[hctp-pbp] tag pair 0x%02X+0x%02X has no verified team-name clip%c",
+                                 lo, hi, 10);
+                }
+            }
             entrants_.push_back(rosterId);
             std::fprintf(stderr, "[hctp-pbp] entrance roster 0x%02X -> %zu Finkel line(s)%c", rosterId & kRosterMask, seq.size(), 10);
             for (size_t i = 0; i < seq.size(); ++i)
                 queue_.push_back({uint16_t(seq[i]), i ? 0.25 : 1.0, 14u});
+            if (teamPbpClip >= 0)
+                queue_.push_back({uint16_t(teamPbpClip), 0.25, 13u});
+            if (stablePbpClip >= 0)
+                queue_.push_back({uint16_t(stablePbpClip), 0.25, 13u});
             cv_.notify_all();
+        }
+
+        void resetEntrances()
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            entrants_.clear();
         }
 
         bool load()
@@ -919,7 +1052,8 @@ namespace
         Clock::time_point lastEntrance_{};
         std::deque<Line> queue_;
         std::mt19937 rng_{std::random_device{}()};
-        bool loaded_ = false, raw_ = false, inMatch_ = false, teamForced_ = false, playerHeld_ = false;
+        bool loaded_ = false, raw_ = false, inMatch_ = false, teamForced_ = false, playerHeld_ = false, tagMatch_ = false;
+        uint32_t matchRule_ = 0, teamSize_ = 2;
         int arena_ = 0;
         Clock::time_point lastBell_{}, matchStart_{}, nextBanter_{}, busyUntil_{}, lastActivity_{}, lastCalledAt_{}, nextReaction_{};
         uint32_t lastCalledMove_ = 0;
@@ -945,6 +1079,30 @@ extern "C" void hctpCommentaryEntrance(uint32_t rosterId)
 {
     if ((rosterId & kRosterMask) < 0x56u && engineReady())
         Engine::get().entrance(rosterId);
+}
+
+extern "C" void hctpCommentaryResetEntrances()
+{
+    if (engineReady())
+        Engine::get().resetEntrances();
+}
+
+extern "C" void hctpCommentarySetTagMatch(uint32_t tag)
+{
+    if (engineReady())
+        Engine::get().setTagMatch(tag != 0u);
+}
+
+extern "C" void hctpCommentarySetTeamSize(uint32_t size)
+{
+    if (engineReady())
+        Engine::get().setTeamSize(size);
+}
+
+extern "C" void hctpCommentarySetMatchRule(uint32_t rule)
+{
+    if (engineReady())
+        Engine::get().setMatchRule(rule);
 }
 
 extern "C" void hctpCommentaryMove(uint32_t chara, uint32_t moveId)

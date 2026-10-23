@@ -23,6 +23,8 @@ namespace ps2x::iop::detail
         void reset();
         [[nodiscard]] ModuleLoadResult loadModule(std::string_view path, const void *arguments, uint32_t argumentSize);
         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize);
+        // the name in a buffered IRX's .iopmod section (lower case), "" when it has none
+        [[nodiscard]] std::string bufferModuleName(uint32_t guestAddress);
         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result);
         void runEeCycles(uint64_t eeCycles) noexcept;
         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);

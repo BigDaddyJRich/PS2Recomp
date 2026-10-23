@@ -147,6 +147,23 @@ namespace ps2x::iop
 
     ModuleLoadResult IopSubsystem::loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
     {
+        // A game's own memory card driver (HCTP loads mcman / mcserv from _IRX272.PAC) would talk to SIO2 hardware that
+        // is not emulated and see a corrupted card: the built-in MCSERV (host folder mc0) answers instead.
+        const std::string name = m_impl->emulator.bufferModuleName(guestAddress);
+        if (name.starts_with("mcman") || name.starts_with("mcserv") || name.starts_with("xmcman") || name.starts_with("xmcserv"))
+        {
+            const std::string key = name.starts_with("x") ? name.substr(0, name.find("serv") != std::string::npos ? 7 : 6)
+                                                           : name.substr(0, name.find("serv") != std::string::npos ? 6 : 5);
+            ModuleLoadResult hle = m_impl->moduleManager.loadHle(key);
+            if (hle.moduleId > 0)
+            {
+                std::ostringstream message;
+                message << "[iop-mc] IRX '" << name << "' from a buffer -> built-in " << key << " (id " << hle.moduleId << ")";
+                m_impl->host.log(LogLevel::Info, message.str());
+                m_impl->rebuildRoutes();
+                return hle;
+            }
+        }
         return m_impl->emulator.loadModuleBuffer(guestAddress, arguments, argumentSize);
     }
 

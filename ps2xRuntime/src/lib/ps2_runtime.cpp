@@ -377,7 +377,10 @@ namespace
             defaults.elfDirectory = ec ? std::filesystem::path(".") : cwd.lexically_normal();
             defaults.hostRoot = defaults.elfDirectory;
             defaults.cdRoot = defaults.elfDirectory;
-            defaults.mcRoot = defaults.elfDirectory / "mc0";
+            if (const char *userProfile = std::getenv("USERPROFILE"); userProfile && *userProfile)
+                defaults.mcRoot = std::filesystem::path(userProfile) / "Documents" / "HCTP";
+            else
+                defaults.mcRoot = defaults.elfDirectory / "mc0";
             return defaults;
         }();
 
@@ -1522,7 +1525,7 @@ void PS2Runtime::setIoPaths(const IoPaths &paths)
     }
     if (normalized.mcRoot.empty())
     {
-        normalized.mcRoot = normalized.elfDirectory / "mc0";
+        normalized.mcRoot = runtimeIoPaths().mcRoot;
     }
 
     runtimeIoPaths() = normalized;
@@ -1541,7 +1544,6 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
     {
         paths.hostRoot = paths.elfDirectory;
         paths.cdRoot = paths.elfDirectory;
-        paths.mcRoot = paths.elfDirectory / "mc0";
     }
 
     setIoPaths(paths);

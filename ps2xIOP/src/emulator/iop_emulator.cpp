@@ -1326,6 +1326,28 @@ namespace ps2x::iop::detail
         return m_impl->loadModuleBuffer(guestAddress, arguments, argumentSize);
     }
 
+    std::string IopEmulator::bufferModuleName(uint32_t guestAddress)
+    {
+        std::vector<uint8_t> image;
+        if (!IopModuleLoader::readElfFromGuest(m_impl->host, guestAddress, image) &&
+            !IopModuleLoader::readElfFromIop(m_impl->memory, guestAddress, image))
+            return {};
+        auto u16 = [&](size_t at) -> uint32_t { return at + 2 <= image.size() ? image[at] | (image[at + 1] << 8) : 0u; };
+        auto u32 = [&](size_t at) -> uint32_t { return at + 4 <= image.size() ? u16(at) | (u16(at + 2) << 16) : 0u; };
+        const uint32_t shoff = u32(0x20), shentsize = u16(0x2E), shnum = u16(0x30);
+        for (uint32_t i = 0; shentsize != 0 && i < shnum; ++i)
+        {
+            const size_t sh = shoff + static_cast<size_t>(i) * shentsize;
+            if (u32(sh + 4) != 0x70000080u) // SHT_SCE_IOPMOD
+                continue;
+            std::string name;
+            for (size_t at = u32(sh + 0x10) + 0x1A; at < image.size() && image[at] != 0 && name.size() < 64; ++at)
+                name.push_back(static_cast<char>(std::tolower(image[at])));
+            return name;
+        }
+        return {};
+    }
+
     bool IopEmulator::stopModule(int32_t moduleId, int32_t *result)
     {
         m_impl->idleKnown = false;

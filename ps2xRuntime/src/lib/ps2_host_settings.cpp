@@ -441,7 +441,10 @@ namespace ps2_host_settings
         if (!(std::getenv("HCTP_NATIVE_DEFAULTS") && std::getenv("HCTP_NATIVE_DEFAULTS")[0] == '0'))
         {
             fillSwitch("HCTP_RENDERER", "d3d11");
-            fillSwitch("HCTP_MOVIES", "1");
+            // The native FFmpeg Sofdec player is required for entrances whose native movie path
+            // otherwise leaves the scene empty (notably Ultimate Warrior). HCTP_MOVIES=1 remains
+            // available as an explicit legacy-path override.
+            fillSwitch("HCTP_MOVIES", "native");
             fillSwitch("HCTP_VU1_FAST", "1");
             fillSwitch("HCTP_NATIVE_P08", "1");
             fillSwitch("HCTP_NATIVE_P18", "1");
@@ -457,6 +460,9 @@ namespace ps2_host_settings
             // morph weights (MSCAL 0x2800): OFF - leg/arm/finger shake (Oct 21 split test, Jordan); likely the VU1's
             // 0x2908 blend reading registers the skipped 0x2800 run would have set. =1 turns it back on
             fillSwitch("HCTP_NATIVE_P07", "0");
+            // Jordan's requested shine reduction, also used by the entrance test.
+            // Explicit HCTP_NO_GLOSS=0 restores the reflection-map paths.
+            fillSwitch("HCTP_NO_GLOSS", "1");
             fillSwitch("HCTP_NATIVE_P01", "1");
             fillSwitch("HCTP_NATIVE_S1", "15");
             fillSwitch("HCTP_S1_ANYHASH", "1");
