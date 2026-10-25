@@ -395,6 +395,7 @@ add_library(ps2_runtime STATIC
     src/lib/gs/gs_cpu_backend.cpp
     src/lib/gs/gs_threaded_backend.cpp
     src/lib/gs/gs_gpu.cpp
+    src/lib/gs/gs_gpu_native_module.cpp
     src/lib/gs/gs_gpu_backend.cpp
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp

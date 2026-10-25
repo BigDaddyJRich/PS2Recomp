@@ -1333,6 +1333,10 @@ namespace
 
 std::unique_ptr<GSGpuRenderer> makeGpuRenderer(const GSGpuOptions &options, std::string &whyNot)
 {
+    if (auto native = makeNativeGsModuleRenderer(whyNot))
+        return native;
+    if (!whyNot.empty())
+        return nullptr;
     auto renderer = std::make_unique<ParallelGsRenderer>(options);
     if (!renderer->start(whyNot))
         return nullptr;

@@ -180,3 +180,8 @@ public:
 
 // nullptr when this build has no paraLLEl-GS or the device could not be set up; whyNot says which.
 std::unique_ptr<GSGpuRenderer> makeGpuRenderer(const GSGpuOptions &options, std::string &whyNot);
+
+// Optional external PS2-native-GS module. Set HCTP_NATIVE_GS_MODULE to a DLL which
+// exports black_parallel_gs_api() version 6. An empty whyNot means no module was
+// requested; a non-empty whyNot explains why the requested module was rejected.
+std::unique_ptr<GSGpuRenderer> makeNativeGsModuleRenderer(std::string &whyNot);
