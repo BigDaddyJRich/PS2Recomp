@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <condition_variable>
 #include <cstring>
 #include <mutex>
+#include <thread>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -90,6 +92,16 @@ namespace
                 return false;
             }
             m_name = "ps2-native-gs (" + m_path + ")";
+            // The module does all its GS work (GIF parsing, batching, Vulkan encode) on the calling thread: ~15 ms a
+            // match frame. Called from the game thread that serialised GS and EE and halved the frame rate. GIF/reg/
+            // kick/present now go to a worker thread in order; anything that reads VRAM back drains the queue first.
+            // HCTP_NATIVE_GS_SYNC=1 = old behaviour (calls on the game thread).
+            m_async = std::getenv("HCTP_NATIVE_GS_SYNC") == nullptr;
+            if (m_async)
+            {
+                m_worker = std::thread([this] { workerLoop(); });
+                std::fprintf(stderr, "[native-gs] GS work on its own thread (HCTP_NATIVE_GS_SYNC=1 = game thread)\n");
+            }
             return true;
         }
 
@@ -97,6 +109,7 @@ namespace
 
         bool attachWindow(void *window) override
         {
+            drain();
             std::lock_guard<std::mutex> lock(m_mutex);
             if (!m_handle || !m_api || !m_api->attachWindow || !window)
                 return false;
@@ -110,13 +123,30 @@ namespace
 
         void gif(uint8_t path, const uint8_t *data, uint32_t bytes) override
         {
+            bytes &= ~15u;
+            if (!data || !bytes)
+                return;
+            if (m_async)
+            {
+                std::lock_guard<std::mutex> lock(m_qMutex);
+                Cmd cmd{Cmd::Gif, path, uint32_t(m_qBytes.size()), bytes, 0u};
+                m_qBytes.insert(m_qBytes.end(), data, data + bytes);
+                m_queue.push_back(cmd);
+                return;
+            }
             std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_handle && data && bytes)
-                m_api->gif(m_handle, path, data, bytes & ~15u);
+            if (m_handle)
+                m_api->gif(m_handle, path, data, bytes);
         }
 
         void reg(uint8_t addr, uint64_t value) override
         {
+            if (m_async)
+            {
+                std::lock_guard<std::mutex> lock(m_qMutex);
+                m_queue.push_back(Cmd{Cmd::Reg, addr, 0u, 0u, value});
+                return;
+            }
             std::lock_guard<std::mutex> lock(m_mutex);
             if (m_handle)
                 m_api->reg(m_handle, addr, value);
@@ -124,6 +154,7 @@ namespace
 
         void reset() override
         {
+            drain();
             std::lock_guard<std::mutex> lock(m_mutex);
             if (m_handle)
                 m_api->reset(m_handle);
@@ -131,13 +162,6 @@ namespace
 
         void present(const uint64_t (&privRegs)[kPrivRegCount], uint64_t vsyncTick, bool) override
         {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (!m_handle)
-                return;
-
-            if (m_scanout.size() != size_t(kScanoutStride) * kScanoutMaxHeight * 4u)
-                m_scanout.resize(size_t(kScanoutStride) * kScanoutMaxHeight * 4u);
-
             NativeGsScanout request{};
             request.pmode = privRegs[0];
             request.smode1 = privRegs[1];
@@ -176,6 +200,30 @@ namespace
                 request.display1 = fixDisplay(request.display1);
                 request.display2 = fixDisplay(request.display2);
             }
+
+            if (m_async)
+            {
+                std::unique_lock<std::mutex> lock(m_qMutex);
+                // At most two frames in flight: the game runs ahead of the GS thread by one frame, never more.
+                m_doneCv.wait(lock, [this] { return m_presentsQueued < 2u || m_stop; });
+                Cmd cmd{Cmd::Present, 0u, 0u, 0u, 0u};
+                cmd.scanout = request;
+                m_queue.push_back(cmd);
+                ++m_presentsQueued;
+                m_qCv.notify_one();
+                return;
+            }
+            std::lock_guard<std::mutex> lock(m_mutex);
+            presentNow(request);
+        }
+
+        // Caller holds m_mutex.
+        void presentNow(NativeGsScanout request)
+        {
+            if (!m_handle)
+                return;
+            if (m_scanout.size() != size_t(kScanoutStride) * kScanoutMaxHeight * 4u)
+                m_scanout.resize(size_t(kScanoutStride) * kScanoutMaxHeight * 4u);
 
             // The native module's direct path renders to its Vulkan swapchain.
             // A null RGBA pointer is intentional: it avoids getBytes() and the
@@ -226,6 +274,7 @@ namespace
 
         void snapshotVram(std::vector<uint8_t> &out) override
         {
+            drain();
             std::lock_guard<std::mutex> lock(m_mutex);
             out.assign(kNativeGsVramBytes, 0u);
             if (m_handle)
@@ -237,6 +286,7 @@ namespace
 
         uint32_t readTransfer(uint8_t *dst, uint32_t maxBytes) override
         {
+            drain();
             std::lock_guard<std::mutex> lock(m_mutex);
             if (!m_handle || !dst || maxBytes == 0u)
                 return 0u;
@@ -269,6 +319,13 @@ namespace
 
         void kick() override
         {
+            if (m_async)
+            {
+                std::lock_guard<std::mutex> lock(m_qMutex);
+                m_queue.push_back(Cmd{Cmd::Kick, 0u, 0u, 0u, 0u});
+                m_qCv.notify_one();
+                return;
+            }
             std::lock_guard<std::mutex> lock(m_mutex);
             if (m_handle)
                 m_api->flush(m_handle);
@@ -293,6 +350,16 @@ namespace
 
         void shutdown() override
         {
+            if (m_worker.joinable())
+            {
+                {
+                    std::lock_guard<std::mutex> lock(m_qMutex);
+                    m_stop = true;
+                }
+                m_qCv.notify_all();
+                m_doneCv.notify_all();
+                m_worker.join();
+            }
             std::lock_guard<std::mutex> lock(m_mutex);
             if (m_handle && m_api)
                 m_api->destroy(m_handle);
@@ -304,6 +371,76 @@ namespace
         }
 
     private:
+        struct Cmd
+        {
+            enum Kind : uint8_t { Gif, Reg, Kick, Present } kind;
+            uint8_t arg; // GIF path or register address
+            uint32_t offset, size; // GIF bytes in the batch's byte buffer
+            uint64_t value;
+            NativeGsScanout scanout{};
+        };
+
+        // Waits until everything queued so far has run (before any VRAM read-back or reset).
+        void drain()
+        {
+            if (!m_async)
+                return;
+            std::unique_lock<std::mutex> lock(m_qMutex);
+            m_qCv.notify_one();
+            m_doneCv.wait(lock, [this] { return (m_queue.empty() && !m_busy) || m_stop; });
+        }
+
+        void workerLoop()
+        {
+            std::vector<Cmd> cmds;
+            std::vector<uint8_t> bytes;
+            for (;;)
+            {
+                uint32_t presents = 0u;
+                {
+                    std::unique_lock<std::mutex> lock(m_qMutex);
+                    m_busy = false;
+                    m_doneCv.notify_all();
+                    m_qCv.wait(lock, [this] { return !m_queue.empty() || m_stop; });
+                    if (m_stop)
+                        return;
+                    cmds.swap(m_queue);
+                    bytes.swap(m_qBytes);
+                    m_queue.clear();
+                    m_qBytes.clear();
+                    m_busy = true;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    if (m_handle)
+                        for (const Cmd &cmd : cmds)
+                            switch (cmd.kind)
+                            {
+                            case Cmd::Gif: m_api->gif(m_handle, cmd.arg, bytes.data() + cmd.offset, cmd.size); break;
+                            case Cmd::Reg: m_api->reg(m_handle, cmd.arg, cmd.value); break;
+                            case Cmd::Kick: m_api->flush(m_handle); break;
+                            case Cmd::Present: presentNow(cmd.scanout); ++presents; break;
+                            }
+                }
+                cmds.clear();
+                bytes.clear();
+                if (presents)
+                {
+                    std::lock_guard<std::mutex> lock(m_qMutex);
+                    m_presentsQueued -= std::min(presents, m_presentsQueued);
+                }
+            }
+        }
+
+        bool m_async = false;
+        std::thread m_worker;
+        std::mutex m_qMutex;
+        std::condition_variable m_qCv, m_doneCv;
+        std::vector<Cmd> m_queue;
+        std::vector<uint8_t> m_qBytes;
+        uint32_t m_presentsQueued = 0u;
+        bool m_busy = false, m_stop = false;
+
         std::string m_path;
         std::string m_name = "ps2-native-gs";
         HMODULE m_module = nullptr;
