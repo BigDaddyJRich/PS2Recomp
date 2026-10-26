@@ -456,9 +456,18 @@ struct GSD3D11Backend::Impl
     {
         uint32_t zbpBlock = 0;
         uint32_t w = 0, h = 0;
+        uint32_t psm = GS_PSM_Z32; // ZBUF.PSM of the last depth-tested draw (Z24 leaves the top byte alone)
         ComPtr<ID3D11Texture2D> tex;
         ComPtr<ID3D11DepthStencilView> dsv;
     };
+    // Depth written back to GS memory for a local->host read: in the format the depth was DRAWN in. HCTP reads its
+    // Z24 buffer as PSMZ32 (flare/flash visibility, 2x2 at each light's screen position); writing 32 bits put the
+    // GPU depth's top byte over the PSMT8H/T4HL/T4HH textures stored in that byte (the entrance nameplate), one
+    // small hole per light, in different places every run. A real GS never writes memory on a read.
+    static uint32_t depthWritebackPsm(uint32_t spsm, const DepthTarget &dt)
+    {
+        return (spsm == GS_PSM_Z32 && dt.psm == GS_PSM_Z24) ? GS_PSM_Z24 : spsm;
+    }
     std::list<DepthTarget> depths;
 
     struct CachedTexture
@@ -1042,7 +1051,8 @@ struct GSD3D11Backend::Impl
         D3D11_MAPPED_SUBRESOURCE m{};
         if (FAILED(ctx->Map(depthStaging.Get(), 0, D3D11_MAP_READ, 0, &m)))
             return;
-        const double top = spsm == GS_PSM_Z32 ? 4294967295.0 : spsm == GS_PSM_Z24 ? 16777215.0 : 65535.0;
+        const uint32_t wpsm = depthWritebackPsm(spsm, *dt);
+        const double top = wpsm == GS_PSM_Z32 ? 4294967295.0 : wpsm == GS_PSM_Z24 ? 16777215.0 : 65535.0;
         for (uint32_t y = y0; y < y0 + h && y < dt->h; ++y)
         {
             const uint32_t sy = y * scale + scale / 2u;
@@ -1052,7 +1062,7 @@ struct GSD3D11Backend::Impl
                 float f;
                 std::memcpy(&f, row + (x * scale + scale / 2u) * 8u, 4); // D32_FLOAT_S8X24: float + stencil/pad
                 const double z = std::clamp(static_cast<double>(f) * 4294967296.0, 0.0, top);
-                mem.WriteVram(spsm, sbp, sbw, x, y, static_cast<uint32_t>(z));
+                mem.WriteVram(wpsm, sbp, sbw, x, y, static_cast<uint32_t>(z));
             }
         }
         ctx->Unmap(depthStaging.Get(), 0);
@@ -1086,7 +1096,8 @@ struct GSD3D11Backend::Impl
         D3D11_MAPPED_SUBRESOURCE m{};
         if (FAILED(ctx->Map(previous.tex.Get(), 0, D3D11_MAP_READ, 0, &m)))
             return false;
-        const double top = spsm == GS_PSM_Z32 ? 4294967295.0 : spsm == GS_PSM_Z24 ? 16777215.0 : 65535.0;
+        const uint32_t wpsm = depthWritebackPsm(spsm, *dt);
+        const double top = wpsm == GS_PSM_Z32 ? 4294967295.0 : wpsm == GS_PSM_Z24 ? 16777215.0 : 65535.0;
         for (uint32_t y = y0; y < y0 + h && y < dt->h; ++y)
         {
             const uint32_t sy = y * scale + scale / 2u;
@@ -1096,7 +1107,7 @@ struct GSD3D11Backend::Impl
                 float f;
                 std::memcpy(&f, row + (x * scale + scale / 2u) * 8u, 4); // D32_FLOAT_S8X24: float + stencil/pad
                 const double z = std::clamp(static_cast<double>(f) * 4294967296.0, 0.0, top);
-                mem.WriteVram(spsm, sbp, sbw, x, y, static_cast<uint32_t>(z));
+                mem.WriteVram(wpsm, sbp, sbw, x, y, static_cast<uint32_t>(z));
             }
         }
         ctx->Unmap(previous.tex.Get(), 0);
@@ -2173,7 +2184,11 @@ struct GSD3D11Backend::Impl
         const bool depthNeeded = ztest && !(ztst == 1u && c.zbuf.zmask);
         DepthTarget *dt = nullptr;
         if (depthNeeded)
+        {
             dt = getDepth(framePageBaseToBlock(c.zbuf.zbp), rt->w, rt->h);
+            if (dt)
+                dt->psm = c.zbuf.psm;
+        }
         const uint32_t zfunc = ztest ? ztst : 1u;
 
         // ---- constants
