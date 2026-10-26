@@ -975,8 +975,42 @@ struct GSD3D11Backend::Impl
     // lives only on the GPU, so write the requested rect of the depth target back to GS memory first.
     ComPtr<ID3D11Texture2D> depthStaging;
     uint32_t depthStagingW = 0, depthStagingH = 0;
+    // One-frame-late depth reads (default): the readers are visibility tests for flares/flashes, many tiny reads
+    // a frame during an entrance. Copying the whole depth target and waiting for the GPU on every read stalled the
+    // GS thread, and the game thread behind it, to ~40 fps. Now the target is copied at most once a frame into a
+    // ring of two staging textures, and reads are served from the previous frame's copy, which the GPU has
+    // finished by then. HCTP_ZREADBACK_SYNC=1 = the exact old path (copy + wait on every read).
+    struct DepthRing
+    {
+        ComPtr<ID3D11Texture2D> tex;
+        uint32_t w = 0, h = 0, zbp = 0xFFFFFFFFu;
+        uint64_t frame = ~0ull;
+    } depthRing[2];
+    bool depthRingCopy(DepthRing &slot, DepthTarget &dt, const D3D11_TEXTURE2D_DESC &src)
+    {
+        if (!slot.tex || slot.w != src.Width || slot.h != src.Height)
+        {
+            slot.tex.Reset();
+            D3D11_TEXTURE2D_DESC td = src;
+            td.Usage = D3D11_USAGE_STAGING;
+            td.BindFlags = 0;
+            td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            td.MiscFlags = 0;
+            if (FAILED(dev->CreateTexture2D(&td, nullptr, &slot.tex)))
+                return false;
+            slot.w = src.Width;
+            slot.h = src.Height;
+        }
+        ctx->CopyResource(slot.tex.Get(), dt.tex.Get()); // depth-stencil copies must be whole-resource
+        slot.zbp = dt.zbpBlock;
+        slot.frame = frameCounter;
+        return true;
+    }
     void syncDepthRect(uint32_t sbp, uint32_t sbw, uint32_t spsm, uint32_t x0, uint32_t y0, uint32_t w, uint32_t h)
     {
+        static const bool s_sync = std::getenv("HCTP_ZREADBACK_SYNC") != nullptr;
+        if (!s_sync && syncDepthRectLate(sbp, sbw, spsm, x0, y0, w, h))
+            return;
         static const bool s_off = std::getenv("PS2X_NO_ZREADBACK") != nullptr;
         if (s_off || (spsm != GS_PSM_Z32 && spsm != GS_PSM_Z24 && spsm != GS_PSM_Z16 && spsm != GS_PSM_Z16S))
             return;
@@ -1022,6 +1056,51 @@ struct GSD3D11Backend::Impl
             }
         }
         ctx->Unmap(depthStaging.Get(), 0);
+    }
+
+    // false = not handled (no previous-frame copy yet, or no depth target): the caller does the exact read.
+    bool syncDepthRectLate(uint32_t sbp, uint32_t sbw, uint32_t spsm, uint32_t x0, uint32_t y0, uint32_t w, uint32_t h)
+    {
+        static const bool s_off = std::getenv("PS2X_NO_ZREADBACK") != nullptr;
+        if (s_off || (spsm != GS_PSM_Z32 && spsm != GS_PSM_Z24 && spsm != GS_PSM_Z16 && spsm != GS_PSM_Z16S))
+            return true;
+        DepthTarget *dt = nullptr;
+        for (auto &d : depths)
+            if (d.zbpBlock == sbp)
+                dt = &d;
+        if (!dt || !dt->tex || w == 0u || h == 0u)
+            return true;
+        D3D11_TEXTURE2D_DESC td{};
+        dt->tex->GetDesc(&td);
+        DepthRing &current = depthRing[frameCounter & 1u];
+        DepthRing &previous = depthRing[(frameCounter + 1u) & 1u];
+        // This frame's copy, made on the first read of the frame (after what the game drew before it).
+        if (current.frame != frameCounter || current.zbp != dt->zbpBlock)
+        {
+            flushPending();
+            if (!depthRingCopy(current, *dt, td))
+                return false;
+        }
+        if (previous.frame + 1u != frameCounter || previous.zbp != dt->zbpBlock || previous.w != td.Width || previous.h != td.Height)
+            return false; // first frame of a burst: one exact read
+        D3D11_MAPPED_SUBRESOURCE m{};
+        if (FAILED(ctx->Map(previous.tex.Get(), 0, D3D11_MAP_READ, 0, &m)))
+            return false;
+        const double top = spsm == GS_PSM_Z32 ? 4294967295.0 : spsm == GS_PSM_Z24 ? 16777215.0 : 65535.0;
+        for (uint32_t y = y0; y < y0 + h && y < dt->h; ++y)
+        {
+            const uint32_t sy = y * scale + scale / 2u;
+            const uint8_t *row = static_cast<const uint8_t *>(m.pData) + sy * m.RowPitch;
+            for (uint32_t x = x0; x < x0 + w && x < dt->w; ++x)
+            {
+                float f;
+                std::memcpy(&f, row + (x * scale + scale / 2u) * 8u, 4); // D32_FLOAT_S8X24: float + stencil/pad
+                const double z = std::clamp(static_cast<double>(f) * 4294967296.0, 0.0, top);
+                mem.WriteVram(spsm, sbp, sbw, x, y, static_cast<uint32_t>(z));
+            }
+        }
+        ctx->Unmap(previous.tex.Get(), 0);
+        return true;
     }
 
     void syncOverlapping(uint32_t first, uint32_t last)

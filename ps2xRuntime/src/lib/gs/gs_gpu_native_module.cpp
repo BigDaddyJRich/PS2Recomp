@@ -29,6 +29,10 @@ namespace
         SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
         SymInitialize(proc, nullptr, TRUE);
         const DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+        static uint8_t stackCopy[32768];
+        const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(GetModuleHandleA(nullptr));
+        const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(reinterpret_cast<const uint8_t *>(dos) + dos->e_lfanew);
+        const uint64_t exeBase = uint64_t(dos), exeEnd = exeBase + nt->OptionalHeader.SizeOfImage;
         std::unordered_map<uint64_t, std::string> names;
         auto nameOf = [&](uint64_t pc) -> const std::string &
         {
@@ -78,15 +82,52 @@ namespace
                 {
                     // Nothing may allocate while a thread is suspended (it may hold the heap lock).
                     CONTEXT context{};
-                    context.ContextFlags = CONTEXT_CONTROL;
+                    context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
                     if (SuspendThread(t) == DWORD(-1))
                         continue;
                     const bool got = GetThreadContext(t, &context) != FALSE;
+                    // Real unwind (x64 unwind tables) while the thread stands still; no allocation in here.
+                    uint64_t frames[16];
+                    uint32_t frameCount = 0;
+                    if (got)
+                    {
+                        CONTEXT walk = context;
+                        while (frameCount < 16u && walk.Rip)
+                        {
+                            frames[frameCount++] = walk.Rip;
+                            DWORD64 imageBase = 0;
+                            PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(walk.Rip, &imageBase, nullptr);
+                            if (!function)
+                            {
+                                walk.Rip = *reinterpret_cast<DWORD64 *>(walk.Rsp); // leaf function
+                                walk.Rsp += 8;
+                                continue;
+                            }
+                            void *handlerData = nullptr;
+                            DWORD64 establisher = 0;
+                            RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, walk.Rip, function, &walk, &handlerData, &establisher, nullptr);
+                        }
+                    }
                     ResumeThread(t);
                     if (!got)
                         continue;
-                    ++hits[id][nameOf(context.Rip)];
+                    const std::string &top = nameOf(context.Rip);
                     ++totals[id];
+                    if (top.rfind("ntdll!", 0) != 0 && top.rfind("KERNELBASE!", 0) != 0 && top.rfind("win32u!", 0) != 0)
+                    {
+                        ++hits[id][top];
+                        continue;
+                    }
+                    // A wait: name it after the first game-exe frames that called it (driver/system frames skipped).
+                    std::string key = top;
+                    uint32_t found = 0;
+                    for (uint32_t i = 1; i < frameCount && found < 4u; ++i)
+                        if (frames[i] > exeBase && frames[i] < exeEnd)
+                        {
+                            key += " <- " + nameOf(frames[i]);
+                            ++found;
+                        }
+                    ++hits[id][key];
                 }
                 Sleep(1);
             }
