@@ -1,3 +1,4 @@
+#include <chrono>
 #include <cstdio>
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_vu_code_log.h"
@@ -1954,6 +1955,43 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
         scratchOffset = (scratchOffset + chunk) & (PS2_SCRATCHPAD_SIZE - 1u);
     }
 
+    // TEMP diag HCTP_SPRWATCH=<hex guest address> (wrestler shake): scratchpad DMAs whose main-RAM range covers that
+    // address, with a steady-clock timestamp, kept in a ring of 120 and dumped when sprwatch.go appears in the cwd.
+    {
+        static const uint32_t s_watch = []
+        {
+            const char *v = std::getenv("HCTP_SPRWATCH");
+            return v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 16)) : 0u;
+        }();
+        if (s_watch && s_watch >= mainOffset && s_watch < mainOffset + byteCount)
+        {
+            struct Rec { int64_t ns; uint32_t madr, sadr, qwc; bool from; float row3[3]; };
+            static std::vector<Rec> ring(120);
+            static uint64_t n = 0;
+            Rec &r = ring[n++ % ring.size()];
+            r.ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            r.madr = originalMadr;
+            r.sadr = originalSadr;
+            r.qwc = qwc;
+            r.from = fromScratchpad;
+            const uint32_t row = s_watch & ~0x3Fu;
+            std::memcpy(r.row3, m_rdram + row + 0x30u, 12);
+            static uint32_t check = 0;
+            if ((++check & 15u) == 0u)
+                if (FILE *go = std::fopen("sprwatch.go", "rb"))
+                {
+                    std::fclose(go);
+                    std::remove("sprwatch.go");
+                    for (uint64_t i = n > ring.size() ? n - ring.size() : 0; i < n; ++i)
+                    {
+                        const Rec &q = ring[i % ring.size()];
+                        std::fprintf(stderr, "[sprwatch] t %lld %s madr %08x sadr %04x qwc %u -> row3 %.3f %.3f %.3f%c", static_cast<long long>(q.ns),
+                                     q.from ? "fromSPR" : "toSPR", q.madr, q.sadr, q.qwc, q.row3[0], q.row3[1], q.row3[2], 10);
+                    }
+                    std::fflush(stderr);
+                }
+        }
+    }
     m_ioRegisters[channelBase + 0x10u] = (originalMadr + byteCount) & 0x7FFFFFF0u;
     m_ioRegisters[channelBase + 0x20u] = 0u;
     m_ioRegisters[channelBase + 0x80u] = (originalSadr + byteCount) & 0x3FF0u;

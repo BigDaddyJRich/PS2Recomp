@@ -1858,6 +1858,9 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
     }
 }
 
+// Set by eeCheckpointDue when a generated back edge asks the callee to stop; read by dispatchGuestBranch.
+thread_local bool t_eeCheckpointHit = false;
+
 bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      R5900Context *ctx,
                                      uint32_t targetPc,
@@ -1914,6 +1917,14 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     const uint32_t entryPc = ctx->pc;
     const uint32_t entrySp = getRegU32(ctx, 29);
     const uint32_t entryRa = getRegU32(ctx, 31);
+    // Did a back-edge checkpoint (eeCheckpointDue) stop the callee early? Kept per call, restored for the caller.
+    const bool outerCheckpointHit = t_eeCheckpointHit;
+    t_eeCheckpointHit = false;
+    struct RestoreHit
+    {
+        bool outer;
+        ~RestoreHit() { t_eeCheckpointHit = t_eeCheckpointHit || outer; }
+    } restoreHit{outerCheckpointHit};
     if (!g_recordDispatches)
     {
         targetFn(rdram, ctx, this);
@@ -1937,7 +1948,13 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // — with the inner frame's sp and the inner return address in ra. Taking that for "returned" resumed the caller
     // on the inner frame (Def Jam Vendetta's recursive sound routine 0x1CEB18: the caller 0x1CEAF8 loaded ra from
     // another frame, returned to 0 and the sound thread ended — the match freezes).
-    if (ctx->pc == entryPc && getRegU32(ctx, 29) == entrySp && getRegU32(ctx, 31) == entryRa)
+    // ...but a leaf function whose loop top IS its entry (no sp / ra change) that a back-edge checkpoint paused looks
+    // exactly the same: pc = entry, sp and ra untouched. Taking that for "returned" dropped the rest of the loop:
+    // HCTP's MulMatrixN2 0x1510c0 (FastUpdate's scratchpad -> world bone copy) lost its last bones every time a
+    // checkpoint fell inside it - feet / shins / hands / forearms kept last frame's matrices and the foot IK flipped
+    // between two poses (the wrestler shake). A checkpoint during the call means "not returned"; the dispatcher
+    // resumes the loop at pc.
+    if (ctx->pc == entryPc && getRegU32(ctx, 29) == entrySp && getRegU32(ctx, 31) == entryRa && !t_eeCheckpointHit)
     {
         ctx->pc = fallthroughPc;
     }
@@ -2903,7 +2920,10 @@ void PS2Runtime::postEeEvent(EeEvent event)
 
 bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
 {
-    return m_eeScheduler->checkpointDue(cycles);
+    const bool due = m_eeScheduler->checkpointDue(cycles);
+    if (due)
+        t_eeCheckpointHit = true; // dispatchGuestBranch: the callee stopped at a back edge, it did not return
+    return due;
 }
 
 [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)
