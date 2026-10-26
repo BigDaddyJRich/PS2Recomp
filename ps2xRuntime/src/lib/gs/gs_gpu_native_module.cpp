@@ -117,6 +117,14 @@ namespace
         }
     }
 
+    // Started at program start whatever the renderer (D3D11, CPU or the native-GS module).
+    const bool g_samplerStarted = []
+    {
+        if (std::getenv("HCTP_SAMPLER"))
+            std::thread(samplerThread).detach();
+        return true;
+    }();
+
     // Deliberately a small ABI declaration: the optional DLL owns all Vulkan
     // objects and is loaded only when HCTP_NATIVE_GS_MODULE names it.
     struct NativeGsScanout
@@ -199,8 +207,6 @@ namespace
             // match frame. Called from the game thread that serialised GS and EE and halved the frame rate. GIF/reg/
             // kick/present now go to a worker thread in order; anything that reads VRAM back drains the queue first.
             // HCTP_NATIVE_GS_SYNC=1 = old behaviour (calls on the game thread).
-            if (std::getenv("HCTP_SAMPLER"))
-                std::thread(samplerThread).detach();
             m_async = std::getenv("HCTP_NATIVE_GS_SYNC") == nullptr;
             if (m_async)
             {
