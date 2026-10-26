@@ -11,9 +11,112 @@
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <dbghelp.h>
+#include <tlhelp32.h>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#pragma comment(lib, "dbghelp.lib")
 
 namespace
 {
+    // HCTP_SAMPLER=1: in-process sampling profiler (no admin rights needed, unlike xperf). Every ~1 ms each thread of
+    // the process is suspended for a moment and its instruction pointer recorded; every 20 s the busiest threads and
+    // their top functions are logged as [sampler] lines (needs PDBs next to the exe / module DLL for names).
+    void samplerThread()
+    {
+        HANDLE proc = GetCurrentProcess();
+        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+        SymInitialize(proc, nullptr, TRUE);
+        const DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+        std::unordered_map<uint64_t, std::string> names;
+        auto nameOf = [&](uint64_t pc) -> const std::string &
+        {
+            auto found = names.find(pc);
+            if (found != names.end())
+                return found->second;
+            alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 256] = {};
+            auto *symbol = reinterpret_cast<SYMBOL_INFO *>(buffer);
+            symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+            symbol->MaxNameLen = 255;
+            std::string name;
+            DWORD64 displacement = 0;
+            IMAGEHLP_MODULE64 module{};
+            module.SizeOfStruct = sizeof(module);
+            const bool hasModule = SymGetModuleInfo64(proc, pc, &module) != FALSE;
+            if (SymFromAddr(proc, pc, &displacement, symbol))
+            {
+                name = std::string(hasModule ? module.ModuleName : "?") + "!" + symbol->Name;
+                // Source line for the GS module's frames (one hot function needs to be split by line).
+                IMAGEHLP_LINE64 line{};
+                line.SizeOfStruct = sizeof(line);
+                DWORD lineDisplacement = 0;
+                if (hasModule && std::strstr(module.ModuleName, "native-gs") && SymGetLineFromAddr64(proc, pc, &lineDisplacement, &line))
+                    name += ":" + std::to_string(line.LineNumber);
+            }
+            else
+                name = std::string(hasModule ? module.ModuleName : "?") + "!?";
+            return names.emplace(pc, std::move(name)).first->second;
+        };
+        for (;;)
+        {
+            SymRefreshModuleList(proc);
+            std::vector<std::pair<DWORD, HANDLE>> threads;
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            THREADENTRY32 entry{sizeof(entry)};
+            for (BOOL ok = Thread32First(snap, &entry); ok; ok = Thread32Next(snap, &entry))
+                if (entry.th32OwnerProcessID == pid && entry.th32ThreadID != self)
+                    if (HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, entry.th32ThreadID))
+                        threads.emplace_back(entry.th32ThreadID, t);
+            CloseHandle(snap);
+            std::unordered_map<DWORD, std::unordered_map<std::string, uint32_t>> hits;
+            std::unordered_map<DWORD, uint32_t> totals;
+            const ULONGLONG end = GetTickCount64() + 20000u;
+            while (GetTickCount64() < end)
+            {
+                for (auto &[id, t] : threads)
+                {
+                    // Nothing may allocate while a thread is suspended (it may hold the heap lock).
+                    CONTEXT context{};
+                    context.ContextFlags = CONTEXT_CONTROL;
+                    if (SuspendThread(t) == DWORD(-1))
+                        continue;
+                    const bool got = GetThreadContext(t, &context) != FALSE;
+                    ResumeThread(t);
+                    if (!got)
+                        continue;
+                    ++hits[id][nameOf(context.Rip)];
+                    ++totals[id];
+                }
+                Sleep(1);
+            }
+            std::vector<std::pair<uint32_t, DWORD>> order;
+            for (auto &[id, counts] : hits)
+            {
+                // Busy = samples not parked in a kernel wait.
+                uint32_t busy = 0;
+                for (auto &[name, n] : counts)
+                    if (name.rfind("ntdll!", 0) != 0 && name.rfind("win32u!", 0) != 0 && name.rfind("KERNELBASE!", 0) != 0)
+                        busy += n;
+                order.emplace_back(busy, id);
+            }
+            std::sort(order.rbegin(), order.rend());
+            for (size_t i = 0; i < order.size() && i < 4u; ++i)
+            {
+                const DWORD id = order[i].second;
+                std::fprintf(stderr, "[sampler] thread %lu: %u of %u samples busy\n", id, order[i].first, totals[id]);
+                std::vector<std::pair<uint32_t, std::string>> top;
+                for (auto &[name, n] : hits[id])
+                    top.emplace_back(n, name);
+                std::sort(top.rbegin(), top.rend());
+                for (size_t k = 0; k < top.size() && k < 15u; ++k)
+                    std::fprintf(stderr, "[sampler]   %5.1f%% %s\n", 100.0 * top[k].first / totals[id], top[k].second.c_str());
+            }
+            for (auto &[id, t] : threads)
+                CloseHandle(t);
+        }
+    }
+
     // Deliberately a small ABI declaration: the optional DLL owns all Vulkan
     // objects and is loaded only when HCTP_NATIVE_GS_MODULE names it.
     struct NativeGsScanout
@@ -96,6 +199,8 @@ namespace
             // match frame. Called from the game thread that serialised GS and EE and halved the frame rate. GIF/reg/
             // kick/present now go to a worker thread in order; anything that reads VRAM back drains the queue first.
             // HCTP_NATIVE_GS_SYNC=1 = old behaviour (calls on the game thread).
+            if (std::getenv("HCTP_SAMPLER"))
+                std::thread(samplerThread).detach();
             m_async = std::getenv("HCTP_NATIVE_GS_SYNC") == nullptr;
             if (m_async)
             {

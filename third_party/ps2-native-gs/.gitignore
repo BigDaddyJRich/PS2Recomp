@@ -1,0 +1,4 @@
+build/
+*.gsdump
+*.ppm
+.DS_Store
