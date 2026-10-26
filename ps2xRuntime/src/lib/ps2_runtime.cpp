@@ -721,6 +721,12 @@ static bool UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         SetTextureFilter(tex, s_frameTextureFilter);
     }
 #if defined(PS2X_NATIVE_HOST)
+    if (rt->gs().gpuDirectPresentation())
+    {
+        outWidth = FB_WIDTH;
+        outHeight = DEFAULT_DISPLAY_HEIGHT;
+        return false;
+    }
     if (GSD3D11Backend::IsActive())
     {
         outWidth = FB_WIDTH;
@@ -1136,7 +1142,26 @@ bool PS2Runtime::initialize(const char *title)
             if (ps2host::audioReady())
                 SetMasterVolume(static_cast<float>(settings.volume) / 100.0f);
             const char *renderer = std::getenv("HCTP_RENDERER");
-            if (!renderer || std::strcmp(renderer, "cpu") != 0)
+            if (renderer && std::strcmp(renderer, "native-gs") == 0)
+            {
+                // The optional external native-GS module is constructed by GS
+                // before the host starts. Once the Win32 HWND exists, attach
+                // its Vulkan child swapchain so scanout avoids CPU readback
+                // and the D3D11 upload path.
+                GSGpuRenderer *gpu = m_gs.gpuRendererForSettings();
+                bool direct = false;
+                const char *directEnv = std::getenv("HCTP_NATIVE_GS_DIRECT");
+                if (gpu && (!directEnv || std::strcmp(directEnv, "0") != 0))
+                    direct = gpu->attachWindow(ps2host::windowHandle());
+                ps2host::setDirectVulkanPresentation(direct);
+                if (gpu && direct)
+                    std::cerr << "[runtime] GS: external native-GS module (direct Vulkan presentation)" << std::endl;
+                else if (gpu)
+                    std::cerr << "[runtime] GS: external native-GS module (CPU readback fallback)" << std::endl;
+                else
+                    std::cerr << "[runtime] GS: native-GS module unavailable; using CPU fallback" << std::endl;
+            }
+            else if (!renderer || std::strcmp(renderer, "cpu") != 0)
             {
                 m_gs.setRasterBackend(std::make_unique<GSD3D11Backend>());
                 std::cerr << "[runtime] GS: Direct3D 11 renderer (native host)" << std::endl;
@@ -3121,7 +3146,7 @@ void PS2Runtime::run()
         // drifts against the game's 59.94 and jitters by a millisecond, a picture was now and then shown twice and the
         // next one never — a slight stutter although every frame was on time. VENDETTA_WINDOW_PACING=timer = the old way.
         bool freshPicture = UploadFrame(frameTex, this, presentWidth, presentHeight);
-        if (!windowTimerPacing())
+        if (!windowTimerPacing() && !m_gs.gpuDirectPresentation())
         {
             const auto waitStart = std::chrono::steady_clock::now();
             while (!freshPicture && !isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire) &&

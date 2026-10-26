@@ -181,6 +181,7 @@ public:
     // VENDETTA_GS=both: which renderer's picture the window shows (the debug panel switches it live)
     void setShowGpuPicture(bool show) { m_showGpu = show && m_gpu != nullptr; }
     GSGpuRenderer *gpuRendererForSettings() { return m_gpu.get(); }
+    bool gpuDirectPresentation() const { return m_gpu && m_gpu->directPresentation(); }
     // The main thread (window, debug panel): how the picture is scaled to the window.
     GSPresentFilter presentFilter() const { return m_presentFilter; }
     void setPresentFilter(GSPresentFilter filter)

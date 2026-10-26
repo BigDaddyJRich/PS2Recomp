@@ -167,6 +167,10 @@ public:
     // The main thread, with shared pictures: the shared image it is drawing from (-1 when done with it).
     virtual void setSharedReading(int image) { (void)image; }
 
+    // Optional direct presentation path for a renderer that owns the native window/swapchain.
+    virtual bool attachWindow(void *window) { (void)window; return false; }
+    virtual bool directPresentation() const { return false; }
+
     // Any thread: live settings, taken at the next presentation.
     virtual void setSuperSampling(uint32_t rate) = 0; // 1, 2, 4, 8 or 16
     virtual void setHighResolution(bool on) = 0;

@@ -1,6 +1,7 @@
 #include "runtime/gs/gs_gpu.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -94,6 +95,19 @@ namespace
 
         const char *deviceName() const override { return m_name.c_str(); }
 
+        bool attachWindow(void *window) override
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!m_handle || !m_api || !m_api->attachWindow || !window)
+                return false;
+            m_directPresentation = m_api->attachWindow(m_handle, window) != 0;
+            if (m_directPresentation)
+                std::fprintf(stderr, "[native-gs] direct Vulkan window presentation enabled\n");
+            return m_directPresentation;
+        }
+
+        bool directPresentation() const override { return m_directPresentation; }
+
         void gif(uint8_t path, const uint8_t *data, uint32_t bytes) override
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -134,6 +148,47 @@ namespace
             request.display2 = privRegs[10];
             request.bgcolor = privRegs[14];
             request.vsyncTick = vsyncTick;
+
+            // SMODE2 INT=1 + FFMD=1 (HCTP: smode2=3): every field is its own frame buffer of DH/2 lines (HCTP draws
+            // 640x224 fields at FBP 0 and FBP 70; 70 pages = 640*224*4 bytes), shown on all DH output lines. The
+            // module derives the scanout height from DISPLAY.DH alone and ignores FFMD and MAGV, so it read 448 rows
+            // and the lower half came from the other field buffer / stale VRAM: the lower band on every screen.
+            // Same rule as PCSX2 and our CPU backend (gs_cpu_backend.cpp halfHeightFields). Hand the module the
+            // real buffer height; the host stretches it to the window. HCTP_NATIVE_GS_FULL_FIELDS=1 restores the
+            // old behaviour for A/B.
+            static const bool fullFields = std::getenv("HCTP_NATIVE_GS_FULL_FIELDS") != nullptr;
+            if (!fullFields)
+            {
+                const bool halfHeightFields = (request.smode2 & 3u) == 3u;
+                auto fixDisplay = [halfHeightFields](uint64_t display) -> uint64_t
+                {
+                    const uint32_t dh = uint32_t(display >> 44) & 0x7FFu;
+                    const uint32_t magv = uint32_t(display >> 27) & 0x3u;
+                    uint32_t lines = (dh + 1u) / (magv + 1u);
+                    if (halfHeightFields && lines > 1u)
+                        lines /= 2u;
+                    if (lines == 0u)
+                        lines = 1u;
+                    display &= ~(uint64_t(0x7FFu) << 44);
+                    display &= ~(uint64_t(0x3u) << 27);
+                    return display | (uint64_t(lines - 1u) << 44);
+                };
+                request.display1 = fixDisplay(request.display1);
+                request.display2 = fixDisplay(request.display2);
+            }
+
+            // The native module's direct path renders to its Vulkan swapchain.
+            // A null RGBA pointer is intentional: it avoids getBytes() and the
+            // subsequent CPU-to-D3D11 upload in the old mailbox path.
+            if (m_directPresentation)
+            {
+                request.rgba = nullptr;
+                request.stride = 0u;
+                request.maxHeight = 0u;
+                m_api->scanout(m_handle, &request);
+                return;
+            }
+
             request.rgba = m_scanout.data();
             request.stride = kScanoutStride * 4u;
             request.maxHeight = kScanoutMaxHeight;
@@ -154,9 +209,15 @@ namespace
             frame.highResolution = width > 1024u || height > 1024u;
             frame.shared = false;
             frame.rgba.resize(size_t(width) * height * 4u);
+            // The module uses request.stride as the capacity of a destination
+            // scanline.  Its returned image is nevertheless tightly packed:
+            // every row begins after request.width * 4 bytes (including the
+            // internally scaled scanout case).  Stepping by the capacity here
+            // skipped large regions of the module output and produced the
+            // horizontal strips/black frame seen by the host presenter.
             for (uint32_t y = 0; y < height; ++y)
                 std::memcpy(frame.rgba.data() + size_t(y) * width * 4u,
-                            m_scanout.data() + size_t(y) * request.stride,
+                            m_scanout.data() + size_t(y) * width * 4u,
                             size_t(width) * 4u);
             m_lastWidth = width;
             m_lastHeight = height;
@@ -183,6 +244,26 @@ namespace
             if (!bytes)
                 return 0u;
             m_api->fifo(m_handle, dst, bytes);
+            // The menu transition makes several GS-local-to-EE-memory
+            // transfers.  Keep an opt-in, bounded signature trace so the
+            // native module's materialized pixels can be matched against a
+            // reference run without retaining a huge binary dump in the log.
+            static const bool traceReadback = std::getenv("HCTP_NATIVE_GS_READBACK_DIAG") != nullptr;
+            static uint32_t traceCount = 0u;
+            if (traceReadback && traceCount++ < 64u)
+            {
+                uint64_t hash = 1469598103934665603ull;
+                for (uint32_t i = 0; i < bytes; ++i)
+                {
+                    hash ^= dst[i];
+                    hash *= 1099511628211ull;
+                }
+                const uint32_t head = bytes >= 4u ? uint32_t(dst[0]) | uint32_t(dst[1]) << 8u |
+                                                       uint32_t(dst[2]) << 16u | uint32_t(dst[3]) << 24u
+                                                  : 0u;
+                std::fprintf(stderr, "[native-gs-readback] #%u bytes=%u fnv=%016llx head=%08x\n", traceCount, bytes,
+                             static_cast<unsigned long long>(hash), head);
+            }
             return bytes;
         }
 
@@ -234,6 +315,7 @@ namespace
         uint64_t m_sequence = 0u;
         uint32_t m_lastWidth = 0u;
         uint32_t m_lastHeight = 0u;
+        bool m_directPresentation = false;
     };
 }
 

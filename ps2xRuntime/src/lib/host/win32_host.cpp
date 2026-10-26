@@ -109,6 +109,7 @@ namespace ps2host
         HWND g_hwnd = nullptr;
         std::atomic<bool> g_quit{false};
         bool g_ready = false;
+        std::atomic<bool> g_directVulkanPresentation{false};
 
         ComPtr<ID3D11Device> g_device;
         ComPtr<ID3D11DeviceContext> g_ctx;
@@ -1019,6 +1020,16 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
             return;
         std::lock_guard lock(g_d3dMutex);
         drawBlit(static_cast<ID3D11ShaderResourceView *>(srv), width, height, u1, v1);
+    }
+
+    void setDirectVulkanPresentation(bool enabled)
+    {
+        g_directVulkanPresentation.store(enabled, std::memory_order_release);
+    }
+
+    bool directVulkanPresentation()
+    {
+        return g_directVulkanPresentation.load(std::memory_order_acquire);
     }
 
     std::recursive_mutex &d3dLock() { return g_d3dMutex; }

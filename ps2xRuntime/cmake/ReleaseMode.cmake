@@ -1,6 +1,12 @@
-include(CheckIPOSupported)
+option(PS2X_SKIP_IPO_PROBE "Skip CMake's IPO capability probe (useful with mismatched MSVC PDB tools)" OFF)
 
-check_ipo_supported(RESULT IPO_SUPPORTED OUTPUT IPO_ERROR)
+if(PS2X_SKIP_IPO_PROBE)
+    set(IPO_SUPPORTED FALSE)
+    set(IPO_ERROR "disabled by PS2X_SKIP_IPO_PROBE")
+else()
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT IPO_SUPPORTED OUTPUT IPO_ERROR)
+endif()
 
 function(EnableFastReleaseMode TargetName)
     message("> Enabling optimization for: ${TargetName}")

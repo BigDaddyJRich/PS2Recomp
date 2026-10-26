@@ -75,6 +75,8 @@ namespace ps2host
     // Present whatever is currently bound as the hardware-rendered guest frame.
     void presentTexture(void *shaderResourceView, uint32_t width, uint32_t height,
                         float u1 = 1.0f, float v1 = 1.0f);
+    void setDirectVulkanPresentation(bool enabled);
+    bool directVulkanPresentation();
 
     // Serializes all use of the immediate context (game thread draws vs host presents).
     std::recursive_mutex &d3dLock();

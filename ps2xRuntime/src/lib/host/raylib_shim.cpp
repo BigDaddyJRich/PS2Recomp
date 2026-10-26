@@ -173,6 +173,11 @@ void SetTextureFilter(Texture2D, int) {} // the host scales with a linear sample
 
 void DrawTexturePro(Texture2D texture, struct Rectangle source, struct Rectangle, Vector2, float, Color)
 {
+    // The native GS module may own a Vulkan child swapchain over the Win32
+    // host window. In that mode do not upload the raylib texture or present a
+    // second D3D11 frame underneath the direct Vulkan image.
+    if (ps2host::directVulkanPresentation())
+        return;
     // the Direct3D 11 GS renderer shows its own latched frame (no CPU pixels)
     if (GSD3D11Backend::IsActive() && GSD3D11Backend::PresentLatchedToHost())
         return;
