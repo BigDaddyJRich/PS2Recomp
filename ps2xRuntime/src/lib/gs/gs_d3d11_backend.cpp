@@ -37,6 +37,7 @@ extern thread_local GifPathId g_gifCurrentPath;
 #include <cstdlib>
 #include <cstring>
 #include <list>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -188,7 +189,7 @@ cbuffer Draw : register(b0)
     float4 p2;          // x fst, y fba, z tex alpha scale (255 decoded / 128 render target), w dst alpha mode
     float4 region;      // minu, maxu, minv, maxv
     float4 p3;          // x wms, y wmt, z storage origin x, w storage origin y
-    float4 p4;          // x linear filter, y texture is a render target
+    float4 p4;          // x linear filter, y texture is a render target, z discard no-op additive pixels
 };
 Texture2D gsTex : register(t0);
 SamplerState gsSamp : register(s0);
@@ -305,9 +306,12 @@ PsOut ps_main(PsIn i)
     {
         bool ok = alphaTest(floor(c.a), p1.y, p1.z);
         if (p1.w == 0.0 && !ok) discard;
-        if (p1.w != 0.0 && ok) discard;
+        if (p1.w == 1.0 && ok) discard; // 2 = every pixel (FB_ONLY without a depth write)
     }
 
+    // Additive Cs*As + Cd with no alpha/depth write: a pixel whose product rounds to 0 changes nothing on the GS -
+    // skip its blend (HBK ice-cave sparks: ~140 M mostly transparent sprite pixels a frame at scale 3).
+    if (p4.z != 0.0 && max(c.r, max(c.g, c.b)) * c.a < 128.0) discard;
     float outA = c.a;
     if (p2.y != 0.0) outA = max(outA, 128.0);
     PsOut o;
@@ -605,6 +609,174 @@ struct GSD3D11Backend::Impl
     bool hasPending = false;
     uint64_t frameCounter = 0;
 
+    // PS2X_GPU_PROF=1: GPU timestamp pair around every draw, grouped by draw class (target, blend, texture source,
+    // prim), resolved 3 frames late; [gpuprof] prints the most expensive classes every 300 frames.
+    using GpuProfKey = std::array<uint32_t, 7>;
+    struct GpuProfAcc { double ms = 0; uint64_t n = 0; double px = 0; double verts = 0; double psInv = 0; };
+    struct GpuProfFrame
+    {
+        ComPtr<ID3D11Query> disjoint, t0, t1;
+        std::vector<ComPtr<ID3D11Query>> ts;
+        std::vector<ComPtr<ID3D11Query>> stats;
+        std::vector<GpuProfKey> keys;
+        std::vector<float> px;
+        std::vector<uint32_t> verts;
+        std::vector<const char *> gapTags;
+        uint32_t used = 0;
+        bool open = false, pending = false;
+    };
+    const bool gpOn = std::getenv("PS2X_GPU_PROF") != nullptr;
+    std::array<GpuProfFrame, 4> gp;
+    uint32_t gpCur = 0;
+    const char *gpTag = nullptr; // last non-draw GPU op since the previous profiled draw
+    std::map<std::string, double> gpGap;
+    std::map<GpuProfKey, GpuProfAcc> gpAcc;
+    uint32_t gpFrames = 0, gpDropped = 0;
+    double gpTotal = 0, gpMax = 0, gpDrawSum = 0;
+
+    ComPtr<ID3D11Query> gpQuery(D3D11_QUERY q)
+    {
+        D3D11_QUERY_DESC qd{q, 0};
+        ComPtr<ID3D11Query> r;
+        dev->CreateQuery(&qd, &r);
+        return r;
+    }
+    // Returns the query index for the draw (-1 = not profiled); End(ts[i]) before and End(ts[i+1]) after the draw.
+    int gpBegin(const GpuProfKey &key, float px, uint32_t verts)
+    {
+        GpuProfFrame &f = gp[gpCur];
+        if (f.pending)
+            return -1;
+        if (!f.open)
+        {
+            if (!f.disjoint)
+            {
+                f.disjoint = gpQuery(D3D11_QUERY_TIMESTAMP_DISJOINT);
+                f.t0 = gpQuery(D3D11_QUERY_TIMESTAMP);
+                f.t1 = gpQuery(D3D11_QUERY_TIMESTAMP);
+            }
+            if (!f.disjoint || !f.t0 || !f.t1)
+                return -1;
+            ctx->Begin(f.disjoint.Get());
+            ctx->End(f.t0.Get());
+            f.open = true;
+            f.used = 0;
+            f.keys.clear();
+            f.px.clear();
+            f.verts.clear();
+            f.gapTags.clear();
+        }
+        if (f.used >= 4096u)
+            return -1;
+        const uint32_t i = f.used * 2u;
+        while (f.ts.size() < i + 2u)
+            f.ts.push_back(gpQuery(D3D11_QUERY_TIMESTAMP));
+        while (f.stats.size() <= f.used)
+            f.stats.push_back(gpQuery(D3D11_QUERY_PIPELINE_STATISTICS));
+        if (!f.ts[i] || !f.ts[i + 1u] || !f.stats[f.used])
+            return -1;
+        ctx->Begin(f.stats[f.used].Get());
+        ++f.used;
+        f.keys.push_back(key);
+        f.px.push_back(px);
+        f.verts.push_back(verts);
+        f.gapTags.push_back(gpTag ? gpTag : "state/idle");
+        gpTag = nullptr;
+        ctx->End(f.ts[i].Get());
+        return static_cast<int>(i);
+    }
+    void gpEnd(int i)
+    {
+        if (i >= 0)
+        {
+            ctx->End(gp[gpCur].ts[static_cast<size_t>(i) + 1u].Get());
+            ctx->End(gp[gpCur].stats[static_cast<size_t>(i) / 2u].Get());
+        }
+    }
+    void gpuProfFrame()
+    {
+        if (!gpOn)
+            return;
+        GpuProfFrame &f = gp[gpCur];
+        if (f.open)
+        {
+            ctx->End(f.t1.Get());
+            ctx->End(f.disjoint.Get());
+            f.open = false;
+            f.pending = true;
+        }
+        gpCur = (gpCur + 1u) & 3u;
+        GpuProfFrame &o = gp[gpCur]; // the oldest frame: resolve it before reuse
+        if (!o.pending)
+            return;
+        o.pending = false;
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj{};
+        if (ctx->GetData(o.disjoint.Get(), &dj, sizeof(dj), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK || dj.Disjoint || !dj.Frequency)
+        {
+            ++gpDropped;
+            return;
+        }
+        auto get = [&](ID3D11Query *q, uint64_t &v) { return ctx->GetData(q, &v, sizeof(v), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK; };
+        const double toMs = 1000.0 / static_cast<double>(dj.Frequency);
+        uint64_t a = 0, b = 0;
+        if (!get(o.t0.Get(), a) || !get(o.t1.Get(), b))
+        {
+            ++gpDropped;
+            return;
+        }
+        const double total = static_cast<double>(b - a) * toMs;
+        double drawSum = 0;
+        uint64_t prevEnd = a;
+        for (uint32_t d = 0; d < o.used; ++d)
+        {
+            uint64_t x = 0, y = 0;
+            if (!get(o.ts[d * 2u].Get(), x) || !get(o.ts[d * 2u + 1u].Get(), y) || y < x)
+                continue;
+            if (x > prevEnd)
+                gpGap[d == 0 ? std::string("frame-start/") + o.gapTags[d] : std::string(o.gapTags[d])] += static_cast<double>(x - prevEnd) * toMs;
+            prevEnd = y;
+            const double ms = static_cast<double>(y - x) * toMs;
+            GpuProfAcc &acc = gpAcc[o.keys[d]];
+            acc.ms += ms;
+            acc.n += 1;
+            acc.px += o.px[d];
+            acc.verts += o.verts[d];
+            D3D11_QUERY_DATA_PIPELINE_STATISTICS ps{};
+            if (ctx->GetData(o.stats[d].Get(), &ps, sizeof(ps), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK)
+                acc.psInv += static_cast<double>(ps.PSInvocations);
+            drawSum += ms;
+        }
+        if (b > prevEnd)
+            gpGap["after-last-draw (present/host)"] += static_cast<double>(b - prevEnd) * toMs;
+        gpTotal += total;
+        gpDrawSum += drawSum;
+        gpMax = std::max(gpMax, total);
+        if (++gpFrames < 300u)
+            return;
+        const double nf = static_cast<double>(gpFrames);
+        std::printf("[gpuprof] frames=%u dropped=%u gpu avg=%.2f max=%.2f ms/frame, draws=%.2f ms/frame, scale=%u\n", gpFrames,
+                    gpDropped, gpTotal / nf, gpMax, gpDrawSum / nf, scale);
+        std::vector<std::pair<GpuProfKey, GpuProfAcc>> v(gpAcc.begin(), gpAcc.end());
+        std::sort(v.begin(), v.end(), [](const auto &l, const auto &r) { return l.second.ms > r.second.ms; });
+        static const char *kTex[4] = {"none", "vram", "rt", "feedback"};
+        for (size_t k = 0; k < v.size() && k < 20u; ++k)
+        {
+            const GpuProfKey &key = v[k].first;
+            const GpuProfAcc &acc = v[k].second;
+            std::printf("[gpuprof]  %6.3f ms/f n/f=%6.1f Mpx/f=%6.2f v/f=%7.0f psMpx/f=%6.2f fbp=%u rt=%ux%u abe=%u alpha=%02x tex=%s tbp=%u %ux%u prim=%u date=%u pass=%u test=%05x zw=%u\n",
+                        acc.ms / nf, static_cast<double>(acc.n) / nf, acc.px / nf / 1e6, acc.verts / nf, acc.psInv / nf / 1e6, key[0], key[1] >> 16, key[1] & 0xFFFFu,
+                        key[2] >> 8, key[2] & 0xFFu, kTex[(key[3] >> 28) & 3u], key[3] & 0x3FFFu, key[5] >> 16, key[5] & 0xFFFFu,
+                        key[4] >> 8, (key[4] >> 4) & 1u, key[4] & 0xFu, key[6] & 0xFFFFFu, key[6] >> 31);
+        }
+        for (const auto &g : gpGap)
+            std::printf("[gpuprof]  gap %-32s %6.3f ms/f\n", g.first.c_str(), g.second / nf);
+        std::fflush(stdout);
+        gpGap.clear();
+        gpAcc.clear();
+        gpFrames = gpDropped = 0;
+        gpTotal = gpMax = gpDrawSum = 0;
+    }
+
     // Feedback copy (texture == render target).
     ComPtr<ID3D11Texture2D> feedbackTex;
     ComPtr<ID3D11ShaderResourceView> feedbackSrv;
@@ -855,6 +1027,7 @@ struct GSD3D11Backend::Impl
         ComPtr<ID3D11Texture2D> staging;
         if (!createTexture(rt.w, hh, D3D11_BIND_SHADER_RESOURCE, staging))
             return;
+        gpTag = "rt-upload";
         ctx->UpdateSubresource(staging.Get(), 0, nullptr, pixels.data(), rt.w * 4u, 0);
         ComPtr<ID3D11ShaderResourceView> srv;
         dev->CreateShaderResourceView(staging.Get(), nullptr, &srv);
@@ -924,6 +1097,7 @@ struct GSD3D11Backend::Impl
         ComPtr<ID3D11Texture2D> staging;
         if (FAILED(dev->CreateTexture2D(&td, nullptr, &staging)))
             return;
+        gpTag = "rt-readback";
         ctx->CopyResource(staging.Get(), nativeTex.Get());
         D3D11_MAPPED_SUBRESOURCE m{};
         if (FAILED(ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m)))
@@ -1010,6 +1184,7 @@ struct GSD3D11Backend::Impl
             slot.w = src.Width;
             slot.h = src.Height;
         }
+        gpTag = "depth-ring-copy";
         ctx->CopyResource(slot.tex.Get(), dt.tex.Get()); // depth-stencil copies must be whole-resource
         slot.zbp = dt.zbpBlock;
         slot.frame = frameCounter;
@@ -1047,6 +1222,7 @@ struct GSD3D11Backend::Impl
             depthStagingW = td.Width;
             depthStagingH = td.Height;
         }
+        gpTag = "depth-readback";
         ctx->CopyResource(depthStaging.Get(), dt->tex.Get()); // depth-stencil copies must be whole-resource
         D3D11_MAPPED_SUBRESOURCE m{};
         if (FAILED(ctx->Map(depthStaging.Get(), 0, D3D11_MAP_READ, 0, &m)))
@@ -1587,6 +1763,7 @@ struct GSD3D11Backend::Impl
                 }
             }
         }
+        gpTag = "tex-upload";
         ctx->UpdateSubresource(ct.tex.Get(), 0, nullptr, px.data(), tw * 4u, 0);
         if (!ct.srv)
             dev->CreateShaderResourceView(ct.tex.Get(), nullptr, &ct.srv);
@@ -2127,6 +2304,7 @@ struct GSD3D11Backend::Impl
                         createTexture(td.Width, td.Height, D3D11_BIND_SHADER_RESOURCE, feedbackTex);
                         dev->CreateShaderResourceView(feedbackTex.Get(), nullptr, &feedbackSrv);
                     }
+                    gpTag = "feedback-full";
                     ctx->CopyResource(feedbackTex.Get(), rt->tex.Get());
                     texSrv = feedbackSrv.Get();
                     texFromRt = true;
@@ -2313,6 +2491,7 @@ struct GSD3D11Backend::Impl
                 if (boxOk)
                 {
                     D3D11_BOX box{static_cast<UINT>(rx0), static_cast<UINT>(ry0), 0, static_cast<UINT>(rx1), static_cast<UINT>(ry1), 1};
+                    gpTag = "date-copy";
                     ctx->CopySubresourceRegion(feedbackTex.Get(), 0, static_cast<UINT>(rx0), static_cast<UINT>(ry0), 0, rt->tex.Get(), 0, &box);
                 }
                 ctx->ClearDepthStencilView(dt->dsv.Get(), D3D11_CLEAR_STENCIL, 0.0f, 0);
@@ -2408,9 +2587,30 @@ struct GSD3D11Backend::Impl
             bound.smp = smp;
         }
 
+        GpuProfKey gpKey{};
+        float gpPx = 0.0f;
+        if (gpOn)
+        {
+            float bx0 = 1e9f, by0 = 1e9f, bx1 = -1e9f, by1 = -1e9f;
+            for (const Vtx &v : pending)
+            {
+                bx0 = std::min(bx0, v.x); by0 = std::min(by0, v.y);
+                bx1 = std::max(bx1, v.x); by1 = std::max(by1, v.y);
+            }
+            bx0 = std::max(bx0, static_cast<float>(c.scissor.x0)); by0 = std::max(by0, static_cast<float>(c.scissor.y0));
+            bx1 = std::min(bx1, static_cast<float>(c.scissor.x1 + 1u)); by1 = std::min(by1, static_cast<float>(c.scissor.y1 + 1u));
+            gpPx = (bx1 > bx0 && by1 > by0) ? (bx1 - bx0) * (by1 - by0) * static_cast<float>(scale * scale) : 0.0f;
+            const uint32_t texKind = !st.prim.tme ? 0u : (texSrv && texSrv == feedbackSrv.Get()) ? 3u : texFromRt ? 2u : 1u;
+            gpKey = {c.frame.fbp, (rt->w << 16) | (rt->h & 0xFFFFu), (st.prim.abe ? 0x100u : 0u) | static_cast<uint32_t>(c.alpha & 0xFFu),
+                     (texKind << 28) | (st.prim.tme ? (c.tex0.tbp0 & 0x3FFFu) : 0u),
+                     (static_cast<uint32_t>(st.prim.type) << 8) | (dateActive ? 0x10u : 0u),
+                     st.prim.tme ? ((st.textureWidth << 16) | (st.textureHeight & 0xFFFFu)) : 0u,
+                     static_cast<uint32_t>(c.test & 0xFFFFFu)};
+        }
         auto drawPass = [&](float afailSelect, bool depthWrite, bool rgbOnly, bool colorOff)
         {
             cbd.p1[3] = afailSelect;
+            cbd.p4[2] = (rgbOnly && !depthWrite && st.prim.abe && (c.alpha & 0xFFu) == 0x48u) ? 1.0f : 0.0f;
             static_assert(sizeof(cbd) <= sizeof(bound.cbData), "constant buffer cache too small");
             if (!bound.cbValid || std::memcmp(bound.cbData, &cbd, sizeof(cbd)) != 0)
             {
@@ -2437,7 +2637,9 @@ struct GSD3D11Backend::Impl
                 ctx->OMSetDepthStencilState(ds, dateActive ? 1u : 0u);
                 bound.ds = ds;
             }
+            const int gq = gpOn ? gpBegin({gpKey[0], gpKey[1], gpKey[2], gpKey[3], gpKey[4] | (afailSelect != 0.0f ? 1u : 0u), gpKey[5], gpKey[6] | (depthWrite ? 0x80000000u : 0u)}, gpPx, static_cast<uint32_t>(pending.size())) : -1;
             ctx->Draw(static_cast<UINT>(pending.size()), firstVertex);
+            gpEnd(gq);
         };
 
         static const int s_traceLimit = std::getenv("PS2X_GS_TRACE") ? std::atoi(std::getenv("PS2X_GS_TRACE")) : 0;
@@ -2642,9 +2844,15 @@ struct GSD3D11Backend::Impl
             }
         }
         const bool zwrite = dt && !c.zbuf.zmask && ztest;
-        if (ate && atst != 1u && afail != 0u)
+        static const bool s_afailSplit = std::getenv("HCTP_AFAIL_SPLIT") != nullptr; // A/B: old two-pass path
+        if (ate && atst != 1u && afail == 1u && !zwrite && !s_afailSplit)
+            drawPass(2.0f, false, false, false); // FB_ONLY with no depth write: both halves write the same color - one pass
+        else if (ate && atst != 1u && afail != 0u)
         {
-            drawPass(0.0f, zwrite, false, false);
+            // ATST NEVER: no pixel passes, so the passing pass only shades and discards (HBK ice-cave sparks:
+            // ~190 M pixels a frame at scale 3) - draw the failing pass alone.
+            if (atst != 0u)
+                drawPass(0.0f, zwrite, false, false);
             if (afail == 1u)      // FB_ONLY: failing pixels still update color
                 drawPass(1.0f, false, false, false);
             else if (afail == 2u) // ZB_ONLY: failing pixels update depth only
@@ -2742,6 +2950,7 @@ struct GSD3D11Backend::Impl
         D3D11_TEXTURE2D_DESC sd{};
         src->GetDesc(&sd);
         D3D11_BOX box{sx * s, sy * s, 0, std::min(sd.Width, (sx + w) * s), std::min(sd.Height, (sy + h) * s), 1};
+        gpTag = "display-copy";
         ctx->CopySubresourceRegion(displayTex.Get(), 0, 0, 0, 0, src, 0, &box);
         displayW = dw;
         displayH = dh;
@@ -3120,6 +3329,7 @@ PresentationFrame GSD3D11Backend::Present(const GSPresentationRequest &request)
     std::lock_guard lock(ps2host::d3dLock());
     Impl &d = *m_impl;
     d.flushPending();
+    d.gpuProfFrame();
     ++d.frameCounter;
     {
         // Widescreen: this frame's aspect is the one its 2D was drawn for; the next frame decides from this one.

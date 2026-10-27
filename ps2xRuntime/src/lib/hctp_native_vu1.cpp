@@ -1281,6 +1281,10 @@ bool hctpNativeVu1MscalGeneric(const uint8_t *code, uint8_t *data, uint32_t star
         {
             g.on = std::getenv(g.env) && std::getenv(g.env)[0] == '1';
             g.off = std::getenv(g.env) && std::getenv(g.env)[0] == '0'; // =0: always the VU1, even with natives on
+            // p16 Particle: the native port mismatches the VU1 (62% of qwords, Oct 27: floating head particles, red
+            // pyro lines, oversized sprites in HBK/Goldberg pyro) - the real VU1 program unless HCTP_NATIVE_P16=1.
+            if (std::strcmp(g.name, "p16 Particle") == 0 && !g.on)
+                g.off = true;
         }
     }
     if (!code || !data)

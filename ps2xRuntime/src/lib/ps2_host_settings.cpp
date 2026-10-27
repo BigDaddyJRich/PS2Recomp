@@ -450,7 +450,8 @@ namespace ps2_host_settings
             fillSwitch("HCTP_NATIVE_P18", "1");
             fillSwitch("HCTP_NATIVE_P10", "1");
             fillSwitch("HCTP_NATIVE_P17", "1"); // crowd, verified 100% (Oct 19)
-            fillSwitch("HCTP_NATIVE_P16", "1"); // particles, verified 100% where handled
+            // p16 particles: OFF - 62% match in a full verify run (Oct 27): oversized sprites (HBK/Goldberg pyro dots
+            // instead of streaks, 273 M px/frame) and floating head particles; the VU1 program matches retail dumps.
             // written, not yet seen in a test match (Jordan: everything native that exists); =0 turns one off
             fillSwitch("HCTP_NATIVE_P19", "1");
             fillSwitch("HCTP_NATIVE_P11", "1");
