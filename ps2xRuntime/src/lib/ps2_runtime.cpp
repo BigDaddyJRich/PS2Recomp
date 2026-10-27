@@ -1860,6 +1860,9 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
 
 // Set by eeCheckpointDue when a generated back edge asks the callee to stop; read by dispatchGuestBranch.
 thread_local bool t_eeCheckpointHit = false;
+// Set by native code that runs guest functions as a native call (hctp_overrides ppvCall): no checkpoint may stop the
+// callee part way, since the native caller cannot resume it (half-built menu objects, then a hang).
+thread_local bool t_eeNoCheckpoint = false;
 
 bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      R5900Context *ctx,
@@ -1875,7 +1878,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while
     // this charge bounds straight-line call chains that have no local loop.
-    if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
+    if (m_eeScheduler && !t_eeNoCheckpoint && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
     {
         return false;
     }
@@ -2920,6 +2923,8 @@ void PS2Runtime::postEeEvent(EeEvent event)
 
 bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
 {
+    if (t_eeNoCheckpoint)
+        return false;
     const bool due = m_eeScheduler->checkpointDue(cycles);
     if (due)
         t_eeCheckpointHit = true; // dispatchGuestBranch: the callee stopped at a back edge, it did not return
