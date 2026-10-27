@@ -400,21 +400,8 @@ namespace ps2recomp
 
     std::string CodeGenerator::translatePHMADH(const Instruction &inst)
     {
-        // Parallel Horizontal Multiply Add Halfword -> results to HI/LO and rd
-        return fmt::format("{{ __m128i evens = _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(2,0,2,0)); \n" // Select even halfwords
-                           "   __m128i odds  = _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(3,1,3,1)); \n" // Select odd halfwords
-                           "   __m128i prod_ev = _mm_mullo_epi16(evens, _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(2,0,2,0))); \n"
-                           "   __m128i prod_od = _mm_mullo_epi16(odds,  _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(3,1,3,1))); \n"
-                           "   __m128i sum_pairs = _mm_add_epi16(prod_ev, prod_od); \n"                            // Add rs[0]*rt[0] + rs[1]*rt[1], etc.
-                           "   int32_t h0 = _mm_extract_epi16(sum_pairs, 0) + _mm_extract_epi16(sum_pairs, 1); \n" // Horizontal add within low 32b
-                           "   int32_t h1 = _mm_extract_epi16(sum_pairs, 2) + _mm_extract_epi16(sum_pairs, 3); \n" // Horizontal add within next 32b
-                           "   int32_t h2 = _mm_extract_epi16(sum_pairs, 4) + _mm_extract_epi16(sum_pairs, 5); \n"
-                           "   int32_t h3 = _mm_extract_epi16(sum_pairs, 6) + _mm_extract_epi16(sum_pairs, 7); \n"
-                           "   int64_t acc = Ps2HiLoToU64(ctx->hi, ctx->lo); \n"
-                           "   acc += (int64_t)h0 + (int64_t)h1 + (int64_t)h2 + (int64_t)h3; \n"
-                           "   ctx->lo = (uint32_t)acc; ctx->hi = (uint32_t)(acc >> 32); \n"
-                           "   SET_GPR_U64(ctx, {}, acc); }}",
-                           inst.rs, inst.rt, inst.rs, inst.rt, inst.rd);
+        // pairwise sums and the upper products into LO/HI/rd (PCSX2 MMI.cpp), not one accumulator
+        return fmt::format("PS2_PHMADH(ctx, {}, {}, {});", inst.rs, inst.rt, inst.rd);
     }
 
 
@@ -471,16 +458,8 @@ namespace ps2recomp
 
     std::string CodeGenerator::translatePMULTH(const Instruction &inst)
     {
-        // Parallel multiply halfword, results sum to HI/LO and rd
-        return fmt::format("{{ __m128i prod = _mm_madd_epi16(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})); \n"
-                           "   int32_t p0 = _mm_cvtsi128_si32(prod); \n"
-                           "   int32_t p1 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 4)); \n"
-                           "   int32_t p2 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 8)); \n"
-                           "   int32_t p3 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 12)); \n"
-                           "   int64_t result = (int64_t)p0 + (int64_t)p1 + (int64_t)p2 + (int64_t)p3; \n"
-                           "   ctx->lo = (uint32_t)result; ctx->hi = (uint32_t)(result >> 32); \n"
-                           "   SET_GPR_U64(ctx, {}, result); }}",
-                           inst.rs, inst.rt, inst.rd);
+        // 8 separate halfword products into LO/HI/rd (PCSX2 MMI.cpp), not one sum
+        return fmt::format("PS2_PMULTH(ctx, {}, {}, {});", inst.rs, inst.rt, inst.rd);
     }
 
 

@@ -75,7 +75,9 @@ namespace
             CloseHandle(snap);
             std::unordered_map<DWORD, std::unordered_map<std::string, uint32_t>> hits;
             std::unordered_map<DWORD, uint32_t> totals;
-            const ULONGLONG end = GetTickCount64() + 20000u;
+            // HCTP_SAMPLER_MS=<ms>: shorter windows (e.g. 1000) line up with [native-fps] lines to catch short dips
+            static const ULONGLONG s_windowMs = std::getenv("HCTP_SAMPLER_MS") ? std::strtoull(std::getenv("HCTP_SAMPLER_MS"), nullptr, 10) : 20000u;
+            const ULONGLONG end = GetTickCount64() + s_windowMs;
             while (GetTickCount64() < end)
             {
                 for (auto &[id, t] : threads)

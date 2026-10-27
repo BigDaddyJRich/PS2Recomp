@@ -745,6 +745,8 @@ namespace ps2x::iop::detail
             return running;
         }
 
+        uint64_t maskedRun = 0u; // consecutive IOP instructions run with I_CTRL = 0
+
         uint32_t runCpu(CpuState &cpu, uint32_t instructionBudget)
         {
             // Guest code can change anything the idle skip relies on (threads, DMA, callbacks, timers).
@@ -752,10 +754,32 @@ namespace ps2x::iop::detail
             CpuState *previous = activeCpu;
             activeCpu = &cpu;
             const uint64_t start = totalInstructions;
-            while (!cpu.stopped && !cpu.yielded && totalInstructions - start < instructionBudget)
+            // CpuSuspendIntr / CpuDisableIntr (I_CTRL = 0) is a critical section on the hardware: no interrupt (DMA
+            // completion, callbacks) is taken and the thread is not switched out until it re-enables interrupts or
+            // blocks. CRI_ADXI.IRX guards its stream block list this way; completing DMA / ending the time slice
+            // inside it lost a block and the stream waited forever (black-screen hang at entrance load, Oct 27; same
+            // as PS2Recomp-Fixer row 68). HCTP_IOP_INTR_MASK=0: old behaviour.
+            static const bool s_intrMask = !(std::getenv("HCTP_IOP_INTR_MASK") && std::getenv("HCTP_IOP_INTR_MASK")[0] == '0');
+            // Only short critical sections are honoured: code that polls a DMA status with interrupts off (the
+            // hardware still completes the transfer) would wait forever (Create menu deadlock, Oct 27). Past
+            // kMaxMaskedRun masked instructions in a row we complete DMA / callbacks as before.
+            constexpr uint64_t kMaxMaskedRun = 20000u;
+            const auto masked = [&]() {
+                if (!s_intrMask || memory.interruptControl() != 0u)
+                {
+                    maskedRun = 0u;
+                    return false;
+                }
+                return ++maskedRun <= kMaxMaskedRun;
+            };
+            while (!cpu.stopped && !cpu.yielded &&
+                   (totalInstructions - start < instructionBudget ||
+                    (s_intrMask && memory.interruptControl() == 0u && maskedRun < kMaxMaskedRun)))
             {
                 if (!step(cpu))
                     break;
+                if (masked())
+                    continue;
                 // After every instruction, as before - but only called when something can be due: a call with
                 // nothing due changes nothing. No DMA interrupt completes before dmaDueFloor, and the guest
                 // callbacks are kept in cycle order, so the first one is the earliest.
