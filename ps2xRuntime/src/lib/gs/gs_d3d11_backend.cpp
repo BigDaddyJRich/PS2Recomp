@@ -592,8 +592,10 @@ struct GSD3D11Backend::Impl
     {
         static const bool s_on = []()
         {
+            // HCTP: the game patch widens every frame (as PCSX2's forced 16:9) and nothing marks frame3D, so the
+            // per-frame 4:3/16:9 choice + 2D correction is opt-in (PS2X_WS_HUD=1); off = every frame 16:9
             const char *v = std::getenv("PS2X_WS_HUD");
-            return ps2host::config().widescreen && !(v && *v == '0');
+            return ps2host::config().widescreen && v && *v == '1';
         }();
         return s_on;
     }

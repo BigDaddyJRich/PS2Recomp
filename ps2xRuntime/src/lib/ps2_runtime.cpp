@@ -1499,6 +1499,14 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
 
     m_iopSubsystem->reset();
 
+    // HCTP widescreen: the game camera's width constant (hctp.toml patches 0x206a5c to read it from 0x7F00; the
+    // sceVu0ViewScreenMatrix stub keeps it current): 0.53125 at 16:9 (ElHecht's PCSX2 patch), the stock 1.0 otherwise
+    {
+        const char *w = std::getenv("PS2X_WIDESCREEN");
+        const float camW = (w && *w && *w != '0') ? 0.53125f : 1.0f;
+        std::memcpy(m_memory.getRDRAM() + 0x7F00u, &camW, sizeof(camW));
+    }
+
     ps2_game_overrides::applyMatching(*this,
                                       elfPath,
                                       m_cpuContext.pc,

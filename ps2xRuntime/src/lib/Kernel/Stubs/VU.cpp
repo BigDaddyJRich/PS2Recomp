@@ -775,7 +775,11 @@ namespace ps2_stubs
     {
         VCNT("sceVu0ViewScreenMatrix");
         const uint32_t d = getRegU32(ctx, 4);
-        const float scrz = ctx->f[12], ax = ctx->f[13], ay = ctx->f[14], cx = ctx->f[15], cy = ctx->f[16];
+        // HCTP widescreen (ElHecht's PCSX2 16:9 patch): ax x 0.75, and the game camera's width constant at 0x7F00
+        // (hctp.toml patches CCamGame5::Action 0x206a5c to read it): 0.53125 at 16:9, the stock 1.0 otherwise
+        static const bool wide = [] { const char *w = std::getenv("PS2X_WIDESCREEN"); return w && *w && *w != '0'; }();
+        { const float camW = wide ? 0.53125f : 1.0f; if (uint8_t *p = getMemPtr(rdram, 0x7F00u)) std::memcpy(p, &camW, 4); }
+        const float scrz = ctx->f[12], ax = ctx->f[13] * (wide ? 0.75f : 1.0f), ay = ctx->f[14], cx = ctx->f[15], cy = ctx->f[16];
         const float zmin = ctx->f[17], zmax = ctx->f[18], nearz = ctx->f[19];
         float farz = 0.0f;
         { const uint8_t *sp = getConstMemPtr(rdram, getRegU32(ctx, 29)); if (sp) std::memcpy(&farz, sp, 4); }

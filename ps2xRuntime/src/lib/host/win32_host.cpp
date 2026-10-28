@@ -588,7 +588,7 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
             float vw = bw, vh = bh;
             if (g_config.keepAspect)
             {
-                const float aspect = (g_config.widescreen && g_presentWide.load(std::memory_order_relaxed)) ? (16.0f / 9.0f) : (4.0f / 3.0f);
+                const float aspect = (config().widescreen && g_presentWide.load(std::memory_order_relaxed)) ? (16.0f / 9.0f) : (4.0f / 3.0f);
                 if (bw / bh > aspect)
                     vw = bh * aspect;
                 else
@@ -662,7 +662,13 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
         }
     }
 
-    const HostConfig &config() { return g_config; }
+    const HostConfig &config()
+    {
+        // settings.toml's shape arrives as PS2X_WIDESCREEN after this host read its ini: it wins over Widescreen=
+        if (const char *ws = std::getenv("PS2X_WIDESCREEN"); ws && *ws)
+            g_config.widescreen = *ws != '0';
+        return g_config;
+    }
 
     bool loadConfig(const char *iniPath)
     {
