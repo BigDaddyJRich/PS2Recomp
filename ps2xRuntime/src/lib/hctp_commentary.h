@@ -39,5 +39,9 @@ extern "C" void hctpCommentaryCharaRoster(uint32_t chara, uint32_t rosterId);
 // Arena / show at the bell (GetNowStage): picks Cole/Tazz or JR/King; PPVs skip the city welcome.
 extern "C" void hctpCommentaryArena(int stage);
 
+// The wrestlers' majority Raw/SmackDown brand (0 Raw, 1 SmackDown, -1 none): picks the team in shared arenas.
+// Send before hctpCommentaryArena.
+extern "C" void hctpCommentaryBrand(int brand);
+
 // Who is in the match (roster ids), sent at the opening bell -> wrestler-specific banter (SvR tables 4 / 22, w0 = id).
 extern "C" void hctpCommentaryParticipants(const uint32_t *rosterIds, uint32_t count);

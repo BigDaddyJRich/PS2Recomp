@@ -125,7 +125,8 @@ namespace
 
         // the arena picks the team (HCTP stage order, SLUS_207.87 arena name table): 0-3 SmackDown, 4-7 Raw, 8 Velocity,
         // 9 Heat, 10 SummerSlam, 11 Unforgiven, 12 No Mercy, 13 Survivor Series, 14 Armageddon, 15 No Way Out,
-        // 16 WrestleMania XIX, 17 Backlash, 18 Judgment Day, 19 Vengeance, 20 Rebellion, 21 Insurrextion, 22 Bad Blood
+        // 16 WrestleMania XIX, 17 Backlash, 18 Judgment Day, 19 Vengeance, 20 Rebellion, 21 Insurrextion, 22 Bad Blood,
+        // 23-29 backstage / outside areas, 30 Royal Rumble (verified against the ELF list at 0x358740)
         void setArena(int stage)
         {
             std::lock_guard<std::mutex> lock(m_);
@@ -135,9 +136,22 @@ namespace
             switch (stage)
             {
             case 4: case 5: case 6: case 7: case 9: case 11: case 14: case 21: case 22: raw_ = true; break;
-            case 0: case 1: case 2: case 3: case 8: case 12: case 18: case 19: case 20: raw_ = false; break;
-            default: raw_ = std::uniform_int_distribution<int>(0, 1)(rng_) == 1; // shared pay-per-views
+            case 0: case 1: case 2: case 3: case 8: case 12: case 19: case 20: raw_ = false; break;
+            // 2003 brand split (Jordan): Royal Rumble 30, No Way Out, WrestleMania, Backlash, Judgment Day, SummerSlam,
+            // Survivor Series and the backstage areas 23-29 are shared -> the wrestlers' brand (SvR: a shared show
+            // keeps the announce team of the brand), random only when they split evenly / have none
+            default:
+                raw_ = brand_ >= 0 ? brand_ == 0 : std::uniform_int_distribution<int>(0, 1)(rng_) == 1;
+                std::fprintf(stderr, "[hctp-pbp] shared arena %d -> %s (%s)%c", stage, raw_ ? "JR/King" : "Cole/Tazz",
+                             brand_ >= 0 ? "wrestlers' brand" : "random", 10);
             }
+        }
+
+        // majority Raw/SmackDown brand of the match's wrestlers: 0 Raw, 1 SmackDown, -1 none / tie
+        void setBrand(int brand)
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            brand_ = brand;
         }
 
         void setCharaRoster(uint32_t chara, uint32_t rosterId)
@@ -172,7 +186,39 @@ namespace
         {
             std::lock_guard<std::mutex> lock(m_);
             matchRule_ = rule & 0xFFu;
-            std::fprintf(stderr, "[hctp-pbp] entrance match rule 0x%02X%c", matchRule_, 10);
+            openerClip_ = openerFor(matchRule_);
+            std::fprintf(stderr, "[hctp-pbp] entrance match rule 0x%02X -> Finkel opener %d%c", matchRule_, openerClip_, 10);
+        }
+
+        // Finkel's "The following contest is ..." per HCTP eRuleType (names: misc.pac debug rule table; team layout:
+        // ELF rule table 0x45AF60; notes/COMMENTARY_MATCHTYPE_AUDIT_20261027.md). FINKEL.afs 1370-1405 = LoW Finkel.
+        static int openerFor(uint32_t rule)
+        {
+            switch (rule)
+            {
+            case 0x01: case 0x02: case 0x05: case 0x0A: case 0x0B: case 0x0C: return 1381; // handicap
+            case 0x03: case 0x04: case 0x07: return 1375;                         // tag team
+            case 0x06: case 0x08: case 0x09: return 1376;                         // six-man tag
+            case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15: case 0x16: return 1389; // hardcore
+            case 0x17: return 1379;                                               // triple threat
+            case 0x18: return 1380;                                               // fatal four-way
+            case 0x19: return 1385;                                               // 4/5/6-man over the top battle royal
+            case 0x1A: return 1386;
+            case 0x1B: return 1387;
+            case 0x1C: case 0x1D: case 0x1E: case 0x1F: case 0x20: case 0x21: case 0x22: return 1394; // steel cage
+            case 0x23: case 0x24: case 0x25: case 0x26: case 0x27: return 1390;  // hell in a cell
+            case 0x2B: case 0x2E: case 0x39: return 1391;                         // iron man
+            case 0x2F: case 0x30: case 0x31: case 0x32: case 0x33: return 1393;  // ladder
+            case 0x34: case 0x36: case 0x37: return 1396;                         // tables
+            case 0x35: case 0x38: return 1397;                                    // tag team tables
+            case 0x46: return 1392;                                               // last man standing
+            case 0x48: return 1405;                                               // street fight = no holds barred
+            case 0x49: return 1395;                                               // submission
+            case 0x4A: return 442;                                                // ultimate submission (SYM)
+            case 0x4B: case 0x4C: return 1377;                                    // elimination tag
+            case 0x4D: case 0x4E: case 0x4F: case 0x50: return 1378;              // six-man elimination tag
+            default: return -1;                                                   // one fall (connector "open")
+            }
         }
 
         // one of the team's lines about this wrestler (rows with w0 == roster id; w1 = clip). id may carry an attire
@@ -200,6 +246,8 @@ namespace
             }
             const Row &r = *rows[std::uniform_int_distribution<size_t>(0, rows.size() - 1)(rng_)];
             heard_.insert({r.part, r.w[1]});
+            std::fprintf(stderr, "[hctp-pbp] wrestler line for 0x%02X (row key 0x%02X) -> %u/%u%c", id, r.w[0], r.part,
+                         r.w[1], 10);
             pushSequence(r, 1, 0.0);
         }
 
@@ -209,6 +257,9 @@ namespace
             std::lock_guard<std::mutex> lock(m_);
             lastActivity_ = Clock::now(); // wrestlers making move sounds = a match is really on screen
             bool always = false;
+            // retail SvR rows (partition 13) key on SvR's move numbering; the public beta (15) and the extra lines (16)
+            // key on HCTP's own ids (beta moves.pac == HCTP), so only retail rows use the translated id
+            const uint32_t hctpMove = moveId;
             const auto pit = charaRoster_.find(chara); // who did it (CChar -> roster id, set by the hook)
             const uint32_t performer = pit != charaRoster_.end() ? pit->second : 0xFFFFFFFFu;
             if (const auto it = moveMap_.find(moveId); it != moveMap_.end())
@@ -219,11 +270,11 @@ namespace
             if (!loaded_ || !inMatch_)
                 return;
             uint32_t &last = lastMove_[chara];
-            if (last == moveId)
+            if (last == hctpMove)
                 return; // same move still playing
-            last = moveId;
-            if (loggedMoves_.insert(moveId).second && loggedMoves_.size() < 2000)
-                std::fprintf(stderr, "[hctp-pbp] move %u (chara %08x)%c", moveId, chara, 10);
+            last = hctpMove;
+            if (loggedMoves_.insert(hctpMove).second && loggedMoves_.size() < 2000)
+                std::fprintf(stderr, "[hctp-pbp] move %u -> svr %u (chara %08x)%c", hctpMove, moveId, chara, 10);
             // timeline for mapping moves by hand ("the Spear was at 1:32"): every new move, seconds since the bell
             std::fprintf(stderr, "[hctp-pbp] mv %4.0fs %u chara %08x%c",
                          std::chrono::duration<double>(Clock::now() - matchStart_).count(), moveId, chara, 10);
@@ -237,13 +288,13 @@ namespace
                 if (t >= 0 && size_t(t) < tables_.size())
                 for (const Row &r : tables_[t])
                     if ((t == coin || r.part != 13) && // the coin is SvR's rule for its own rows; added packs always
-                        r.w[1] == moveId && r.w[2] < clipCount(r.part) &&
+                        r.w[1] == (r.part == 13 ? moveId : hctpMove) && r.w[2] < clipCount(r.part) &&
                         (r.part == 13 && r.owner == 0xFFFFu ? (r.w[0] == 0xFFu || r.w[0] == who)
                                                              : (r.owner == 0xFFFFu || r.owner == performer)))
                         rows.push_back(&r);
             if (rows.empty())
             {
-                moveReaction(moveId, false, performer);
+                moveReaction(moveId, false, performer, hctpMove);
                 return;
             }
             // attacker and receiver both carry the move id while it happens: one call per move
@@ -262,7 +313,7 @@ namespace
 
         // an ordinary move: the team's reaction line for it, by the game's own chance (w2 %), only when nobody is
         // talking and at most every 10 s (banter and finisher calls come first). Called with m_ held.
-        void moveReaction(uint32_t moveId, bool always, uint32_t performer)
+        void moveReaction(uint32_t moveId, bool always, uint32_t performer, uint32_t hctpMove)
         {
             const int t = team().moveReaction;
             const auto now = Clock::now();
@@ -279,7 +330,7 @@ namespace
                 return;
             std::vector<const Row *> rows;
             for (const Row &r : tables_[t])
-                if (r.w[0] == moveId && r.w[1] < clipCount(r.part) && (r.owner == 0xFFFFu || r.owner == performer))
+                if (r.w[0] == (r.part == 13 ? moveId : hctpMove) && r.w[1] < clipCount(r.part) && (r.owner == 0xFFFFu || r.owner == performer))
                     rows.push_back(&r);
             if (rows.empty())
                 return;
@@ -417,6 +468,8 @@ namespace
             {
                 if (royalRumble)
                     seq.push_back(1369); // "Ladies and gentlemen, it is now time for the Royal Rumble..."
+                else if (openerClip_ >= 0)
+                    seq.push_back(openerClip_);
                 else if (int c = pick(kConnectors, tagMatch_ ? "open_tag" : "open", false); c >= 0) seq.push_back(c);
             }
             else if (royalRumble)
@@ -429,7 +482,7 @@ namespace
                 // Team boundaries come from the match cast count: 2-v-2 groups by two,
                 // 3-v-3 groups by three. The first entrant of the next group is an
                 // opponent; the remaining entrants in that group are partners.
-                const bool opposingTeamFirst = tagMatch_ && entrants_.size() == teamSize_;
+                const bool opposingTeamFirst = tagMatch_ && entrants_.size() % teamSize_ == 0u; // triangle tag: 3 teams
                 const char *kind = tagMatch_ && !opposingTeamFirst
                                        ? (prevFemale ? "and_her_tag_partner" : "and_his_tag_partner")
                                        : (prevFemale ? "and_her_opponent" : "and_his_opponent");
@@ -1054,7 +1107,8 @@ namespace
         std::mt19937 rng_{std::random_device{}()};
         bool loaded_ = false, raw_ = false, inMatch_ = false, teamForced_ = false, playerHeld_ = false, tagMatch_ = false;
         uint32_t matchRule_ = 0, teamSize_ = 2;
-        int arena_ = 0;
+        int openerClip_ = -1;
+        int arena_ = 0, brand_ = -1;
         Clock::time_point lastBell_{}, matchStart_{}, nextBanter_{}, busyUntil_{}, lastActivity_{}, lastCalledAt_{}, nextReaction_{};
         uint32_t lastCalledMove_ = 0;
     };
@@ -1121,6 +1175,12 @@ extern "C" void hctpCommentaryCharaRoster(uint32_t chara, uint32_t rosterId)
 {
     if (engineReady())
         Engine::get().setCharaRoster(chara, rosterId);
+}
+
+extern "C" void hctpCommentaryBrand(int brand)
+{
+    if (engineReady())
+        Engine::get().setBrand(brand);
 }
 
 extern "C" void hctpCommentaryArena(int stage)
