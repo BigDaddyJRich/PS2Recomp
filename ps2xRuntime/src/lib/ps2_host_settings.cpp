@@ -41,6 +41,7 @@ namespace ps2_host_settings
             "                         # second, else the smoothest rate it has), \"smoothest\" (the highest multiple of 60 Hz),\n"
             "                         # 0 = the screen's own (no switch), or a number such as 60 or 120\n"
             "vsync = true             # wait for the screen before showing each picture (no tearing)\n"
+            "show_fps = false         # the frame-rate counter in the top-left corner (F1 in the game toggles it)\n"
             "shape = \"widescreen\"     # \"widescreen\" (matches at 16:9 with more of the arena; menus and movies 4:3),\n"
             "                         # \"4:3\" (as on the PS2, bars at the sides) or \"stretch\" (fill the window)\n"
             "\n"
@@ -347,8 +348,18 @@ namespace ps2_host_settings
                 scale = 16;
             }
             fillSwitch("VENDETTA_SSAA", std::to_string(scale));
-            // HCTP's D3D11 renderer (the default) draws at 1-6 x the PS2: the launcher's 1/2/4/8/16 -> 1/2/4/5/6
-            fillSwitch("PS2X_GS_SCALE", std::to_string(scale == 16 ? 6 : (scale == 8 ? 5 : scale)));
+            // HCTP's D3D11 renderer (the default): the launcher's 1/2/4/8 -> 1x/2x/3x/4x the PS2; 16 (the default) =
+            // automatic, from the window's size (1080p 3x, 1440p 4x, 4K 6x) as the host picks it
+            {
+                bool showFps = false; // a player's default: no counter (the line missing: hctp_native.ini decides)
+                if (std::string text; reader.peek("display.show_fps", text))
+                {
+                    reader.boolean("display.show_fps", showFps);
+                    fillSwitch("PS2X_SHOW_FPS", showFps ? "1" : "0");
+                }
+            }
+            if (scale != 16)
+                fillSwitch("PS2X_GS_SCALE", std::to_string(scale == 8 ? 4 : (scale == 4 ? 3 : scale)));
             if (const int filter = reader.choice("graphics.filter", {"fsr", "smooth", "blocky"}); filter >= 0)
                 fillSwitch("VENDETTA_FILTER", filter == 0 ? "fsr" : (filter == 1 ? "bilinear" : "nearest"));
             int sharpening = -1;

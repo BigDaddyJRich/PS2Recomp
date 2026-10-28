@@ -1,6 +1,7 @@
 // Native Win32 host (window, Direct3D 11, XInput, XAudio2). Ported from WWE Crush Hour PC (KaikoClanworth1,
 // GPL-3.0, https://github.com/KaikoClanworth1/wwe-crush-hour-pc) for the HCTP native-renderer build.
 #include "host/win32_host.h"
+#include "runtime/ps2_host_settings.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -686,6 +687,8 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
         g_config.keepAspect = GetPrivateProfileIntA("Display", "KeepAspect", g_config.keepAspect, iniPath) != 0;
         g_config.widescreen = GetPrivateProfileIntA("Display", "Widescreen", g_config.widescreen, iniPath) != 0;
         g_showFps = GetPrivateProfileIntA("Display", "ShowFPS", g_showFps ? 1 : 0, iniPath) != 0;
+        if (const char *f = std::getenv("PS2X_SHOW_FPS"); f && *f) // settings.toml show_fps (the launcher)
+            g_showFps = *f != '0';
         // InternalScale=N: the GS is rendered at N x the PS2 resolution (640x448 -> 1920x1344 at 3), 1..6;
         // 0 = from the output size (init). The GS backend reads PS2X_GS_SCALE when it starts (an explicit
         // PS2X_GS_SCALE wins).
@@ -695,6 +698,73 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
         if (const char *ws = std::getenv("PS2X_WIDESCREEN")) // test override
             g_config.widescreen = *ws != '0';
         return true;
+    }
+
+    namespace
+    {
+        // settings.toml (the launcher) -> this host: the Nth screen (1 = the main one)
+        BOOL CALLBACK collectMonitor(HMONITOR mon, HDC, LPRECT, LPARAM out)
+        {
+            reinterpret_cast<std::vector<HMONITOR> *>(out)->push_back(mon);
+            return TRUE;
+        }
+        MONITORINFOEXW settingsMonitor(int screen)
+        {
+            std::vector<HMONITOR> mons;
+            EnumDisplayMonitors(nullptr, nullptr, collectMonitor, reinterpret_cast<LPARAM>(&mons));
+            HMONITOR primary = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+            std::stable_partition(mons.begin(), mons.end(), [&](HMONITOR m) { return m == primary; }); // 1 = main
+            MONITORINFOEXW mi{};
+            mi.cbSize = sizeof(mi);
+            const size_t i = (screen >= 1 && static_cast<size_t>(screen) <= mons.size()) ? static_cast<size_t>(screen - 1) : 0;
+            GetMonitorInfoW(mons.empty() ? primary : mons[i], &mi);
+            return mi;
+        }
+        bool g_displayChanged = false; // exclusive fullscreen switched the screen's mode: put it back at exit
+        std::wstring g_displayDevice;
+        void restoreDisplay()
+        {
+            if (g_displayChanged)
+                ChangeDisplaySettingsExW(g_displayDevice.c_str(), nullptr, nullptr, 0, nullptr);
+            g_displayChanged = false;
+        }
+        // Fullscreen with a size or rate: the screen switched to it (borderless keeps the desktop's mode)
+        void switchDisplay(const MONITORINFOEXW &mi, const ps2_host_settings::Settings &hs)
+        {
+            DEVMODEW cur{};
+            cur.dmSize = sizeof(cur);
+            if (!EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &cur))
+                return;
+            const DWORD w = hs.fullscreenWidth > 0 ? static_cast<DWORD>(hs.fullscreenWidth) : cur.dmPelsWidth;
+            const DWORD h = hs.fullscreenHeight > 0 ? static_cast<DWORD>(hs.fullscreenHeight) : cur.dmPelsHeight;
+            std::vector<int> rates;
+            DEVMODEW dm{};
+            dm.dmSize = sizeof(dm);
+            for (DWORD n = 0; EnumDisplaySettingsW(mi.szDevice, n, &dm); ++n)
+                if (dm.dmPelsWidth == w && dm.dmPelsHeight == h && std::find(rates.begin(), rates.end(), int(dm.dmDisplayFrequency)) == rates.end())
+                    rates.push_back(static_cast<int>(dm.dmDisplayFrequency));
+            std::sort(rates.begin(), rates.end());
+            const int hz = ps2_host_settings::chooseRefreshRate(hs.refreshRate, static_cast<int>(cur.dmDisplayFrequency), rates);
+            if (w == cur.dmPelsWidth && h == cur.dmPelsHeight && (hz <= 0 || DWORD(hz) == cur.dmDisplayFrequency))
+                return; // already there
+            DEVMODEW want{};
+            want.dmSize = sizeof(want);
+            want.dmPelsWidth = w;
+            want.dmPelsHeight = h;
+            want.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
+            if (hz > 0)
+            {
+                want.dmDisplayFrequency = static_cast<DWORD>(hz);
+                want.dmFields |= DM_DISPLAYFREQUENCY;
+            }
+            if (ChangeDisplaySettingsExW(mi.szDevice, &want, nullptr, CDS_FULLSCREEN, nullptr) == DISP_CHANGE_SUCCESSFUL)
+            {
+                g_displayChanged = true;
+                g_displayDevice = mi.szDevice;
+                std::atexit(restoreDisplay);
+                std::printf("[host] fullscreen %lux%lu %d Hz%c", w, h, hz, 10);
+            }
+        }
     }
 
     bool init(const char *title)
@@ -718,16 +788,40 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
         wc.lpszClassName = L"PS2XNativeWindow";
         RegisterClassExW(&wc);
 
+        // settings.toml (the launcher's choices) wins over hctp_native.ini when the game has one
+        const ps2_host_settings::Settings &hs = ps2_host_settings::get();
+        const bool fromSettings = !hs.file.empty();
+        if (fromSettings)
+        {
+            g_config.fullscreen = hs.mode != ps2_host_settings::WindowMode::Window;
+            g_config.vsync = hs.vsync;
+            g_config.keepAspect = !hs.stretch;
+        }
+        MONITORINFOEXW mon = settingsMonitor(fromSettings ? hs.screen : 1);
+        if (fromSettings && hs.mode == ps2_host_settings::WindowMode::Fullscreen)
+        {
+            switchDisplay(mon, hs);
+            mon = settingsMonitor(hs.screen); // its rectangle after the switch
+        }
         DWORD style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
         int x = CW_USEDEFAULT, y = CW_USEDEFAULT;
         int w = static_cast<int>(g_config.width), h = static_cast<int>(g_config.height);
         if (g_config.fullscreen)
         {
             style = WS_POPUP | WS_VISIBLE;
-            x = 0;
-            y = 0;
-            w = GetSystemMetrics(SM_CXSCREEN);
-            h = GetSystemMetrics(SM_CYSCREEN);
+            x = mon.rcMonitor.left;
+            y = mon.rcMonitor.top;
+            w = mon.rcMonitor.right - mon.rcMonitor.left;
+            h = mon.rcMonitor.bottom - mon.rcMonitor.top;
+        }
+        else if (fromSettings)
+        {
+            // a window on the chosen screen, at most its work area
+            const RECT &wa = mon.rcWork;
+            w = std::min(w, int(wa.right - wa.left));
+            h = std::min(h, int(wa.bottom - wa.top));
+            x = wa.left + ((wa.right - wa.left) - w) / 2;
+            y = wa.top + ((wa.bottom - wa.top) - h) / 2;
         }
         if (g_internalScale == 0 && !std::getenv("PS2X_GS_SCALE"))
         {
@@ -928,7 +1022,8 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
 
         if (!g_background)
         {
-            ShowWindow(g_hwnd, SW_SHOW);
+            const bool maximise = !g_config.fullscreen && fromSettings && hs.maximised;
+            ShowWindow(g_hwnd, maximise ? SW_MAXIMIZE : SW_SHOW);
             UpdateWindow(g_hwnd);
         }
         g_ready = true;

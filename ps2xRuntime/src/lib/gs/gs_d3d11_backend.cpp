@@ -3582,6 +3582,11 @@ bool GSD3D11Backend::PresentLatchedToHost()
         }
     }
     ps2host::setPresentWide(d->displayWide);
-    ps2host::presentTexture(d->displaySrv.Get(), d->displayW, d->displayH, 1.0f, 1.0f);
+    // the game never paints its frame's last PS2 column / row (stray dots along the right and bottom edges, wide at
+    // 16:9): one PS2 pixel is cut off there, as a TV's overscan did. HCTP_NO_EDGE_CROP=1 = the whole frame
+    static const bool s_noCrop = std::getenv("HCTP_NO_EDGE_CROP") != nullptr;
+    const float cropU = (s_noCrop || d->displayW <= static_cast<uint32_t>(d->scale)) ? 1.0f : 1.0f - static_cast<float>(d->scale) / static_cast<float>(d->displayW);
+    const float cropV = (s_noCrop || d->displayH <= static_cast<uint32_t>(d->scale)) ? 1.0f : 1.0f - static_cast<float>(d->scale) / static_cast<float>(d->displayH);
+    ps2host::presentTexture(d->displaySrv.Get(), d->displayW, d->displayH, cropU, cropV);
     return true;
 }
