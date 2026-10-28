@@ -269,7 +269,7 @@ namespace ps2_host_update
             url = test;
         auto answer = std::make_shared<Answer>();
         const auto started = std::chrono::steady_clock::now();
-        std::thread(fetch, wide(url), wide("DefJamVendettaRecompiled/" + versionText(installed)), answer).detach();
+        std::thread(fetch, wide(url), wide("HCTPRecompiled/" + versionText(installed)), answer).detach();
         {
             std::unique_lock<std::mutex> lock(answer->mutex);
             if (!answer->ready.wait_for(lock, kAskFor, [&] { return answer->done; }))

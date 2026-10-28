@@ -29,7 +29,7 @@ namespace ps2_host_settings
         // What a missing file is replaced by: every setting, at its default, with what it does.
         const char *kDefaultFile =
             "# The game's settings. A settings program writes this file; you can also edit it by hand.\n"
-            "# A VENDETTA_* switch set in the environment wins over a line here.\n"
+            "# A switch set in the environment wins over a line here.\n"
             "\n"
             "[display]\n"
             "mode = \"fullscreen\"      # \"window\", \"borderless\" (a frameless window the size of the screen) or \"fullscreen\"\n"
@@ -309,6 +309,8 @@ namespace ps2_host_settings
             // filled in like the other switches. No settings file at all (VENDETTA_SETTINGS=none, test runs): off.
             const int shape = reader.choice("display.shape", {"4:3", "stretch", "widescreen"});
             s.stretch = shape == 1;
+            if (shape >= 0)
+                fillSwitch("PS2X_WIDESCREEN", shape == 2 ? "1" : "0"); // D3D11 host (win32_host.cpp)
             if (shape == 2 || shape < 0)
                 fillSwitch("VENDETTA_WIDESCREEN", "16:9");
             reader.integer("sound.volume", s.volume, 0, 100);
@@ -345,6 +347,8 @@ namespace ps2_host_settings
                 scale = 16;
             }
             fillSwitch("VENDETTA_SSAA", std::to_string(scale));
+            // HCTP's D3D11 renderer (the default) draws at 1-6 x the PS2: the launcher's 1/2/4/8/16 -> 1/2/4/5/6
+            fillSwitch("PS2X_GS_SCALE", std::to_string(scale == 16 ? 6 : (scale == 8 ? 5 : scale)));
             if (const int filter = reader.choice("graphics.filter", {"fsr", "smooth", "blocky"}); filter >= 0)
                 fillSwitch("VENDETTA_FILTER", filter == 0 ? "fsr" : (filter == 1 ? "bilinear" : "nearest"));
             int sharpening = -1;
