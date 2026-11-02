@@ -2796,6 +2796,9 @@ void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8
     try
     {
         m_memory.write8(vaddr, value);
+        // a narrow DMAC register write can start/finish a DMA too (PS2Recomp-Fixer row 71); only hardware regs pay
+        if ((vaddr & 0x1FFF0000u) == 0x10000000u)
+            drainCompletedDmacHandlers(rdram);
     }
     catch (const std::exception &)
     {
@@ -2809,6 +2812,9 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     try
     {
         m_memory.write16(vaddr, value);
+        // a narrow DMAC register write can start/finish a DMA too (PS2Recomp-Fixer row 71); only hardware regs pay
+        if ((vaddr & 0x1FFF0000u) == 0x10000000u)
+            drainCompletedDmacHandlers(rdram);
     }
     catch (const std::exception &)
     {

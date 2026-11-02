@@ -1564,7 +1564,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
-                    const int kMaxChainTags = 4096;
+                    const int kMaxChainTags = 1 << 20; // runaway guard only (was 4096: long chains were cut, PS2Recomp-Fixer row 43)
                     std::vector<uint8_t> chainBuf;
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
@@ -1703,8 +1703,18 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                                     asr1 = retAddr;
                                     asp = 2u;
                                 }
+                                else
+                                {
+                                    // 3rd nested CALL: the address stack holds 2 (PCSX2 hwDmacSrcChainWithStack) - send
+                                    // this tag's data, end the transfer, TADR stays on this tag
+                                    static std::atomic<uint32_t> s_overflow{0};
+                                    if (++s_overflow <= 20u)
+                                        std::fprintf(stderr, "[dma] call stack overflow at tag 0x%x%c", currentTagAddr, 10);
+                                    endChain = true;
+                                }
                             }
-                            tagAddr = addr;
+                            if (!endChain)
+                                tagAddr = addr;
                             break;
                         case 6:
                             dataAddr = tagAddr + 16;

@@ -1,3 +1,5 @@
+#include <atomic>
+#include <cstdio>
 #include <type_traits>
 #include <chrono>
 #include <vector>
@@ -1099,7 +1101,7 @@ void VU1Interpreter::progressXgkick()
         m_xgkick.cycleCredit -= 2u;
         if (m_xgkick.copiedBytes > XgkickPipeline::kBufferSize - 16u)
         {
-            reportReservedInstruction(false, 0xFFFFFFFBu);
+            reportBadXgkick(1u);
             m_xgkick.active = false;
             return;
         }
@@ -1133,18 +1135,12 @@ void VU1Interpreter::progressXgkick()
                 tagBytes += static_cast<uint64_t>(nloop) * nreg * 16u;
             else if (format == 1u)
                 tagBytes += ((static_cast<uint64_t>(nloop) * nreg + 1u) & ~1ull) * 8u;
-            else if (format == 2u)
+            else // IMAGE (2) and IMAGE2 (3): PCSX2 Gif_Unit.h treats FLG 3 as IMAGE
                 tagBytes += static_cast<uint64_t>(nloop) * 16u;
-            else
-            {
-                reportReservedInstruction(false, 0xFFFFFFF8u);
-                m_xgkick.active = false;
-                return;
-            }
 
             if (tagBytes > XgkickPipeline::kBufferSize - qwordOffset)
             {
-                reportReservedInstruction(false, 0xFFFFFFFBu);
+                reportBadXgkick(2u);
                 m_xgkick.active = false;
                 return;
             }
@@ -2161,6 +2157,17 @@ const VU1Interpreter::DecodedInstructionPair &VU1Interpreter::getDecodedInstruct
     return m_decodedCodeCache[pairIndex];
 }
 
+// An XGKICK packet our 64 KB kick buffer cannot hold: drop the kick but keep the VU1 program running (PCSX2 never
+// stops VU1 over kick contents; stopping left the program mid-run and the next MSCNT resumed there).
+void VU1Interpreter::reportBadXgkick(uint32_t why)
+{
+    static std::atomic<uint32_t> s_count{0};
+    const uint32_t n = ++s_count;
+    if (n <= 32u || (n & 1023u) == 0u)
+        std::fprintf(stderr, "[VU1 bad xgkick] #%u why=%u cycle=%llu pc=0x%x kickAddr=0x%x copied=%u%c", n, why,
+                     static_cast<unsigned long long>(m_cycle), m_state.pc, m_xgkick.sourceAddress, m_xgkick.copiedBytes, 10);
+}
+
 void VU1Interpreter::reportReservedInstruction(bool upper, uint32_t instruction)
 {
     RUNTIME_ERROR(
@@ -2222,6 +2229,25 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         return;
     }
     runLoop(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+    // A program longer than the budget used to be cut off here and the rest dropped (PS2Recomp-Fixer row 138; PCSX2
+    // runs to the E bit): keep going in budget-sized slices, up to 16. HCTP_VU1_FINISH=0 = old behaviour.
+    static const bool finish = !(std::getenv("HCTP_VU1_FINISH") && std::getenv("HCTP_VU1_FINISH")[0] == '0');
+    if (!finish || m_unit != Unit::VU1)
+        return;
+    uint32_t slices = 1;
+    while (!m_lastRunEnded && !m_stopRequested && slices < 16u)
+    {
+        runLoop(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+        ++slices;
+    }
+    if (slices > 1u)
+    {
+        static std::atomic<uint32_t> s_long{0};
+        const uint32_t n = ++s_long;
+        if (n <= 16u || (n & 1023u) == 0u)
+            std::fprintf(stderr, "[vu1] long program #%u ran %u slice(s), pc=0x%x ended=%d%c", n, slices, m_state.pc,
+                         m_lastRunEnded ? 1 : 0, 10);
+    }
 }
 
 // Apply every queued VF / VI / ACC write now (the latest per lane wins, as when they commit). Their ready cycles
@@ -2670,6 +2696,7 @@ void VU1Interpreter::runLoop(uint8_t *vuCode, uint32_t codeSize,
         m_pendingHaltD = false;
         m_pendingHaltT = false;
     }
+    m_lastRunEnded = programEnded;
     m_state.cycles = m_cycle;
     if (s_vu1Stat && m_unit == Unit::VU1)
     {

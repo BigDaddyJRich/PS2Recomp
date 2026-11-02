@@ -451,6 +451,8 @@ private:
     int32_t readBranchVi(uint8_t reg) const;
     void recordViWriteForBranch(uint8_t reg, int32_t oldValue);
     void reportReservedInstruction(bool upper, uint32_t instruction);
+    void reportBadXgkick(uint32_t why);
+    bool m_lastRunEnded = true;
     float broadcast(const float *vf, uint8_t bc);
 };
 
