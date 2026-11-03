@@ -14,6 +14,9 @@
 #include <algorithm>
 #include <string>
 #include <vector>
+#include <mutex>
+#include <set>
+#include <cstdlib>
 namespace ps2_stubs { void mpegIpuToDmaStart(uint8_t *rdram, uint32_t &chcr, uint32_t &madr, uint32_t &qwc, uint32_t &tadr); }
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -69,6 +72,73 @@ namespace
 
 #if defined(_WIN32)
     // A guest access above 32 MB that nothing committed: say which guest address, then let the crash happen as before.
+    // HCTP_LOWRAM_WATCH=1 (diagnosis, six-man): guest 0x20000-0x20FFF (our HLE RPC server records) is read-only; each
+    // write logs its host call stack once per distinct writer (RPC code skipped), then is single-stepped through.
+    constexpr uint32_t kLowWatchBase = 0x20000u, kLowWatchSize = 0x1000u;
+    std::atomic<bool> g_lowWatchOn{false};
+    thread_local bool t_lowWatchStepping = false;
+
+    LONG CALLBACK lowRamWatch(EXCEPTION_POINTERS *info)
+    {
+        const EXCEPTION_RECORD *rec = info ? info->ExceptionRecord : nullptr;
+        uint8_t *base = g_guestRamBase.load(std::memory_order_acquire);
+        if (!rec || !base || !g_lowWatchOn.load(std::memory_order_relaxed))
+            return EXCEPTION_CONTINUE_SEARCH;
+        DWORD old = 0;
+        if (rec->ExceptionCode == EXCEPTION_SINGLE_STEP && t_lowWatchStepping)
+        {
+            t_lowWatchStepping = false;
+            VirtualProtect(base + kLowWatchBase, kLowWatchSize, PAGE_READONLY, &old);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || rec->NumberParameters < 2 || rec->ExceptionInformation[0] != 1)
+            return EXCEPTION_CONTINUE_SEARCH;
+        const auto *host = reinterpret_cast<const uint8_t *>(rec->ExceptionInformation[1]);
+        if (host < base + kLowWatchBase || host >= base + kLowWatchBase + kLowWatchSize)
+            return EXCEPTION_CONTINUE_SEARCH;
+        static std::mutex logMutex;
+        static std::set<void *> seen;
+        static int logs = 0;
+        {
+            std::lock_guard<std::mutex> lock(logMutex);
+            if (logs < 60 && seen.insert(rec->ExceptionAddress).second)
+            {
+                HANDLE proc = GetCurrentProcess();
+                static bool symInit = (SymInitialize(proc, nullptr, TRUE), true);
+                (void)symInit;
+                alignas(SYMBOL_INFO) char symBuf[sizeof(SYMBOL_INFO) + 256] = {};
+                auto *sym = reinterpret_cast<SYMBOL_INFO *>(symBuf);
+                sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+                sym->MaxNameLen = 255;
+                void *frames[16] = {};
+                const USHORT n = CaptureStackBackTrace(0, 16, frames, nullptr);
+                frames[0] = rec->ExceptionAddress;
+                char line[2048];
+                int len = std::snprintf(line, sizeof(line), "[lowwatch] write 0x%05X:", static_cast<unsigned>(host - base));
+                bool rpc = false;
+                for (USHORT i = 0; i < n && len < 1900; ++i)
+                {
+                    DWORD64 disp = 0;
+                    if (i != 1 && i != 2 && i != 3 && SymFromAddr(proc, reinterpret_cast<DWORD64>(frames[i]), &disp, sym))
+                    {
+                        rpc = rpc || std::strstr(sym->Name, "Rpc") || std::strstr(sym->Name, "rpc");
+                        len += std::snprintf(line + len, sizeof(line) - len, " <- %s+0x%llx", sym->Name, static_cast<unsigned long long>(disp));
+                    }
+                }
+                if (!rpc)
+                {
+                    ++logs;
+                    std::fprintf(stderr, "%s\n", line);
+                    std::fflush(stderr);
+                }
+            }
+        }
+        VirtualProtect(base + kLowWatchBase, kLowWatchSize, PAGE_READWRITE, &old);
+        t_lowWatchStepping = true;
+        info->ContextRecord->EFlags |= 0x100u; // trap after the write, re-protect in the single-step branch
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
     LONG CALLBACK reportStrayGuestRamAccess(EXCEPTION_POINTERS *info)
     {
         const EXCEPTION_RECORD *rec = info ? info->ExceptionRecord : nullptr;
@@ -480,6 +550,16 @@ bool PS2Memory::initialize()
         static std::atomic<bool> s_strayAccessReporter{false};
         if (!s_strayAccessReporter.exchange(true))
             AddVectoredExceptionHandler(1, reportStrayGuestRamAccess);
+        if (const char *w = std::getenv("HCTP_LOWRAM_WATCH"); w && w[0] == '1')
+        {
+            static std::atomic<bool> s_lowWatch{false};
+            if (!s_lowWatch.exchange(true))
+                AddVectoredExceptionHandler(1, lowRamWatch);
+            DWORD old = 0;
+            VirtualProtect(m_rdram + kLowWatchBase, kLowWatchSize, PAGE_READONLY, &old);
+            g_lowWatchOn = true;
+            std::fprintf(stderr, "[lowwatch] guest 0x%X-0x%X write watch on\n", kLowWatchBase, kLowWatchBase + kLowWatchSize - 1u);
+        }
 #endif
 
         // Allocate scratchpad

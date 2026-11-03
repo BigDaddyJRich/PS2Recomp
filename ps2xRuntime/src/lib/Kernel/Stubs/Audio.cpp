@@ -186,6 +186,19 @@ namespace ps2_stubs
                         n += std::snprintf(line + n, sizeof(line) - n, " %08x", FAST_READ32(arg[1] + w * 4u));
                     std::fprintf(stderr, "%s\n", line);
                 }
+                // HCTP six-man: sceSkSsMIDI_Bind sent a block at 0x0AB6B1B1 (outside RAM) -> the RPC copy faulted
+                if ((arg[1] & 0x1FFFFFFFu) >= PS2_RAM_SIZE || arg[2] > 0x10000u)
+                {
+                    static uint32_t badBlockLogs = 0u;
+                    if (badBlockLogs < 16u)
+                    {
+                        ++badBlockLogs;
+                        std::fprintf(stderr, "[libsdr] cmd 0x%x: bad block 0x%x size 0x%x (args 0x%x 0x%x 0x%x) ra=0x%x - skipped\n",
+                                     cmd, arg[1], arg[2], arg[3], arg[4], arg[5], getRegU32(ctx, 31));
+                    }
+                    FAST_WRITE32(buf, 0u);
+                    return 0u;
+                }
                 sdrCall(rdram, ctx, runtime, cmd, arg[1], arg[2], buf, 16u); // user command (sound kit)
             }
             else

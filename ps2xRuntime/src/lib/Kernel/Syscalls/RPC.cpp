@@ -579,7 +579,18 @@ namespace ps2_syscalls
             server->rmode = ((mode & kSifRpcModeNowait) && endFunction == 0u) ? 0 : 1;
             server->rid = 0;
 
-            if (server->buf != 0u && sendBuf != 0u && sendSize != 0u)
+            if (server->buf != 0u && (server->buf & 0x1FFFFFFFu) >= PS2_RAM_SIZE)
+            {
+                // HCTP six-man (sceSkSsMIDI_Bind): server->buf = 0x0AB6B1B1 -> the copy faulted. Log who, skip copy.
+                static uint32_t badServerLogs = 0u;
+                if (badServerLogs < 16u)
+                {
+                    ++badServerLogs;
+                    std::fprintf(stderr, "[rpc] fno=0x%x client=0x%x server=0x%x: server buf 0x%08x outside RAM, send copy skipped\n",
+                                 rpcNum, clientPtr, serverPtr, server->buf);
+                }
+            }
+            else if (server->buf != 0u && sendBuf != 0u && sendSize != 0u)
             {
                 rpcCopyToRdram(rdram, server->buf, sendBuf, sendSize);
             }
@@ -655,6 +666,20 @@ namespace ps2_syscalls
                 resultPointer = getRegU32(guestResult, 2);
                 if (resultPointer == 0u)
                 {
+                    resultPointer = guestDefaultResult;
+                }
+                else if ((resultPointer & 0x1FFFFFFFu) >= PS2_RAM_SIZE && (resultPointer & 0xF0000000u) != 0x70000000u)
+                {
+                    // HCTP six-man: sceSkSsMIDI_Bind's sound-kit call came back with v0 = 0x0AB6B1B1 (not an address);
+                    // copying the reply from there crashed (or, masked to 32 MB, overwrote game RAM: invisible
+                    // wrestlers, no music). A server result outside RAM is a value, not a reply buffer.
+                    static uint32_t badResultLogs = 0u;
+                    if (badResultLogs < 16u)
+                    {
+                        ++badResultLogs;
+                        std::fprintf(stderr, "[rpc] fno=0x%x: server result 0x%08x is not a RAM address, using reply buffer 0x%x\n",
+                                     rpcNum, resultPointer, guestDefaultResult);
+                    }
                     resultPointer = guestDefaultResult;
                 }
             }

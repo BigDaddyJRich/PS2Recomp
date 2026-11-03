@@ -3,6 +3,8 @@
 #include <cstdio>
 #include <cstdlib>
 
+namespace { uint32_t g_mainStackBottom = 0u; } // set by SetupThread(stack = -1), read by SetupHeap
+
 namespace ps2_syscalls
 {
     void GsSetCrt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -530,6 +532,9 @@ namespace ps2_syscalls
             initialStack = stack;
         }
 
+        if (initialStack != 0u)
+            g_mainStackBottom = initialStack; // SetupHeap(-1) ends the heap here, like the PS2 kernel
+        std::fprintf(stderr, "[SetupThread] stack=0x%x size=0x%x -> sp=0x%x bottom=0x%x\n", stack, stackSize, sp, initialStack);
         scheduler.setupCurrentThread(initialStack, stackSize, getRegU32(ctx, 28));
         setReturnU32(ctx, sp);
     }
@@ -545,6 +550,13 @@ namespace ps2_syscalls
         // Silent Hill and other games often pass -1 (0xFFFFFFFF) to mean "rest of RAM".
         static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
         uint32_t heapLimit = kDefaultGuestHeapEnd;
+        // PS2 kernel: a "rest of RAM" heap ends at the main thread's stack (SetupThread stack = -1 puts it at the top
+        // of RAM). HCTP main() grabs one block up to 0x1FF0000 and shrinks it until malloc succeeds: the flat
+        // 0x1F00000 end cost it ~1 MB -> six-man CChar allocations (0x69014 each) returned NULL and the game copied
+        // wrestler data over guest 0x0-0x30000 (invisible wrestlers, no music, sound RPC crash).
+        if ((heapSize == 0u || heapSize == 0xFFFFFFFFu) && g_mainStackBottom > heapBase && g_mainStackBottom <= PS2_RAM_SIZE &&
+            !(std::getenv("HCTP_HEAP_END_FLAT") && std::getenv("HCTP_HEAP_END_FLAT")[0] == '1'))
+            heapLimit = g_mainStackBottom & ~0xFu;
 
         if (heapSize != 0u && heapSize != 0xFFFFFFFFu)
         {
