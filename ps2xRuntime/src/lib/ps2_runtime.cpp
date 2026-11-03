@@ -3135,6 +3135,7 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
 
 void ps2HostPreferPerformance();      // Kernel/HostPower.cpp
 void ps2HostPreferPerformanceCores(); // Kernel/HostPower.cpp
+void ps2HostApplyGuestFpEnv();      // Kernel/HostPower.cpp
 
 void PS2Runtime::run()
 {
@@ -3186,6 +3187,7 @@ void PS2Runtime::run()
         ThreadNaming::SetCurrentThreadName("GameThread");
         ps2_host_profile::recordThisThread();
         ps2HostPreferPerformanceCores();
+        ps2HostApplyGuestFpEnv();
         ChainWorker::markProducerThread();
         try
         {

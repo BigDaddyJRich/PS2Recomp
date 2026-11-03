@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <xmmintrin.h>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -73,5 +74,19 @@ void ps2HostPreferPerformanceCores()
     }();
     if (!performanceSets.empty())
         SetThreadSelectedCpuSets(GetCurrentThread(), performanceSets.data(), static_cast<ULONG>(performanceSets.size()));
+#endif
+}
+
+// EE rounding (BT3 / PCSX2 default, Pcsx2Config.cpp): the EE FPU rounds toward zero and flushes denormals (in and
+// out), so the game thread runs with MXCSR round-toward-zero + FTZ + DAZ (0x7FC0 = 0x1F80 | RC=11 | FZ | DAZ). The GS
+// entry points restore round-to-nearest for drawing (gsEnterDrawFpEnv). HCTP_FPROUND=0 keeps the host default.
+void ps2HostApplyGuestFpEnv()
+{
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+    const char *setting = std::getenv("HCTP_FPROUND");
+    if (setting && *setting == '0')
+        return;
+    _mm_setcsr(0x7FC0u | (_mm_getcsr() & 0x3Fu));
+    std::fprintf(stderr, "[fpround] game thread MXCSR chop + FTZ/DAZ (HCTP_FPROUND=0 off)\n");
 #endif
 }
