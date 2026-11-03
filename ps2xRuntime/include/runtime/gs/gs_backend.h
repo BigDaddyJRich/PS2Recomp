@@ -28,7 +28,7 @@ public:
     // HCTP GPU character path: triangle-list corners (3 per triangle) drawn with one state; the renderer does the
     // per-corner maths (GSNativeVtx). Only called when SupportsNativeTris().
     virtual bool SupportsNativeTris() const { return false; }
-    virtual void SubmitNativeTris(const GSDrawState &state, const GSNativeVtx *v, uint32_t count) { (void)state, (void)v, (void)count; }
+    virtual void SubmitNativeTris(const GSDrawState &state, const GSNativeChunk &chunk) { (void)state, (void)chunk; }
 
     virtual void BeginTransfer(const GSTransferCommand &command) = 0;
     virtual void UploadImage(const uint8_t *data, uint32_t sizeBytes) = 0;

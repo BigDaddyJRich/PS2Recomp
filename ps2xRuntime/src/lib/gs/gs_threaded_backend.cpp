@@ -340,17 +340,25 @@ void GSThreadedBackend::Submit(const GSPrimitiveBatch &batch) { push(Cmd::Submit
 
 namespace
 {
-    constexpr uint32_t kNativeTrisHead = (static_cast<uint32_t>(sizeof(GSDrawState)) + 4u + 15u) & ~15u;
+    constexpr uint32_t kNativeTrisHead = (static_cast<uint32_t>(sizeof(GSDrawState)) + 8u + 15u) & ~15u;
 }
 
-void GSThreadedBackend::SubmitNativeTris(const GSDrawState &state, const GSNativeVtx *v, uint32_t count)
+void GSThreadedBackend::SubmitNativeTris(const GSDrawState &state, const GSNativeChunk &chunk)
 {
-    if (count == 0u)
+    if (chunk.indexCount == 0u)
         return;
-    uint8_t *dst = reserve(Cmd::NativeTris, kNativeTrisHead + count * static_cast<uint32_t>(sizeof(GSNativeVtx)));
+    // head: state, u32 corners, u32 indices (16-aligned) | GSNativeConst | corners | u16 index (padded to 16)
+    const uint32_t cornerBytes = chunk.cornerCount * static_cast<uint32_t>(sizeof(GSNativeCorner));
+    const uint32_t indexBytes = (chunk.indexCount * 2u + 15u) & ~15u;
+    uint8_t *dst = reserve(Cmd::NativeTris, kNativeTrisHead + static_cast<uint32_t>(sizeof(GSNativeConst)) + cornerBytes + indexBytes);
     std::memcpy(dst, &state, sizeof(GSDrawState));
-    std::memcpy(dst + sizeof(GSDrawState), &count, 4);
-    std::memcpy(dst + kNativeTrisHead, v, count * sizeof(GSNativeVtx));
+    std::memcpy(dst + sizeof(GSDrawState), &chunk.cornerCount, 4);
+    std::memcpy(dst + sizeof(GSDrawState) + 4u, &chunk.indexCount, 4);
+    uint8_t *p = dst + kNativeTrisHead;
+    std::memcpy(p, &chunk.k, sizeof(GSNativeConst));
+    p += sizeof(GSNativeConst);
+    std::memcpy(p, chunk.corners, cornerBytes);
+    std::memcpy(p + cornerBytes, chunk.index, chunk.indexCount * 2u);
     commit();
 }
 void GSThreadedBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) { push(Cmd::LoadClut, ClutPayload{tex0, texclut}); }
@@ -639,9 +647,15 @@ void GSThreadedBackend::execute(const Header &header, const uint8_t *payload)
     case Cmd::NativeTris:
     {
         const GSDrawState state = load<GSDrawState>(payload);
-        uint32_t count;
-        std::memcpy(&count, payload + sizeof(GSDrawState), 4);
-        m_inner->SubmitNativeTris(state, reinterpret_cast<const GSNativeVtx *>(payload + kNativeTrisHead), count);
+        GSNativeChunk chunk;
+        std::memcpy(&chunk.cornerCount, payload + sizeof(GSDrawState), 4);
+        std::memcpy(&chunk.indexCount, payload + sizeof(GSDrawState) + 4u, 4);
+        const uint8_t *p = payload + kNativeTrisHead;
+        std::memcpy(&chunk.k, p, sizeof(GSNativeConst));
+        p += sizeof(GSNativeConst);
+        chunk.corners = reinterpret_cast<const GSNativeCorner *>(p);
+        chunk.index = reinterpret_cast<const uint16_t *>(p + chunk.cornerCount * sizeof(GSNativeCorner));
+        m_inner->SubmitNativeTris(state, chunk);
         break;
     }
     case Cmd::LoadClut:

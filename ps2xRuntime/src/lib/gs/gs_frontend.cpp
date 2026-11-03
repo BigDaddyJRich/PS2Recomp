@@ -1115,10 +1115,11 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
 // HCTP native-VU1 verify: while set (per thread), PATH1 packets are also appended here (hctp_native_vu1.cpp)
 thread_local std::vector<uint8_t> *g_hctpPath1Capture = nullptr;
 
-bool GS::submitNativeTris(uint64_t tagLo, uint64_t tagHi, const GSNativeVtx *v, uint32_t count, const uint8_t lastRgba[4],
+bool GS::submitNativeTris(uint64_t tagLo, uint64_t tagHi, const GSNativeChunk &chunk, const uint8_t lastRgba[4],
                           const float lastStq[3])
 {
     gateForeignCall();
+    const uint32_t count = chunk.indexCount;
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!m_backend || m_gpu || !m_backend->SupportsNativeTris() || m_gifContinuation[1].active || m_overlayRule)
     {
@@ -1147,7 +1148,7 @@ bool GS::submitNativeTris(uint64_t tagLo, uint64_t tagHi, const GSNativeVtx *v, 
     static const bool s_stateCache = [] { const char *e = std::getenv("HCTP_GPU_CHARS_STATECACHE"); return !(e && e[0] == '0'); }();
     if (s_stateCache && count != 0u && m_nativeGen == m_regGen && m_nativeTag[0] == tagLo && m_nativeTag[1] == tagHi)
     {
-        m_backend->SubmitNativeTris(m_nativeState, v, count);
+        m_backend->SubmitNativeTris(m_nativeState, chunk);
         m_vramWrittenSincePresent = true;
         m_curR = lastRgba[0];
         m_curG = lastRgba[1];
@@ -1181,7 +1182,7 @@ bool GS::submitNativeTris(uint64_t tagLo, uint64_t tagHi, const GSNativeVtx *v, 
                 GSPrimitiveBatch tri = batch;
                 for (int j = 0; j < 3; ++j)
                 {
-                    const GSNativeVtx &n = v[i + static_cast<uint32_t>(j)];
+                    const GSNativeVtx n = chunk.vertex(i + static_cast<uint32_t>(j));
                     GSVertex &o = tri.vertices[j];
                     float col[4];
                     for (int c = 0; c < 4; ++c)
@@ -1203,7 +1204,7 @@ bool GS::submitNativeTris(uint64_t tagLo, uint64_t tagHi, const GSNativeVtx *v, 
         }
         else
         {
-            m_backend->SubmitNativeTris(batch.state, v, count);
+            m_backend->SubmitNativeTris(batch.state, chunk);
             m_nativeState = batch.state;
             m_nativeTag[0] = tagLo;
             m_nativeTag[1] = tagHi;

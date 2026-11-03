@@ -662,18 +662,22 @@ bool hctpNativeVu1TryDraw(const uint8_t *code, uint8_t *data, const VU1State &st
         ps2_perf_split::PhaseScope perfGpu(ps2_perf_split::PhNatGpu);
         const bool p18 = g_variant == 1 || g_variant == 5;
         const float *v1 = q(data, 1006), *v1007 = q(data, 1007), *mat = q(data, 1019), *scroll = q(data, 1009);
-        GSNativeVtx base{};
+        GSNativeChunk chunk;
         for (int c = 0; c < 4; ++c)
         {
-            base.s1[c] = p18 ? v1[c] : v1[c] * (c == 3 ? 128.0f : 255.0f);
-            base.s2[c] = (p18 && c == 3) ? 0.0f : v1007[c] * mat[c];
+            chunk.k.s1[c] = p18 ? v1[c] : v1[c] * (c == 3 ? 128.0f : 255.0f);
+            chunk.k.s2[c] = (p18 && c == 3) ? 0.0f : v1007[c] * mat[c];
+            chunk.k.k[c] = 0.0f;
         }
-        base.k[0] = g_variant == 3 ? 0.0f : scroll[0];
-        base.k[1] = g_variant == 3 ? 0.0f : scroll[1];
-        static thread_local std::vector<GSNativeVtx> s_tris;
-        s_tris.clear();
-        auto corner = [&](uint32_t k) {
-            GSNativeVtx o = base;
+        chunk.k.k[0] = g_variant == 3 ? 0.0f : scroll[0];
+        chunk.k.k[1] = g_variant == 3 ? 0.0f : scroll[1];
+        // each corner once (64 B) + a triangle-list index; the renderer adds the chunk constants (GSNativeChunk)
+        static thread_local std::vector<GSNativeCorner> s_corners;
+        static thread_local std::vector<uint16_t> s_index;
+        s_corners.resize(g_count);
+        for (uint32_t k = 0; k < g_count; ++k)
+        {
+            GSNativeCorner &o = s_corners[k];
             const uint32_t idx = cornerIndex(data, top, k);
             std::memcpy(o.p, q(data, idx + 320u), 16);
             std::memcpy(o.l, q(data, idx + 480u), 16);
@@ -682,23 +686,20 @@ bool hctpNativeVu1TryDraw(const uint8_t *code, uint8_t *data, const VU1State &st
             std::memcpy(o.c1, q(data, top + 2u + 2u * k), 16);
             std::memcpy(o.c0, q(data, top + 1u + 2u * k), 12);
             o.c0[3] = p18 ? 1.0f : q(data, idx + 160u)[3];
-            s_tris.push_back(o);
-        };
-        // each corner built once, then copied into the triangles that use it (was rebuilt 3x per triangle)
-        static thread_local std::vector<GSNativeVtx> s_corners;
-        s_corners.clear();
-        for (uint32_t k = 0; k < g_count; ++k)
-            corner(k);
-        s_corners.swap(s_tris); // s_corners = the corners, s_tris empty (s_corners was cleared above)
-        s_tris.reserve(static_cast<size_t>(g_count) * 3u);
+        }
+        s_index.clear();
         for (uint32_t k = 2; k < g_count; ++k)
         {
             if (g_expected[k].xyz[3] & 0x8000)
                 continue; // ADC: backface-culled corner
-            s_tris.push_back(s_corners[k - 2u]);
-            s_tris.push_back(s_corners[k - 1u]);
-            s_tris.push_back(s_corners[k]);
+            s_index.push_back(static_cast<uint16_t>(k - 2u));
+            s_index.push_back(static_cast<uint16_t>(k - 1u));
+            s_index.push_back(static_cast<uint16_t>(k));
         }
+        chunk.corners = s_corners.data();
+        chunk.cornerCount = g_count;
+        chunk.index = s_index.data();
+        chunk.indexCount = static_cast<uint32_t>(s_index.size());
         // HCTP_GPU_CHARS_VERIFY=1: vs_native's maths in C++ against the packet path's corners ([gpuverify])
         static const bool s_verify = [] { const char *v = std::getenv("HCTP_GPU_CHARS_VERIFY"); return v && v[0] == '1'; }();
         if (s_verify)
@@ -713,7 +714,7 @@ bool hctpNativeVu1TryDraw(const uint8_t *code, uint8_t *data, const VU1State &st
                 for (uint32_t j = 0; j < 3; ++j, ++t)
                 {
                     const Corner &e = g_expected[k - 2u + j];
-                    const GSNativeVtx &v = s_tris[t];
+                    const GSNativeVtx v = chunk.vertex(static_cast<uint32_t>(t));
                     int32_t ci[4];
                     for (int c = 0; c < 4; ++c)
                     {
@@ -757,7 +758,7 @@ bool hctpNativeVu1TryDraw(const uint8_t *code, uint8_t *data, const VU1State &st
         bool submitted;
         {
             ps2_perf_split::PhaseScope perfSub(ps2_perf_split::PhNatSub);
-            submitted = gs.submitNativeTris(tag[0], tag[1], s_tris.data(), static_cast<uint32_t>(s_tris.size()), lastRgba, last.stq);
+            submitted = gs.submitNativeTris(tag[0], tag[1], chunk, lastRgba, last.stq);
         }
         if (submitted)
         {

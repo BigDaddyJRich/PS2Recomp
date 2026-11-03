@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 enum GSPrimType : uint8_t
@@ -268,6 +269,40 @@ struct GSNativeVtx
     float s1[4]; // colour scale ([1006], x255 / x128 for p08)
     float s2[4]; // colour add ([1007] * [1019])
     float k[4];  // ST scroll xy, XYOFFSET xy
+};
+
+// The chain worker sends a chunk as its corners once (64 B: p, l, c1, c0 of GSNativeVtx) + the chunk's constants
+// (s1, s2, k) + a triangle-list index list; the renderer expands it into GSNativeVtx on its own thread.
+struct GSNativeCorner
+{
+    float p[4];
+    float l[4];
+    float c1[4];
+    float c0[4];
+};
+
+struct GSNativeConst
+{
+    float s1[4];
+    float s2[4];
+    float k[4];
+};
+
+struct GSNativeChunk
+{
+    const GSNativeCorner *corners = nullptr;
+    uint32_t cornerCount = 0;
+    const uint16_t *index = nullptr; // 3 per triangle
+    uint32_t indexCount = 0;
+    GSNativeConst k{};
+
+    GSNativeVtx vertex(uint32_t i) const
+    {
+        GSNativeVtx o;
+        std::memcpy(&o, &corners[index[i]], sizeof(GSNativeCorner));
+        std::memcpy(o.s1, &k, sizeof(GSNativeConst));
+        return o;
+    }
 };
 
 struct GSTransferCommand

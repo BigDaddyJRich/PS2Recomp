@@ -2289,7 +2289,7 @@ struct GSD3D11Backend::Impl
     }
 
     // HCTP GPU character path: corners go to the draw as they are; vs_native does the per-corner maths
-    void submitNativeTris(const GSDrawState &st, const GSNativeVtx *v, uint32_t count)
+    void submitNativeTris(const GSDrawState &st, const GSNativeChunk &chunk)
     {
         const DrawKey key = makeKey(st);
         const auto &c = st.context;
@@ -2307,13 +2307,10 @@ struct GSD3D11Backend::Impl
             pendingNativeBox[2] = pendingNativeBox[3] = -1e9f;
         }
         const float ofx = static_cast<float>(c.xyoffset.ofx) / 16.0f, ofy = snapOfy(c.xyoffset.ofy);
-        const size_t at = pendingNative.size();
-        pendingNative.insert(pendingNative.end(), v, v + count);
-        for (size_t i = at; i < pendingNative.size(); ++i)
+        // corners once for the box, then expanded (corner + chunk constants) per triangle index
+        for (uint32_t i = 0; i < chunk.cornerCount; ++i)
         {
-            GSNativeVtx &o = pendingNative[i];
-            o.k[2] = ofx;
-            o.k[3] = ofy;
+            const GSNativeCorner &o = chunk.corners[i];
             const float x = static_cast<float>(static_cast<int32_t>(o.p[0] * 16.0f) & 0xFFFF) / 16.0f - ofx;
             const float y = static_cast<float>(static_cast<int32_t>(o.p[1] * 16.0f) & 0xFFFF) / 16.0f - ofy;
             pendingNativeMaxY = std::max(pendingNativeMaxY, y);
@@ -2321,6 +2318,15 @@ struct GSD3D11Backend::Impl
             pendingNativeBox[1] = std::min(pendingNativeBox[1], y);
             pendingNativeBox[2] = std::max(pendingNativeBox[2], x);
             pendingNativeBox[3] = std::max(pendingNativeBox[3], y);
+        }
+        const size_t at = pendingNative.size();
+        pendingNative.resize(at + chunk.indexCount);
+        for (uint32_t i = 0; i < chunk.indexCount; ++i)
+        {
+            GSNativeVtx &o = pendingNative[at + i];
+            o = chunk.vertex(i);
+            o.k[2] = ofx;
+            o.k[3] = ofy;
         }
         if (pendingNative.size() > 60000)
             flushPending();
@@ -3398,13 +3404,13 @@ void GSD3D11Backend::Submit(const GSPrimitiveBatch &batch)
     m_impl->submit(batch);
 }
 
-void GSD3D11Backend::SubmitNativeTris(const GSDrawState &state, const GSNativeVtx *v, uint32_t count)
+void GSD3D11Backend::SubmitNativeTris(const GSDrawState &state, const GSNativeChunk &chunk)
 {
     ps2_perf_split::PhaseScope perfPhase(ps2_perf_split::PhD3d); // HCTP_PERF_PHASES
     std::lock_guard<std::recursive_mutex> lock(ps2host::d3dLock());
-    if (!m_impl->initGpu() || count == 0u)
+    if (!m_impl->initGpu() || chunk.indexCount == 0u)
         return;
-    m_impl->submitNativeTris(state, v, count);
+    m_impl->submitNativeTris(state, chunk);
 }
 
 void GSD3D11Backend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
