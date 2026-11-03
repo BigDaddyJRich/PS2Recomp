@@ -1082,6 +1082,15 @@ bool PS2Runtime::syncCoreSubsystems()
                                          m_chain.noteVu1Run(0u);
                                          return;
                                      }
+                                     // p07 morph weights 0x2800 with the registers it leaves (HCTP_NATIVE_P07S=0 off)
+                                     if (m_vu1.fastEntryAllowed() &&
+                                         hctpNativeVu1P07State(m_memory.getVU1Code(), m_memory.getVU1Data(), startPC, m_vu1.state()))
+                                     {
+                                         m_vu1.fastEntryDone(0x2910u, top, itop);
+                                         hctpNativeVu1Census(m_memory.getVU1Code(), startPC, true, censusT0, 1);
+                                         m_chain.noteVu1Run(0u);
+                                         return;
+                                     }
                                      // empty overlay entry (stage-2 programs at 0x2a00): no interpreter call
                                      if (m_vu1.executeEmptyEntry(m_memory.getVU1Code(), startPC, top, itop))
                                      {
@@ -1101,6 +1110,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                      hctpNativeVu1Census(m_memory.getVU1Code(), startPC, true, censusT0, 0);
                                      hctpNativeVu1AfterMscal(m_memory.getVU1Data());
                                      hctpNativeVu1AfterMscalGeneric(m_memory.getVU1Data());
+                                     hctpNativeVu1AfterP07(m_memory.getVU1Data(), m_vu1.state());
                                      m_chain.noteVu1Run((m_vu1.state().stoppedByD ? 0x0200u : 0u) |
                                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u)); });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)

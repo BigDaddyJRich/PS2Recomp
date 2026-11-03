@@ -20,6 +20,10 @@ void hctpNativeVu1AfterResume(const uint8_t *data);
 // p00 (VU 0x0000, 12 pairs: vi15 = 0, vi10 = 1016, LQI vf13-16 / vf26-29 <- [1016..1023], E): done on the state.
 // True = it was p00 (exact ELF words) and the registers are set; the caller finishes the entry (pc 0x60).
 bool hctpNativeVu1P00(const uint8_t *code, const uint8_t *data, uint32_t startPC, VU1State &st);
+// p07 MorphWeights (MSCAL 0x2800) on the VU1 state: memory + every register the 0x2800 run leaves (0x2908 reads
+// them). HCTP_NATIVE_P07S=0 off; HCTP_P07_VERIFY=1 runs it on copies and compares after the VU1 ([p07verify]).
+bool hctpNativeVu1P07State(const uint8_t *code, uint8_t *data, uint32_t startPC, VU1State &st);
+void hctpNativeVu1AfterP07(const uint8_t *data, const VU1State &st);
 void hctpNativeVu1FirstChunk(const uint8_t *code, const uint8_t *data, VU1State &st);
 void hctpNativeVu1AfterFirstChunk(const VU1State &st);
 // p01 at MSCAL 0x00a0: HCTP_NATIVE_P01=1 -> computed natively, true = skip the VU1; verify mode compares after the run

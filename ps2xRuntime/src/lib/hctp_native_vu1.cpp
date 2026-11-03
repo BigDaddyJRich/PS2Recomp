@@ -1805,3 +1805,112 @@ void hctpNativeVu1AfterMscalGeneric(const uint8_t *data)
 }
 
 #include "hctp_native_vu1_p14.inl"
+
+// ---- p07 MorphWeights 0x2800 on the VU1 state (whole program: memory AND the registers it leaves) ----------------
+// The VU1's 0x2908 entry (target blend, MSCAL right after) reads registers, so the native 0x2800 run must leave every
+// register it writes as the VU does (Oct 21 leg shake = the old memory-only native p07). From the listing
+// (logs\vu1map\p07.txt): prologue vi1 = 4, vi4 = [1009].x, vf31 = [1011], vf1-4.w = raw [480..483].w; software-
+// pipelined loop k = 4, 8 .. n (exit when vi1 == vi4 before the delay-slot vi1 += 4): it stores group k/4-1 and loads
+// raw [480+k..483+k].w, so the last pass reads the 4 words PAST the weights. Rounding toward zero as the VU (chop).
+namespace
+{
+    struct P07Pending
+    {
+        bool on = false;
+        VU1State st;
+        std::vector<uint8_t> data;
+    } g_p07;
+
+    float p07Itof(int32_t raw) { return _mm_cvtss_f32(_mm_cvtsi32_ss(_mm_setzero_ps(), raw)); }
+    float p07Mul(float a, float b) { return _mm_cvtss_f32(_mm_mul_ss(_mm_set_ss(a), _mm_set_ss(b))); }
+    float p07Add(float a, float b) { return _mm_cvtss_f32(_mm_add_ss(_mm_set_ss(a), _mm_set_ss(b))); }
+
+    bool p07Run(uint8_t *data, VU1State &st)
+    {
+        const int32_t n = ilw(data, 1009u, 0);
+        if (n < 4 || (n & 3) != 0 || 480 + n + 4 > 1009)
+            return false;
+        int32_t raw[4];
+        for (int j = 0; j < 4; ++j)
+            raw[j] = qwi(data, 480u + static_cast<uint32_t>(n + j))[3]; // read before runP07 (it never writes there)
+        Kicks none;
+        if (!runP07(data, none))
+            return false;
+        const float *c = qwf(data, 1011u);
+        const unsigned int savedCsr = _mm_getcsr();
+        _mm_setcsr((savedCsr & ~0x6000u) | 0x6000u);
+        std::memcpy(st.vf[31], c, 16);
+        for (int j = 0; j < 4; ++j)
+        {
+            std::memcpy(&st.vf[1 + j][3], &raw[j], 4);
+            st.vf[11 + j][3] = p07Itof(raw[j]);
+            std::memcpy(&st.vf[21 + j][3], &qwi(data, 476u + static_cast<uint32_t>(n + j))[3], 4);
+        }
+        st.acc[3] = p07Mul(st.vf[11][3], c[2]);
+        st.vf[11][3] = p07Add(st.acc[3], p07Mul(1.0f, c[0]));
+        _mm_setcsr(savedCsr);
+        st.vi[1] = n + 4;
+        st.vi[4] = n;
+        return true;
+    }
+
+    bool p07Code(const uint8_t *code)
+    {
+        static uint64_t s_sig = 0;
+        static bool s_ok = false;
+        uint64_t sig;
+        std::memcpy(&sig, code + 0x2808u, 8);
+        if (sig != s_sig)
+        {
+            s_sig = sig;
+            s_ok = hashRange(code, 0x2800u, 0x190u) == 0xffbdc4d8743d017aull;
+        }
+        return s_ok;
+    }
+}
+
+bool hctpNativeVu1P07State(const uint8_t *code, uint8_t *data, uint32_t startPC, VU1State &st)
+{
+    static const char *e = std::getenv("HCTP_NATIVE_P07S");
+    static const bool s_on = !(e && e[0] == '0');
+    static const bool s_verify = std::getenv("HCTP_P07_VERIFY") && std::getenv("HCTP_P07_VERIFY")[0] == '1';
+    if (!s_on || startPC != 0x2800u || !code || !data || !p07Code(code))
+        return false;
+    if (s_verify)
+    {
+        g_p07.st = st;
+        g_p07.data.assign(data, data + 0x4000u);
+        g_p07.on = p07Run(g_p07.data.data(), g_p07.st);
+        return false; // the VU1 runs; hctpNativeVu1AfterP07 compares
+    }
+    return p07Run(data, st);
+}
+
+void hctpNativeVu1AfterP07(const uint8_t *data, const VU1State &st)
+{
+    if (!g_p07.on)
+        return;
+    g_p07.on = false;
+    static uint64_t s_runs = 0, s_bad = 0, s_memBad = 0;
+    ++s_runs;
+    const VU1State &e = g_p07.st;
+    int bad = 0;
+    char what[256] = {};
+    for (int r = 1; r < 32 && bad < 4; ++r)
+        if (std::memcmp(e.vf[r], st.vf[r], 16) != 0)
+            std::snprintf(what + std::strlen(what), sizeof(what) - std::strlen(what), " vf%d", r), ++bad;
+    for (int r = 1; r < 16; ++r)
+        if (e.vi[r] != st.vi[r])
+            std::snprintf(what + std::strlen(what), sizeof(what) - std::strlen(what), " vi%d(%d/%d)", r, e.vi[r], st.vi[r]), ++bad;
+    if (std::memcmp(e.acc, st.acc, 16) != 0)
+        std::snprintf(what + std::strlen(what), sizeof(what) - std::strlen(what), " acc"), ++bad;
+    const bool memBad = std::memcmp(g_p07.data.data(), data, 0x4000u) != 0;
+    s_bad += bad ? 1 : 0;
+    s_memBad += memBad ? 1 : 0;
+    if ((bad || memBad) && s_bad + s_memBad < 20)
+        std::fprintf(stderr, "[p07verify] mismatch regs:%s mem=%d%c", what, memBad ? 1 : 0, 10);
+    if ((s_runs & 1023u) == 0u)
+        std::fprintf(stderr, "[p07verify] runs=%llu regBad=%llu memBad=%llu interp pc=0x%x%c",
+                     static_cast<unsigned long long>(s_runs), static_cast<unsigned long long>(s_bad),
+                     static_cast<unsigned long long>(s_memBad), st.pc, 10);
+}
