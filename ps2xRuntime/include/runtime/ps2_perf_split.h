@@ -48,11 +48,12 @@ namespace ps2_perf_split
         PhNatGpu,   // GPU-character draw build (corner records -> GSNativeVtx) + submit
         PhNatGen,   // generic native programs (p17 crowd, p14, p16 ...) via MscalGeneric
         PhNatP07,   // p07 morph weights
+        PhNatSub,   // GS::submitNativeTris (front end state + ring copy), inside n-gpu
         PhaseCount
     };
     inline const char *const kPhaseNames[PhaseCount] = {"other", "vif", "vu1nat", "vu1int", "gif",
                                                         "d3d", "texdec", "rtsync", "xfer", "present",
-                                                        "n-s1", "n-chunk", "n-gpu", "n-gen", "n-p07"};
+                                                        "n-s1", "n-chunk", "n-gpu", "n-gen", "n-p07", "n-sub"};
 
     inline bool enabled()
     {

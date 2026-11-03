@@ -754,7 +754,12 @@ bool hctpNativeVu1TryDraw(const uint8_t *code, uint8_t *data, const VU1State &st
         const Corner &last = g_expected[g_count - 1u];
         const uint8_t lastRgba[4] = {static_cast<uint8_t>(last.rgba[0]), static_cast<uint8_t>(last.rgba[1]),
                                      static_cast<uint8_t>(last.rgba[2]), static_cast<uint8_t>(last.rgba[3])};
-        if (gs.submitNativeTris(tag[0], tag[1], s_tris.data(), static_cast<uint32_t>(s_tris.size()), lastRgba, last.stq))
+        bool submitted;
+        {
+            ps2_perf_split::PhaseScope perfSub(ps2_perf_split::PhNatSub);
+            submitted = gs.submitNativeTris(tag[0], tag[1], s_tris.data(), static_cast<uint32_t>(s_tris.size()), lastRgba, last.stq);
+        }
+        if (submitted)
         {
             // leave the kicked packet in VU memory at TOP+33 as the VU1 would: later VU work reads it back (without
             // it: big translucent wedges over the mat / stage, Nov 3). HCTP_GPU_CHARS_VUMEM=0: off (+ lite corners)

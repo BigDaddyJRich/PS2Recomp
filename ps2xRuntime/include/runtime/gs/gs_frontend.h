@@ -340,6 +340,11 @@ private:
         VertexSource vertices[3];
     };
     OverlayRule m_overlayRule = nullptr;
+    // GPU-character chunks: GS register writes since the last native chunk; unchanged -> its draw state is reused
+    uint64_t m_regGen = 1;
+    uint64_t m_nativeGen = 0;
+    uint64_t m_nativeTag[2] = {0, 0};
+    GSDrawState m_nativeState{};
     VertexSource m_vtxSource[kMaxVerts];
     const uint8_t *m_packetData = nullptr; // the packet being read when it may be held, else null
     const uint8_t *m_regSource = nullptr;  // the register write being read (inside m_packetData)

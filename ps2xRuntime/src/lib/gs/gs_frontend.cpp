@@ -1142,6 +1142,23 @@ bool GS::submitNativeTris(uint64_t tagLo, uint64_t tagHi, const GSNativeVtx *v, 
     };
     if (flg != 0u || nreg != 3u || !pre || (prim & 7u) != GS_PRIM_TRISTRIP || (tagHi & 0xFFFu) != 0x412u)
         return refuse("tag");
+    // same tag, no GS register written since the last native chunk: same PRIM / context / draw state
+    // (HCTP_GPU_CHARS_STATECACHE=0: rebuild every chunk)
+    static const bool s_stateCache = [] { const char *e = std::getenv("HCTP_GPU_CHARS_STATECACHE"); return !(e && e[0] == '0'); }();
+    if (s_stateCache && count != 0u && m_nativeGen == m_regGen && m_nativeTag[0] == tagLo && m_nativeTag[1] == tagHi)
+    {
+        m_backend->SubmitNativeTris(m_nativeState, v, count);
+        m_vramWrittenSincePresent = true;
+        m_curR = lastRgba[0];
+        m_curG = lastRgba[1];
+        m_curB = lastRgba[2];
+        m_curA = lastRgba[3];
+        m_curS = lastStq[0];
+        m_curT = lastStq[1];
+        m_curQ = lastStq[2] == 0.0f ? 1.0f : lastStq[2];
+        m_vtxCount = 0;
+        return true;
+    }
     if (s_taken.fetch_add(1u, std::memory_order_relaxed) == 0u)
         std::fprintf(stderr, "[gpuchars] first chunk on the GPU path: tag %016llx %016llx%c", static_cast<unsigned long long>(tagLo),
                      static_cast<unsigned long long>(tagHi), 10);
@@ -1185,7 +1202,13 @@ bool GS::submitNativeTris(uint64_t tagLo, uint64_t tagHi, const GSNativeVtx *v, 
             }
         }
         else
+        {
             m_backend->SubmitNativeTris(batch.state, v, count);
+            m_nativeState = batch.state;
+            m_nativeTag[0] = tagLo;
+            m_nativeTag[1] = tagHi;
+            m_nativeGen = m_regGen;
+        }
         m_vramWrittenSincePresent = true;
     }
     m_curR = lastRgba[0];
@@ -1797,6 +1820,7 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
 
 void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
 {
+    ++m_regGen;
     const bool interestingReg =
         regAddr == GS_REG_PRIM ||
         regAddr == GS_REG_RGBAQ ||
