@@ -134,6 +134,21 @@ namespace
     }
 
     // the spec for one p08 chunk -> g_expected, g_chunkClip; false when the overlay is not p08 / not a chunk
+    // the renderer refused a GPU-character draw (DATE / flat / FST): the packet path needs every corner, and lite left
+    // only the clip flags (garbage triangles = the Nov 3 wedge)
+    thread_local bool g_forceFull = false;
+    // HCTP_GPU_CHARS_LITE=1: GPU chunks get only clip flags + backface ADC on the CPU (no kicked-packet copy in VU memory:
+    // the Nov 3 probe found no reader of it)
+    bool s_gpuLiteOn()
+    {
+        static const bool on = [] {
+            const char *e = std::getenv("HCTP_GPU_CHARS"), *l = std::getenv("HCTP_GPU_CHARS_LITE"),
+                       *v = std::getenv("HCTP_GPU_CHARS_VERIFY");
+            return !(e && e[0] == '0') && (l && l[0] == '1') && !(v && v[0] == '1');
+        }();
+        return on;
+    }
+
     bool computeChunk(const uint8_t *code, const uint8_t *data, const VU1State &st, uint32_t top)
     {
         if (!code || !data)
@@ -213,13 +228,9 @@ namespace
             return false;
         const bool p18 = g_variant == 1 || g_variant == 5; // p19 = p18's colour / STQ
         // GPU character path: only the clip flags, the backface ADC and the last corner's RGBA / STQ are needed here
-        static const bool s_gpuLite = [] {
-            const char *e = std::getenv("HCTP_GPU_CHARS"), *m = std::getenv("HCTP_GPU_CHARS_VUMEM"),
-                       *v = std::getenv("HCTP_GPU_CHARS_VERIFY");
-            return !(e && e[0] == '0') && (m && m[0] == '0') && !(v && v[0] == '1');
-        }();
+        const bool s_gpuLite = s_gpuLiteOn();
         static thread_local bool t_full = false; // a clipped chunk: the CPU clipper needs every corner's outputs
-        const bool lite = s_gpuLite && !g_on && !t_full && (g_variant == 0 || g_variant == 1 || g_variant == 3 || g_variant == 5);
+        const bool lite = s_gpuLite && !g_on && !t_full && !g_forceFull && (g_variant == 0 || g_variant == 1 || g_variant == 3 || g_variant == 5);
 
         uint32_t header;
         std::memcpy(&header, data + (top & 0x3FFu) * 16u, 4);
@@ -744,7 +755,11 @@ bool hctpNativeVu1TryDraw(const uint8_t *code, uint8_t *data, const VU1State &st
                 for (uint32_t i = 0; i < 1u + 3u * g_count; ++i)
                     std::memcpy(data + ((top + 33u + i) & 0x3FFu) * 16u, pw, 16);
             }
-            else if (s_vumem)
+            // HCTP_GPU_CHARS_PACKET=0: no copy at all (probe: nothing reads it - no VU1 load / kick, no GS packet)
+            static const bool s_packet = [] { const char *m = std::getenv("HCTP_GPU_CHARS_PACKET"); return !(m && m[0] == '0'); }();
+            if (s_poison || s_gpuLiteOn())
+                ;
+            else if (s_vumem && s_packet)
             {
                 std::memcpy(data + ((top + 33u) & 0x3FFu) * 16u, data + (top & 0x3FFu) * 16u, 16);
                 for (uint32_t k = 0; k < g_count; ++k)
@@ -762,6 +777,14 @@ bool hctpNativeVu1TryDraw(const uint8_t *code, uint8_t *data, const VU1State &st
             report();
             return true;
         }
+    }
+    if (s_gpuLiteOn())
+    {
+        g_forceFull = true;
+        const bool ok = computeChunk(code, data, st, top);
+        g_forceFull = false;
+        if (!ok)
+            return false;
     }
     // the packet p08 would kick from TOP+33: the chunk's own GIF tag, then STQ / RGBA / XYZF2 per corner
     const uint32_t qwords = 1u + 3u * g_count;
