@@ -607,6 +607,58 @@ bool hctpNativeVu1TryDraw(const uint8_t *code, uint8_t *data, const VU1State &st
         ++g_vuChunks;
         return false;
     }
+    // GPU character path (default; HCTP_GPU_CHARS=0: off): the chunk's triangles go to the renderer as raw corners
+    // (stage-1 outputs + corner records); its vertex shader does the colour / STQ / FTOI maths (GSNativeVtx).
+    // p08, p18, p11, p19; the rest, clipped chunks and DATE draws kick packets.
+    static const bool s_gpuChars = [] { const char *e = std::getenv("HCTP_GPU_CHARS"); return !(e && e[0] == '0'); }();
+    if (s_gpuChars && !g_on && !g_chunkClip && (g_variant == 0 || g_variant == 1 || g_variant == 3 || g_variant == 5))
+    {
+        const bool p18 = g_variant == 1 || g_variant == 5;
+        const float *v1 = q(data, 1006), *v1007 = q(data, 1007), *mat = q(data, 1019), *scroll = q(data, 1009);
+        GSNativeVtx base{};
+        for (int c = 0; c < 4; ++c)
+        {
+            base.s1[c] = p18 ? v1[c] : v1[c] * (c == 3 ? 128.0f : 255.0f);
+            base.s2[c] = (p18 && c == 3) ? 0.0f : v1007[c] * mat[c];
+        }
+        base.k[0] = g_variant == 3 ? 0.0f : scroll[0];
+        base.k[1] = g_variant == 3 ? 0.0f : scroll[1];
+        static thread_local std::vector<GSNativeVtx> s_tris;
+        s_tris.clear();
+        auto corner = [&](uint32_t k) {
+            GSNativeVtx o = base;
+            const uint32_t idx = cornerIndex(data, top, k);
+            std::memcpy(o.p, q(data, idx + 320u), 16);
+            std::memcpy(o.l, q(data, idx + 480u), 16);
+            if (!p18)
+                o.l[3] = 1.0f;
+            std::memcpy(o.c1, q(data, top + 2u + 2u * k), 16);
+            std::memcpy(o.c0, q(data, top + 1u + 2u * k), 12);
+            o.c0[3] = p18 ? 1.0f : q(data, idx + 160u)[3];
+            s_tris.push_back(o);
+        };
+        for (uint32_t k = 2; k < g_count; ++k)
+        {
+            if (g_expected[k].xyz[3] & 0x8000)
+                continue; // ADC: backface-culled corner
+            corner(k - 2u);
+            corner(k - 1u);
+            corner(k);
+        }
+        uint64_t tag[2];
+        std::memcpy(tag, data + (top & 0x3FFu) * 16u, 16);
+        const Corner &last = g_expected[g_count - 1u];
+        const uint8_t lastRgba[4] = {static_cast<uint8_t>(last.rgba[0]), static_cast<uint8_t>(last.rgba[1]),
+                                     static_cast<uint8_t>(last.rgba[2]), static_cast<uint8_t>(last.rgba[3])};
+        if (gs.submitNativeTris(tag[0], tag[1], s_tris.data(), static_cast<uint32_t>(s_tris.size()), lastRgba, last.stq))
+        {
+            ++g_nativeChunks;
+            if (g_variant == 1)
+                ++g_p18Native;
+            report();
+            return true;
+        }
+    }
     // the packet p08 would kick from TOP+33: the chunk's own GIF tag, then STQ / RGBA / XYZF2 per corner
     const uint32_t qwords = 1u + 3u * g_count;
     g_packet.resize(qwords * 16u);

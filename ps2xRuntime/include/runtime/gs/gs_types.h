@@ -256,6 +256,20 @@ struct GSPrimitiveBatch
     GSDrawState state{};
 };
 
+// HCTP GPU character path: one stage-2 corner as the VU1 program reads it; the D3D11 vertex shader (vs_native) does
+// p08/p18's per-corner maths: RGBA = trunc(min(C1*S1*L + C1*S2, 255)) & 255, STQ = (C0.xy + K.xy, C0.z) * C0.w,
+// XYZF2 = FTOI4(P) (x/y 12.4, z >> 4 24-bit, fog = P.w). K.zw = XYOFFSET in pixels (the backend fills it).
+struct GSNativeVtx
+{
+    float p[4];  // screen position + fog (stage-1 output +320)
+    float l[4];  // light (+480; .w = 1 for p08)
+    float c1[4]; // corner colour
+    float c0[4]; // S, T, Q source, and the STQ multiplier (N.w for p08, 1 for p18)
+    float s1[4]; // colour scale ([1006], x255 / x128 for p08)
+    float s2[4]; // colour add ([1007] * [1019])
+    float k[4];  // ST scroll xy, XYOFFSET xy
+};
+
 struct GSTransferCommand
 {
     GSBitBltBuf bitbltbuf{};

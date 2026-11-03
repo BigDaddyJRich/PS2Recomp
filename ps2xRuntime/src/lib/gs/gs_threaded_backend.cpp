@@ -337,6 +337,22 @@ void GSThreadedBackend::Initialize(uint8_t *vram, uint32_t vramSize)
 
 void GSThreadedBackend::Reset() { pushEmpty(Cmd::Reset); }
 void GSThreadedBackend::Submit(const GSPrimitiveBatch &batch) { push(Cmd::Submit, batch); }
+
+namespace
+{
+    constexpr uint32_t kNativeTrisHead = (static_cast<uint32_t>(sizeof(GSDrawState)) + 4u + 15u) & ~15u;
+}
+
+void GSThreadedBackend::SubmitNativeTris(const GSDrawState &state, const GSNativeVtx *v, uint32_t count)
+{
+    if (count == 0u)
+        return;
+    uint8_t *dst = reserve(Cmd::NativeTris, kNativeTrisHead + count * static_cast<uint32_t>(sizeof(GSNativeVtx)));
+    std::memcpy(dst, &state, sizeof(GSDrawState));
+    std::memcpy(dst + sizeof(GSDrawState), &count, 4);
+    std::memcpy(dst + kNativeTrisHead, v, count * sizeof(GSNativeVtx));
+    commit();
+}
 void GSThreadedBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) { push(Cmd::LoadClut, ClutPayload{tex0, texclut}); }
 void GSThreadedBackend::BeginTransfer(const GSTransferCommand &command) { push(Cmd::BeginTransfer, command); }
 
@@ -620,6 +636,14 @@ void GSThreadedBackend::execute(const Header &header, const uint8_t *payload)
     case Cmd::Submit:
         m_inner->Submit(load<GSPrimitiveBatch>(payload));
         break;
+    case Cmd::NativeTris:
+    {
+        const GSDrawState state = load<GSDrawState>(payload);
+        uint32_t count;
+        std::memcpy(&count, payload + sizeof(GSDrawState), 4);
+        m_inner->SubmitNativeTris(state, reinterpret_cast<const GSNativeVtx *>(payload + kNativeTrisHead), count);
+        break;
+    }
     case Cmd::LoadClut:
     {
         const ClutPayload clut = load<ClutPayload>(payload);

@@ -1115,6 +1115,60 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
 // HCTP native-VU1 verify: while set (per thread), PATH1 packets are also appended here (hctp_native_vu1.cpp)
 thread_local std::vector<uint8_t> *g_hctpPath1Capture = nullptr;
 
+bool GS::submitNativeTris(uint64_t tagLo, uint64_t tagHi, const GSNativeVtx *v, uint32_t count, const uint8_t lastRgba[4],
+                          const float lastStq[3])
+{
+    gateForeignCall();
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (!m_backend || m_gpu || !m_backend->SupportsNativeTris() || m_gifContinuation[1].active || m_overlayRule)
+    {
+        static std::atomic<uint32_t> s_early{0};
+        if (s_early.fetch_add(1u, std::memory_order_relaxed) < 4u)
+            std::fprintf(stderr, "[gpuchars] packet path: backend=%d gpu=%d supports=%d path1-open=%d overlay=%d%c", m_backend ? 1 : 0,
+                         m_gpu ? 1 : 0, m_backend && m_backend->SupportsNativeTris() ? 1 : 0,
+                         m_gifContinuation[1].active ? 1 : 0, m_overlayRule ? 1 : 0, 10);
+        return false;
+    }
+    const uint32_t flg = static_cast<uint32_t>((tagLo >> 58) & 3u), nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
+    const bool pre = ((tagLo >> 46) & 1u) != 0u;
+    const uint32_t prim = static_cast<uint32_t>((tagLo >> 47) & 0x7FFu);
+    // STQ (2), RGBA (1), XYZF2 (4) in that order, PACKED, a triangle strip
+    static std::atomic<uint32_t> s_taken{0}, s_refused{0};
+    auto refuse = [&](const char *why) {
+        if (s_refused.fetch_add(1u, std::memory_order_relaxed) < 8u)
+            std::fprintf(stderr, "[gpuchars] packet path (%s): tag %016llx %016llx%c", why, static_cast<unsigned long long>(tagLo),
+                         static_cast<unsigned long long>(tagHi), 10);
+        return false;
+    };
+    if (flg != 0u || nreg != 3u || !pre || (prim & 7u) != GS_PRIM_TRISTRIP || (tagHi & 0xFFFu) != 0x412u)
+        return refuse("tag");
+    if (s_taken.fetch_add(1u, std::memory_order_relaxed) == 0u)
+        std::fprintf(stderr, "[gpuchars] first chunk on the GPU path: tag %016llx %016llx%c", static_cast<unsigned long long>(tagLo),
+                     static_cast<unsigned long long>(tagHi), 10);
+    KickGuard kick(*this);
+    writeRegisterUnlocked(GS_REG_PRIM, prim);
+    if (m_prim.fst || !m_prim.iip)
+        return refuse("fst / flat"); // the packet re-applies the same PRIM
+    GSPrimitiveBatch batch = buildDrawBatch(3);
+    if (((batch.state.context.test >> 14) & 1u) != 0u)
+        return refuse("DATE"); // the CPU path's bounding box
+    if (count != 0u)
+    {
+        updatePreferredDisplaySourceForDraw(batch);
+        m_backend->SubmitNativeTris(batch.state, v, count);
+        m_vramWrittenSincePresent = true;
+    }
+    m_curR = lastRgba[0];
+    m_curG = lastRgba[1];
+    m_curB = lastRgba[2];
+    m_curA = lastRgba[3];
+    m_curS = lastStq[0];
+    m_curT = lastStq[1];
+    m_curQ = lastStq[2] == 0.0f ? 1.0f : lastStq[2];
+    m_vtxCount = 0;
+    return true;
+}
+
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint8_t path)
 {
     if (path == 1u && g_hctpPath1Capture && data && sizeBytes)

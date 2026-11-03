@@ -24,6 +24,8 @@ public:
     void Reset() override;
 
     void Submit(const GSPrimitiveBatch &batch) override;
+    bool SupportsNativeTris() const override { return true; }
+    void SubmitNativeTris(const GSDrawState &state, const GSNativeVtx *v, uint32_t count) override;
     // the slot for HCTP's native model draws (not used yet)
     void SubmitNative(const GSDrawState &state, const void *job, uint32_t jobSize);
     void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override;

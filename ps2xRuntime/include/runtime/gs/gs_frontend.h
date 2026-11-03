@@ -113,6 +113,11 @@ public:
     // path: the GIF path the packet came by (1 = VU1 XGKICK, 2 = VIF1, 3 = GIF DMA) — an unfinished tag continues
     // only with more data from the same path.
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint8_t path = 3u);
+    // HCTP GPU character path: a PATH1 chunk packet (GIF tag PACKED, PRE, triangle strip, REGS STQ RGBA XYZF2) whose
+    // triangles are already expanded to corners: PRIM from the tag, one draw state, the renderer does the vertex maths.
+    // lastRgba / lastStq = what the packet's last corner leaves in RGBAQ / ST. False = not taken (send the packet).
+    bool submitNativeTris(uint64_t tagLo, uint64_t tagHi, const GSNativeVtx *v, uint32_t count, const uint8_t lastRgba[4],
+                          const float lastStq[3]);
     bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     void uploadImageNative(uint64_t bitbltbuf,
                            uint64_t trxpos,

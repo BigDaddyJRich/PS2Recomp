@@ -35,6 +35,8 @@ public:
     void Reset() override;
 
     void Submit(const GSPrimitiveBatch &batch) override;
+    bool SupportsNativeTris() const override { return m_inner && m_inner->SupportsNativeTris(); }
+    void SubmitNativeTris(const GSDrawState &state, const GSNativeVtx *v, uint32_t count) override;
     void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override;
     void BeginTransfer(const GSTransferCommand &command) override;
     void UploadImage(const uint8_t *data, uint32_t sizeBytes) override;
@@ -77,6 +79,7 @@ private:
         Present,
         ResetPresentation,
         Verify,
+        NativeTris, // GSDrawState, u32 count (padded to 16), count x GSNativeVtx
     };
     struct alignas(16) Header
     {

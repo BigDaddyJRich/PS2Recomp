@@ -209,6 +209,30 @@ PsIn vs_main(VsIn v)
     return o;
 }
 
+// HCTP GPU character path (GSNativeVtx): p08/p18's per-corner maths as the VU1 + GS front end would do it.
+struct NVsIn { float4 P : POSITION; float4 L : TEXCOORD1; float4 C1 : COLOR0; float4 C0 : TEXCOORD2;
+               float4 S1 : TEXCOORD3; float4 S2 : TEXCOORD4; float4 K : TEXCOORD5; };
+PsIn vs_native(NVsIn v)
+{
+    PsIn o;
+    precise float4 col = min(v.C1 * v.S1 * v.L + v.C1 * v.S2, 255.0); // MUL/MADD, MINI 255
+    const int4 ci = (int4)col;                                        // FTOI0 (truncation)
+    precise float3 stq = float3(v.C0.x + v.K.x, v.C0.y + v.K.y, v.C0.z) * v.C0.w;
+    const float q = stq.z == 0.0 ? 1.0 : stq.z;
+    const int xi = ((int)(v.P.x * 16.0)) & 0xFFFF;                    // FTOI4, XYZF2 packed fields
+    const int yi = ((int)(v.P.y * 16.0)) & 0xFFFF;
+    const uint zi = ((uint)((int)(v.P.z * 16.0)) >> 4) & 0xFFFFFFu;
+    const uint fi = ((uint)((int)(v.P.w * 16.0)) >> 4) & 0xFFu;
+    const float x = (float)xi / 16.0 - v.K.z;
+    const float y = (float)yi / 16.0 - v.K.w;
+    const float z = min((float)zi, p4.w) / 4294967296.0;
+    const float hx = rtSize.w + (x - rtSize.w) * abs(rtSize.z);
+    o.pos = float4(hx / rtSize.x * 2.0 - 1.0, 1.0 - y / rtSize.y * 2.0, z, 1.0);
+    o.col = (float4)(ci & 255);
+    o.tc = float4(stq.x, stq.y, q, p0.w != 0.0 ? (float)fi : 255.0);
+    return o;
+}
+
 float wrapCoord(float c, float size, float mode, float mn, float mx)
 {
     if (mode == 0.0) return c;                                // repeat (sampler wraps)
@@ -405,6 +429,10 @@ struct GSD3D11Backend::Impl
     ComPtr<ID3D11BlendState> blendNoColor;
     ComPtr<ID3D11DepthStencilState> dsDateMark;
     ComPtr<ID3D11InputLayout> layout;
+    ComPtr<ID3D11VertexShader> vsNative;   // HCTP GPU character path
+    ComPtr<ID3D11InputLayout> layoutNative;
+    ComPtr<ID3D11Buffer> vbNative;
+    uint32_t vbNativeCapacity = 0, vbNativeWriteOffset = 0;
     ComPtr<ID3D11Buffer> vb, cb, blitCb;
     uint32_t vbCapacity = 0;
     uint32_t vbWriteOffset = 0; // append-only ring: NO_OVERWRITE maps, DISCARD on wrap
@@ -619,6 +647,10 @@ struct GSD3D11Backend::Impl
     bool displayWide = true;  // the latched frame: 16:9 (or 4:3 with bars)
     GSDrawState pendingState{};
     bool hasPending = false;
+    std::vector<GSNativeVtx> pendingNative; // the pending draw is GPU-character corners (pending stays empty)
+    bool pendingIsNative = false;
+    bool boundNative = false;
+    float pendingNativeMaxY = 0.0f;
     uint64_t frameCounter = 0;
 
     // PS2X_GPU_PROF=1: GPU timestamp pair around every draw, grouped by draw class (target, blend, texture source,
@@ -870,6 +902,21 @@ struct GSD3D11Backend::Impl
             {"TEXCOORD", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 32, D3D11_INPUT_PER_VERTEX_DATA, 0},
         };
         dev->CreateInputLayout(il, 3, vsb->GetBufferPointer(), vsb->GetBufferSize(), &layout);
+        ComPtr<ID3DBlob> vsnb;
+        if (compile("vs_native", "vs_5_0", vsnb))
+        {
+            dev->CreateVertexShader(vsnb->GetBufferPointer(), vsnb->GetBufferSize(), nullptr, &vsNative);
+            const D3D11_INPUT_ELEMENT_DESC iln[] = {
+                {"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                {"TEXCOORD", 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 32, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                {"TEXCOORD", 2, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 48, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                {"TEXCOORD", 3, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 64, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                {"TEXCOORD", 4, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 80, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                {"TEXCOORD", 5, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 96, D3D11_INPUT_PER_VERTEX_DATA, 0},
+            };
+            dev->CreateInputLayout(iln, 7, vsnb->GetBufferPointer(), vsnb->GetBufferSize(), &layoutNative);
+        }
 
         D3D11_BUFFER_DESC cbd{};
         cbd.ByteWidth = sizeof(DrawCB);
@@ -2007,13 +2054,14 @@ struct GSD3D11Backend::Impl
         if (st.prim.type == GS_PRIM_POINT)
             return;
         const DrawKey key = makeKey(st);
-        if (hasPending && !(key == pendingKey))
+        if (hasPending && (pendingIsNative || !(key == pendingKey)))
             flushPending();
         if (!hasPending)
         {
             pendingKey = key;
             pendingState = st;
             hasPending = true;
+            pendingIsNative = false;
         }
 
         const auto &c = st.context;
@@ -2153,24 +2201,76 @@ struct GSD3D11Backend::Impl
 
 
 
+    static float snapOfy(uint32_t ofyRaw)
+    {
+        static const bool s_noSnap = std::getenv("HCTP_NO_OFY_SNAP") != nullptr;
+        if (!s_noSnap && g_presentSmode2.load() == 3u)
+            ofyRaw &= ~15u;
+        return static_cast<float>(ofyRaw) / 16.0f;
+    }
+
+    // HCTP GPU character path: corners go to the draw as they are; vs_native does the per-corner maths
+    void submitNativeTris(const GSDrawState &st, const GSNativeVtx *v, uint32_t count)
+    {
+        const DrawKey key = makeKey(st);
+        const auto &c = st.context;
+        if (hasPending && (!pendingIsNative || !(key == pendingKey) || c.xyoffset.ofx != pendingState.context.xyoffset.ofx ||
+                           c.xyoffset.ofy != pendingState.context.xyoffset.ofy))
+            flushPending();
+        if (!hasPending)
+        {
+            pendingKey = key;
+            pendingState = st;
+            hasPending = true;
+            pendingIsNative = true;
+            pendingNativeMaxY = 0.0f;
+        }
+        const float ofx = static_cast<float>(c.xyoffset.ofx) / 16.0f, ofy = snapOfy(c.xyoffset.ofy);
+        const size_t at = pendingNative.size();
+        pendingNative.insert(pendingNative.end(), v, v + count);
+        for (size_t i = at; i < pendingNative.size(); ++i)
+        {
+            GSNativeVtx &o = pendingNative[i];
+            o.k[2] = ofx;
+            o.k[3] = ofy;
+            const float y = static_cast<float>(static_cast<int32_t>(o.p[1] * 16.0f) & 0xFFFF) / 16.0f - ofy;
+            pendingNativeMaxY = std::max(pendingNativeMaxY, y);
+        }
+        if (pendingNative.size() > 60000)
+            flushPending();
+    }
+
     void flushPending()
     {
         if (!hasPending)
             return;
         ps2_host_profile::Scope profScope(ps2_host_profile::GsDraw);
         hasPending = false;
-        if (pending.empty() || !gpuReady)
+        const bool native = pendingIsNative;
+        pendingIsNative = false;
+        if (native && (pendingNative.empty() || !gpuReady || !vsNative || !layoutNative))
+        {
+            pendingNative.clear();
+            return;
+        }
+        if (!native && (pending.empty() || !gpuReady))
         {
             pending.clear();
             return;
         }
+        struct ClearNative
+        {
+            std::vector<GSNativeVtx> &v;
+            bool on;
+            ~ClearNative() { if (on) v.clear(); }
+        } clearNative{pendingNative, native};
         const GSDrawState &st = pendingState;
         const auto &c = st.context;
 
         const uint32_t fbpBlock = framePageBaseToBlock(c.frame.fbp);
         // Size by what is actually drawn: a full-VRAM scissor would otherwise grow the frame buffer
         // over the texture area, and every texture upload then forces an RT re-upload.
-        float maxY = 0.0f;
+        float maxY = native ? pendingNativeMaxY : 0.0f;
         for (const Vtx &v : pending)
             maxY = std::max(maxY, v.y);
         const uint32_t drawnH = static_cast<uint32_t>(std::max(0.0f, std::ceil(maxY))) + 1u;
@@ -2456,10 +2556,46 @@ struct GSD3D11Backend::Impl
         cbd.p3[3] = origin[1];
         cbd.p4[0] = st.linearFilter ? 1.0f : 0.0f;
         cbd.p4[1] = texFromRt ? 1.0f : 0.0f;
+        {
+            const uint8_t zp = c.zbuf.psm; // vs_native: the Z format's clamp (zNorm)
+            cbd.p4[3] = zp == GS_PSM_Z24 ? 16777215.0f : (zp == GS_PSM_Z16 || zp == GS_PSM_Z16S) ? 65535.0f : 4294967295.0f;
+        }
 
         // ---- vertex upload
         const uint32_t bytes = static_cast<uint32_t>(pending.size() * sizeof(Vtx));
         UINT firstVertex = 0;
+        if (native)
+        {
+            const uint32_t nbytes = static_cast<uint32_t>(pendingNative.size() * sizeof(GSNativeVtx));
+            if (nbytes > vbNativeCapacity)
+            {
+                vbNative.Reset();
+                ++pipeGen;
+                vbNativeWriteOffset = 0;
+                D3D11_BUFFER_DESC bd{};
+                bd.ByteWidth = std::max<uint32_t>(nbytes, 16u << 20);
+                bd.Usage = D3D11_USAGE_DYNAMIC;
+                bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+                bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+                if (FAILED(dev->CreateBuffer(&bd, nullptr, &vbNative)))
+                    return;
+                vbNativeCapacity = bd.ByteWidth;
+            }
+            D3D11_MAPPED_SUBRESOURCE m{};
+            D3D11_MAP mapType = D3D11_MAP_WRITE_NO_OVERWRITE;
+            if (vbNativeWriteOffset + nbytes > vbNativeCapacity)
+            {
+                mapType = D3D11_MAP_WRITE_DISCARD;
+                vbNativeWriteOffset = 0;
+            }
+            if (FAILED(ctx->Map(vbNative.Get(), 0, mapType, 0, &m)))
+                return;
+            std::memcpy(static_cast<uint8_t *>(m.pData) + vbNativeWriteOffset, pendingNative.data(), nbytes);
+            ctx->Unmap(vbNative.Get(), 0);
+            firstVertex = vbNativeWriteOffset / static_cast<UINT>(sizeof(GSNativeVtx));
+            vbNativeWriteOffset += nbytes;
+        }
+        else
         {
         if (bytes > vbCapacity)
         {
@@ -2574,6 +2710,11 @@ struct GSD3D11Backend::Impl
 
         // ---- pipeline
         const uint64_t hostEpoch = ps2host::d3dStateEpoch();
+        if (native != boundNative)
+        {
+            boundNative = native;
+            ++pipeGen; // the vertex format / shader change
+        }
         if (bound.gen != pipeGen || bound.hostEpoch != hostEpoch)
         {
             bound = BoundDrawState{};
@@ -2582,12 +2723,12 @@ struct GSD3D11Backend::Impl
             bound.vp.Width = -1.0f; // force
             bound.sc.right = -1;
             ctx->RSSetState(raster.Get());
-            ctx->IASetInputLayout(layout.Get());
+            ctx->IASetInputLayout(native ? layoutNative.Get() : layout.Get());
             ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            UINT stride = sizeof(Vtx), offset = 0;
-            ID3D11Buffer *vbp = vb.Get();
+            UINT stride = native ? static_cast<UINT>(sizeof(GSNativeVtx)) : static_cast<UINT>(sizeof(Vtx)), offset = 0;
+            ID3D11Buffer *vbp = native ? vbNative.Get() : vb.Get();
             ctx->IASetVertexBuffers(0, 1, &vbp, &stride, &offset);
-            ctx->VSSetShader(vs.Get(), nullptr, 0);
+            ctx->VSSetShader(native ? vsNative.Get() : vs.Get(), nullptr, 0);
             ctx->PSSetShader(ps.Get(), nullptr, 0);
             ctx->GSSetShader(nullptr, nullptr, 0);
             ID3D11Buffer *cbp = cb.Get();
@@ -2683,7 +2824,7 @@ struct GSD3D11Backend::Impl
                 bound.ds = ds;
             }
             const int gq = gpOn ? gpBegin({gpKey[0], gpKey[1], gpKey[2], gpKey[3], gpKey[4] | (afailSelect != 0.0f ? 1u : 0u), gpKey[5], gpKey[6] | (depthWrite ? 0x80000000u : 0u)}, gpPx, static_cast<uint32_t>(pending.size())) : -1;
-            ctx->Draw(static_cast<UINT>(pending.size()), firstVertex);
+            ctx->Draw(static_cast<UINT>(native ? pendingNative.size() : pending.size()), firstVertex);
             gpEnd(gq);
         };
 
@@ -3147,6 +3288,15 @@ void GSD3D11Backend::Submit(const GSPrimitiveBatch &batch)
     if (!m_impl->initGpu() || batch.vertexCount == 0u)
         return;
     m_impl->submit(batch);
+}
+
+void GSD3D11Backend::SubmitNativeTris(const GSDrawState &state, const GSNativeVtx *v, uint32_t count)
+{
+    ps2_perf_split::PhaseScope perfPhase(ps2_perf_split::PhD3d); // HCTP_PERF_PHASES
+    std::lock_guard<std::recursive_mutex> lock(ps2host::d3dLock());
+    if (!m_impl->initGpu() || count == 0u)
+        return;
+    m_impl->submitNativeTris(state, v, count);
 }
 
 void GSD3D11Backend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
