@@ -137,6 +137,7 @@ namespace
     // the renderer refused a GPU-character draw (DATE / flat / FST): the packet path needs every corner, and lite left
     // only the clip flags (garbage triangles = the Nov 3 wedge)
     thread_local bool g_forceFull = false;
+    thread_local bool g_chunkLite = false; // the last computeChunk left only clip flags + ADC (lite)
     // HCTP_GPU_CHARS_LITE=1: GPU chunks get only clip flags + backface ADC on the CPU (no kicked-packet copy in VU memory:
     // the Nov 3 probe found no reader of it)
     bool s_gpuLiteOn()
@@ -349,6 +350,7 @@ namespace
             t_full = false;
             return ok;
         }
+        g_chunkLite = lite;
         g_top = top;
         g_count = count;
         return true;
@@ -778,7 +780,8 @@ bool hctpNativeVu1TryDraw(const uint8_t *code, uint8_t *data, const VU1State &st
             return true;
         }
     }
-    if (s_gpuLiteOn())
+    // only a lite chunk: a clipped chunk is already full, and recomputing it would drop buildClipPacket's ADC marks
+    if (g_chunkLite)
     {
         g_forceFull = true;
         const bool ok = computeChunk(code, data, st, top);
