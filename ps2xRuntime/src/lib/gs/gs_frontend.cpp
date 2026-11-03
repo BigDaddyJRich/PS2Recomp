@@ -1155,7 +1155,37 @@ bool GS::submitNativeTris(uint64_t tagLo, uint64_t tagHi, const GSNativeVtx *v, 
     if (count != 0u)
     {
         updatePreferredDisplaySourceForDraw(batch);
-        m_backend->SubmitNativeTris(batch.state, v, count);
+        // HCTP_GPU_CHARS_CPUVTX=1 (test): the corners as ordinary GS triangles (vs_native's maths in C++)
+        static const bool s_cpuVtx = [] { const char *e = std::getenv("HCTP_GPU_CHARS_CPUVTX"); return e && e[0] == '1'; }();
+        if (s_cpuVtx)
+        {
+            for (uint32_t i = 0; i + 2u < count; i += 3u)
+            {
+                GSPrimitiveBatch tri = batch;
+                for (int j = 0; j < 3; ++j)
+                {
+                    const GSNativeVtx &n = v[i + static_cast<uint32_t>(j)];
+                    GSVertex &o = tri.vertices[j];
+                    float col[4];
+                    for (int c = 0; c < 4; ++c)
+                        col[c] = std::fmin(n.c1[c] * n.s1[c] * n.l[c] + n.c1[c] * n.s2[c], 255.0f);
+                    o.r = static_cast<uint8_t>(static_cast<int32_t>(col[0]) & 255);
+                    o.g = static_cast<uint8_t>(static_cast<int32_t>(col[1]) & 255);
+                    o.b = static_cast<uint8_t>(static_cast<int32_t>(col[2]) & 255);
+                    o.a = static_cast<uint8_t>(static_cast<int32_t>(col[3]) & 255);
+                    o.s = (n.c0[0] + n.k[0]) * n.c0[3];
+                    o.t = (n.c0[1] + n.k[1]) * n.c0[3];
+                    o.q = n.c0[2] * n.c0[3];
+                    o.x = static_cast<float>(static_cast<int32_t>(n.p[0] * 16.0f) & 0xFFFF) / 16.0f;
+                    o.y = static_cast<float>(static_cast<int32_t>(n.p[1] * 16.0f) & 0xFFFF) / 16.0f;
+                    o.z = static_cast<double>((static_cast<uint32_t>(static_cast<int32_t>(n.p[2] * 16.0f)) >> 4) & 0xFFFFFFu);
+                    o.fog = static_cast<uint8_t>((static_cast<uint32_t>(static_cast<int32_t>(n.p[3] * 16.0f)) >> 4) & 0xFFu);
+                }
+                m_backend->Submit(tri);
+            }
+        }
+        else
+            m_backend->SubmitNativeTris(batch.state, v, count);
         m_vramWrittenSincePresent = true;
     }
     m_curR = lastRgba[0];

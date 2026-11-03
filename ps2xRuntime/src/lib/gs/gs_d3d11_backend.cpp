@@ -191,8 +191,11 @@ cbuffer Draw : register(b0)
     float4 region;      // minu, maxu, minv, maxv
     float4 p3;          // x wms, y wmt, z storage origin x, w storage origin y
     float4 p4;          // x linear filter, y texture is a render target, z discard no-op additive pixels
+    float4 p5;          // x paletted (index texture t2 + palette atlas row y in t3)
 };
 Texture2D gsTex : register(t0);
+Texture2D<uint> gsIdx : register(t2);
+Texture2D gsPal : register(t3);
 SamplerState gsSamp : register(s0);
 
 struct VsIn  { float4 pos : POSITION; float4 col : COLOR0; float4 tc : TEXCOORD0; };
@@ -255,6 +258,8 @@ float4 fetchTexel(int2 ic)
     ic.x = wrapTexel(ic.x, texDims.x, p3.x, region.x, region.y);
     ic.y = wrapTexel(ic.y, texDims.y, p3.y, region.z, region.w);
     int2 sc = clamp(ic + (int2)p3.zw, int2(0, 0), (int2)texDims.zw - 1);
+    if (p5.x != 0.0)
+        return gsPal.Load(int3((int)gsIdx.Load(int3(sc, 0)), (int)p5.y, 0)); // palette lookup on the GPU
     return gsTex.Load(int3(sc, 0));
 }
 
@@ -392,6 +397,7 @@ float4 ps_date(BlitOut i) : SV_Target
         float region[4];
         float p3[4];
         float p4[4];
+        float p5[4];
     };
 
     // Everything that changes how a batch of primitives is rendered.
@@ -651,6 +657,7 @@ struct GSD3D11Backend::Impl
     bool pendingIsNative = false;
     bool boundNative = false;
     float pendingNativeMaxY = 0.0f;
+    float pendingNativeBox[4] = {1e9f, 1e9f, -1e9f, -1e9f}; // x0 y0 x1 y1 of the native corners (dirty rect)
     uint64_t frameCounter = 0;
 
     // PS2X_GPU_PROF=1: GPU timestamp pair around every draw, grouped by draw class (target, blend, texture source,
@@ -1680,7 +1687,52 @@ struct GSD3D11Backend::Impl
         return s;
     }
 
-    ID3D11ShaderResourceView *decodedTexture(const GSDrawState &st, uint32_t &outW, uint32_t &outH)
+    // HCTP_CLUT_GPU (default on; =0: off): paletted textures as an index texture (cached by texels, no palette in
+    // the key) + a palette row in an atlas; the pixel shader looks the colour up. A palette change re-uploads 1 KB.
+    static bool clutGpuOn()
+    {
+        static const bool on = [] { const char *e = std::getenv("HCTP_CLUT_GPU"); return !(e && e[0] == '0'); }();
+        return on;
+    }
+    ComPtr<ID3D11Texture2D> palTex;
+    ComPtr<ID3D11ShaderResourceView> palSrv;
+    static constexpr uint32_t kPalRows = 4096u;
+    std::unordered_map<uint64_t, uint32_t> palRows; // palette key -> atlas row
+    std::vector<uint64_t> palRowKey;                // atlas row -> key (for eviction)
+    uint32_t palNext = 0;
+    uint64_t statPalUploads = 0;
+
+    int paletteRow(const GSDrawState &st)
+    {
+        const GSTex0Reg &t = st.context.tex0;
+        if (!palTex)
+        {
+            if (!createTexture(256u, kPalRows, D3D11_BIND_SHADER_RESOURCE, palTex) ||
+                FAILED(dev->CreateShaderResourceView(palTex.Get(), nullptr, &palSrv)))
+                return -1;
+            palRowKey.assign(kPalRows, ~0ull);
+        }
+        const uint32_t k[] = {clutVersion, t.cpsm, t.csa, t.csm, isIndexed4(t.psm) ? 1u : 0u, st.texa.ta0, st.texa.ta1,
+                              st.texa.aem ? 1u : 0u};
+        const uint64_t key = fnv1a(k, sizeof(k));
+        auto it = palRows.find(key);
+        if (it != palRows.end())
+            return static_cast<int>(it->second);
+        const uint32_t row = palNext++ % kPalRows;
+        if (palRowKey[row] != ~0ull)
+            palRows.erase(palRowKey[row]);
+        palRowKey[row] = key;
+        palRows[key] = row;
+        uint32_t pal[256];
+        for (uint32_t i = 0; i < 256u; ++i)
+            pal[i] = clutColor(t, st.texa, i);
+        const D3D11_BOX box{0, row, 0, 256, row + 1u, 1};
+        ctx->UpdateSubresource(palTex.Get(), 0, &box, pal, 256u * 4u, 0);
+        ++statPalUploads;
+        return static_cast<int>(row);
+    }
+
+    ID3D11ShaderResourceView *decodedTexture(const GSDrawState &st, uint32_t &outW, uint32_t &outH, bool asIndex = false)
     {
         ps2_perf_split::PhaseScope perfPhase(ps2_perf_split::PhTexDec); // HCTP_PERF_PHASES
         const GSTex0Reg &t = st.context.tex0;
@@ -1723,16 +1775,16 @@ struct GSD3D11Backend::Impl
         syncDetail[0] = 0;
 
         uint64_t key = fnv1a(&t.tbp0, sizeof(t.tbp0));
-        const uint32_t k2[] = {t.tbw, t.psm, tw, th};
+        const uint32_t k2[] = {t.tbw, t.psm, tw, th, asIndex ? 0x1D7u : 0u};
         key = fnv1a(k2, sizeof(k2), key);
-        if (isIndexed(t.psm))
+        if (isIndexed(t.psm) && !asIndex)
         {
             const uint32_t k3[] = {t.cpsm, t.csa, t.csm};
             key = fnv1a(k3, sizeof(k3), key);
             const bool c16 = t.cpsm == GS_PSM_CT16 || t.cpsm == GS_PSM_CT16S;
             key = fnv1a(clut.data(), c16 ? 512u * 2u : 512u * 2u, key);
         }
-        if (is16(t.psm) || is24(t.psm) || (isIndexed(t.psm) && t.cpsm != GS_PSM_CT32))
+        if (is16(t.psm) || is24(t.psm) || (isIndexed(t.psm) && !asIndex && t.cpsm != GS_PSM_CT32))
         {
             const uint32_t k4[] = {st.texa.ta0, st.texa.ta1, st.texa.aem ? 1u : 0u};
             key = fnv1a(k4, sizeof(k4), key);
@@ -1811,6 +1863,33 @@ struct GSD3D11Backend::Impl
         {
             raw.resize(static_cast<size_t>(tw) * th);
             mem.ReadVramRect(t.psm, t.tbp0, tbw, 0u, 0u, tw, th, raw.data());
+        }
+        if (asIndex)
+        {
+            std::vector<uint8_t> ix(static_cast<size_t>(tw) * th);
+            for (size_t i = 0; i < ix.size(); ++i)
+                ix[i] = static_cast<uint8_t>(raw[i]);
+            CachedTexture ct;
+            if (!createTexture(tw, th, D3D11_BIND_SHADER_RESOURCE, ct.tex, DXGI_FORMAT_R8_UINT))
+                return nullptr;
+            gpTag = "tex-upload";
+            ctx->UpdateSubresource(ct.tex.Get(), 0, nullptr, ix.data(), tw, 0);
+            dev->CreateShaderResourceView(ct.tex.Get(), nullptr, &ct.srv);
+            ct.w = tw;
+            ct.h = th;
+            ct.pageStamp = stamp;
+            ct.lastUse = frameCounter;
+            texCache[key] = ct;
+            if (vram)
+            {
+                contentCache[contentKey] = ct;
+                if (rawRead)
+                    contentCache[texelKey] = ct;
+            }
+            ++statTexDecodes;
+            outW = tw;
+            outH = th;
+            return texCache[key].srv.Get();
         }
         std::vector<uint32_t> px(static_cast<size_t>(tw) * th);
         for (uint32_t y = 0; y < th; ++y)
@@ -2224,6 +2303,8 @@ struct GSD3D11Backend::Impl
             hasPending = true;
             pendingIsNative = true;
             pendingNativeMaxY = 0.0f;
+            pendingNativeBox[0] = pendingNativeBox[1] = 1e9f;
+            pendingNativeBox[2] = pendingNativeBox[3] = -1e9f;
         }
         const float ofx = static_cast<float>(c.xyoffset.ofx) / 16.0f, ofy = snapOfy(c.xyoffset.ofy);
         const size_t at = pendingNative.size();
@@ -2233,8 +2314,13 @@ struct GSD3D11Backend::Impl
             GSNativeVtx &o = pendingNative[i];
             o.k[2] = ofx;
             o.k[3] = ofy;
+            const float x = static_cast<float>(static_cast<int32_t>(o.p[0] * 16.0f) & 0xFFFF) / 16.0f - ofx;
             const float y = static_cast<float>(static_cast<int32_t>(o.p[1] * 16.0f) & 0xFFFF) / 16.0f - ofy;
             pendingNativeMaxY = std::max(pendingNativeMaxY, y);
+            pendingNativeBox[0] = std::min(pendingNativeBox[0], x);
+            pendingNativeBox[1] = std::min(pendingNativeBox[1], y);
+            pendingNativeBox[2] = std::max(pendingNativeBox[2], x);
+            pendingNativeBox[3] = std::max(pendingNativeBox[3], y);
         }
         if (pendingNative.size() > 60000)
             flushPending();
@@ -2307,6 +2393,8 @@ struct GSD3D11Backend::Impl
 
         // ---- texture
         ID3D11ShaderResourceView *texSrv = nullptr;
+        int palRowForDraw = -1;                          // HCTP_CLUT_GPU: palette atlas row of an index texture
+        ID3D11ShaderResourceView *idxSrvForDraw = nullptr;
         bool texFromRt = false;
         float texDims[4] = {1, 1, 1, 1};
         float origin[2] = {0, 0};
@@ -2464,7 +2552,17 @@ struct GSD3D11Backend::Impl
                 texSrv = nullptr;
                 if (!texSrv)
                 {
-                    texSrv = decodedTexture(st, w, h);
+                    palRowForDraw = -1;
+                    if (isIndexed(t.psm) && clutGpuOn())
+                    {
+                        palRowForDraw = paletteRow(st);
+                        if (palRowForDraw >= 0)
+                            idxSrvForDraw = decodedTexture(st, w, h, true);
+                        if (!idxSrvForDraw)
+                            palRowForDraw = -1;
+                    }
+                    // t0 keeps the index view for the null checks below; the shader reads t2/t3 when p5.x is set
+                    texSrv = palRowForDraw >= 0 ? idxSrvForDraw : decodedTexture(st, w, h);
                     if (clobberLeft > 0)
                     {
                         const uint32_t cw = std::min<uint32_t>(st.textureWidth, std::max<uint32_t>(t.tbw, 1u) * 64u);
@@ -2556,6 +2654,13 @@ struct GSD3D11Backend::Impl
         cbd.p3[3] = origin[1];
         cbd.p4[0] = st.linearFilter ? 1.0f : 0.0f;
         cbd.p4[1] = texFromRt ? 1.0f : 0.0f;
+        cbd.p5[0] = palRowForDraw >= 0 ? 1.0f : 0.0f;
+        cbd.p5[1] = static_cast<float>(std::max(palRowForDraw, 0));
+        if (palRowForDraw >= 0)
+        {
+            ID3D11ShaderResourceView *ps2[2] = {idxSrvForDraw, palSrv.Get()};
+            ctx->PSSetShaderResources(2, 2, ps2);
+        }
         {
             const uint8_t zp = c.zbuf.psm; // vs_native: the Z format's clamp (zNorm)
             cbd.p4[3] = zp == GS_PSM_Z24 ? 16777215.0f : (zp == GS_PSM_Z16 || zp == GS_PSM_Z16S) ? 65535.0f : 4294967295.0f;
@@ -3078,7 +3183,10 @@ struct GSD3D11Backend::Impl
                             static_cast<unsigned long long>(c.test), pending.empty() ? 0.f : pending[0].x, pending.empty() ? 0.f : pending[0].y, 10);
         }
         {
-            float minY = 1e9f, maxY = -1e9f, minX = 1e9f, maxX = -1e9f;
+            // GPU-character draws: the corners' box (pending is empty for them) - else the target's writeback to GS
+            // memory skips the wrestlers
+            float minY = native ? pendingNativeBox[1] : 1e9f, maxY = native ? pendingNativeBox[3] : -1e9f;
+            float minX = native ? pendingNativeBox[0] : 1e9f, maxX = native ? pendingNativeBox[2] : -1e9f;
             for (const Vtx &v : pending)
             {
                 minY = std::min(minY, v.y);

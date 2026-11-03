@@ -213,7 +213,11 @@ namespace
             return false;
         const bool p18 = g_variant == 1 || g_variant == 5; // p19 = p18's colour / STQ
         // GPU character path: only the clip flags, the backface ADC and the last corner's RGBA / STQ are needed here
-        static const bool s_gpuLite = [] { const char *e = std::getenv("HCTP_GPU_CHARS"); return !(e && e[0] == '0'); }();
+        static const bool s_gpuLite = [] {
+            const char *e = std::getenv("HCTP_GPU_CHARS"), *m = std::getenv("HCTP_GPU_CHARS_VUMEM"),
+                       *v = std::getenv("HCTP_GPU_CHARS_VERIFY");
+            return !(e && e[0] == '0') && (m && m[0] == '0') && !(v && v[0] == '1');
+        }();
         static thread_local bool t_full = false; // a clipped chunk: the CPU clipper needs every corner's outputs
         const bool lite = s_gpuLite && !g_on && !t_full && (g_variant == 0 || g_variant == 1 || g_variant == 3 || g_variant == 5);
 
@@ -633,7 +637,10 @@ bool hctpNativeVu1TryDraw(const uint8_t *code, uint8_t *data, const VU1State &st
     // (stage-1 outputs + corner records); its vertex shader does the colour / STQ / FTOI maths (GSNativeVtx).
     // p08, p18, p11, p19; the rest, clipped chunks and DATE draws kick packets.
     static const bool s_gpuChars = [] { const char *e = std::getenv("HCTP_GPU_CHARS"); return !(e && e[0] == '0'); }();
-    if (s_gpuChars && !g_on && !g_chunkClip && (g_variant == 0 || g_variant == 1 || g_variant == 3 || g_variant == 5))
+    // HCTP_GPU_CHARS_MASK=<bits> (test): only these variants (bit n = g_variant n) take the GPU path
+    static const uint32_t s_gpuMask = [] { const char *e = std::getenv("HCTP_GPU_CHARS_MASK"); return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 0xFFu; }();
+    if (s_gpuChars && !g_on && !g_chunkClip && ((s_gpuMask >> g_variant) & 1u) &&
+        (g_variant == 0 || g_variant == 1 || g_variant == 3 || g_variant == 5))
     {
         const bool p18 = g_variant == 1 || g_variant == 5;
         const float *v1 = q(data, 1006), *v1007 = q(data, 1007), *mat = q(data, 1019), *scroll = q(data, 1009);
@@ -667,6 +674,56 @@ bool hctpNativeVu1TryDraw(const uint8_t *code, uint8_t *data, const VU1State &st
             corner(k - 1u);
             corner(k);
         }
+        // HCTP_GPU_CHARS_VERIFY=1: vs_native's maths in C++ against the packet path's corners ([gpuverify])
+        static const bool s_verify = [] { const char *v = std::getenv("HCTP_GPU_CHARS_VERIFY"); return v && v[0] == '1'; }();
+        if (s_verify)
+        {
+            static uint64_t s_n = 0, s_bad = 0;
+            static int s_logs = 0;
+            size_t t = 0;
+            for (uint32_t k = 2; k < g_count; ++k)
+            {
+                if (g_expected[k].xyz[3] & 0x8000)
+                    continue;
+                for (uint32_t j = 0; j < 3; ++j, ++t)
+                {
+                    const Corner &e = g_expected[k - 2u + j];
+                    const GSNativeVtx &v = s_tris[t];
+                    int32_t ci[4];
+                    for (int c = 0; c < 4; ++c)
+                    {
+                        const float col = std::fmin(v.c1[c] * v.s1[c] * v.l[c] + v.c1[c] * v.s2[c], 255.0f);
+                        ci[c] = static_cast<int32_t>(col) & 255;
+                    }
+                    const float stq[3] = {(v.c0[0] + v.k[0]) * v.c0[3], (v.c0[1] + v.k[1]) * v.c0[3], v.c0[2] * v.c0[3]};
+                    const int32_t xi = static_cast<int32_t>(v.p[0] * 16.0f) & 0xFFFF, yi = static_cast<int32_t>(v.p[1] * 16.0f) & 0xFFFF;
+                    const uint32_t zi = (static_cast<uint32_t>(static_cast<int32_t>(v.p[2] * 16.0f)) >> 4) & 0xFFFFFFu;
+                    const uint32_t fi = (static_cast<uint32_t>(static_cast<int32_t>(v.p[3] * 16.0f)) >> 4) & 0xFFu;
+                    const bool okC = ci[0] == (e.rgba[0] & 255) && ci[1] == (e.rgba[1] & 255) && ci[2] == (e.rgba[2] & 255) && ci[3] == (e.rgba[3] & 255);
+                    const bool okS = std::fabs(stq[0] - e.stq[0]) <= 1e-4f * std::fmax(1.0f, std::fabs(e.stq[0])) &&
+                                     std::fabs(stq[1] - e.stq[1]) <= 1e-4f * std::fmax(1.0f, std::fabs(e.stq[1])) &&
+                                     std::fabs(stq[2] - e.stq[2]) <= 1e-4f * std::fmax(1.0f, std::fabs(e.stq[2]));
+                    const bool okP = xi == (e.xyz[0] & 0xFFFF) && yi == (e.xyz[1] & 0xFFFF) &&
+                                     zi == ((static_cast<uint32_t>(e.xyz[2]) >> 4) & 0xFFFFFFu) && fi == ((static_cast<uint32_t>(e.xyz[3]) >> 4) & 0xFFu);
+                    ++s_n;
+                    if (!(okC && okS && okP))
+                    {
+                        ++s_bad;
+                        if (s_logs++ < 24)
+                            std::fprintf(stderr, "[gpuverify] var=%d k=%u j=%u col %d %d %d %d / %d %d %d %d stq %g %g %g / %g %g %g xy %d %d / %d %d z %u / %u fog %u / %u%c",
+                                         g_variant, k, j, ci[0], ci[1], ci[2], ci[3], e.rgba[0], e.rgba[1], e.rgba[2], e.rgba[3],
+                                         stq[0], stq[1], stq[2], e.stq[0], e.stq[1], e.stq[2], xi, yi, e.xyz[0] & 0xFFFF, e.xyz[1] & 0xFFFF,
+                                         zi, (static_cast<uint32_t>(e.xyz[2]) >> 4) & 0xFFFFFFu, fi, (static_cast<uint32_t>(e.xyz[3]) >> 4) & 0xFFu, 10);
+                    }
+                }
+            }
+            static auto s_last = std::chrono::steady_clock::now();
+            if (std::chrono::steady_clock::now() - s_last > std::chrono::seconds(5))
+            {
+                s_last = std::chrono::steady_clock::now();
+                std::fprintf(stderr, "[gpuverify] corners=%llu bad=%llu%c", static_cast<unsigned long long>(s_n), static_cast<unsigned long long>(s_bad), 10);
+            }
+        }
         uint64_t tag[2];
         std::memcpy(tag, data + (top & 0x3FFu) * 16u, 16);
         const Corner &last = g_expected[g_count - 1u];
@@ -674,6 +731,21 @@ bool hctpNativeVu1TryDraw(const uint8_t *code, uint8_t *data, const VU1State &st
                                      static_cast<uint8_t>(last.rgba[2]), static_cast<uint8_t>(last.rgba[3])};
         if (gs.submitNativeTris(tag[0], tag[1], s_tris.data(), static_cast<uint32_t>(s_tris.size()), lastRgba, last.stq))
         {
+            // leave the kicked packet in VU memory at TOP+33 as the VU1 would: later VU work reads it back (without
+            // it: big translucent wedges over the mat / stage, Nov 3). HCTP_GPU_CHARS_VUMEM=0: off (+ lite corners)
+            static const bool s_vumem = [] { const char *m = std::getenv("HCTP_GPU_CHARS_VUMEM"); return !(m && m[0] == '0'); }();
+            if (s_vumem)
+            {
+                std::memcpy(data + ((top + 33u) & 0x3FFu) * 16u, data + (top & 0x3FFu) * 16u, 16);
+                for (uint32_t k = 0; k < g_count; ++k)
+                {
+                    const Corner &e = g_expected[k];
+                    const float stq[4] = {e.stq[0], e.stq[1], e.stq[2], 0.0f};
+                    std::memcpy(data + ((top + 34u + 3u * k) & 0x3FFu) * 16u, stq, 16);
+                    std::memcpy(data + ((top + 35u + 3u * k) & 0x3FFu) * 16u, e.rgba, 16);
+                    std::memcpy(data + ((top + 36u + 3u * k) & 0x3FFu) * 16u, e.xyz, 16);
+                }
+            }
             ++g_nativeChunks;
             if (g_variant == 1)
                 ++g_p18Native;
