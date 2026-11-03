@@ -2974,7 +2974,8 @@ namespace ps2_vu_code_log
             uint32_t begin = 0;
             uint32_t end = 0;
         };
-        constexpr uint32_t kLogSize = 64u;
+        // six-man: well over 64 program uploads between two VU1 runs -> every run fell back to a full re-decode
+        constexpr uint32_t kLogSize = 4096u;
         std::mutex g_mutex;
         std::array<Write, kLogSize> g_log{};
     }

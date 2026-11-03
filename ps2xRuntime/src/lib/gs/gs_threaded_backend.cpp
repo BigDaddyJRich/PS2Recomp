@@ -1,6 +1,7 @@
 #include "runtime/gs/gs_threaded_backend.h"
 
 #include "runtime/ps2_host_profile.h"
+#include "runtime/ps2_perf_split.h"
 #include "ThreadNaming.h"
 
 #include <algorithm>
@@ -177,9 +178,10 @@ namespace
 
 // ---- GSThreadedBackend: producer side ------------------------------------------------------------------------------
 
-GSThreadedBackend::GSThreadedBackend(std::unique_ptr<GSCpuBackend> inner, const Options &options)
+GSThreadedBackend::GSThreadedBackend(std::unique_ptr<GSRasterBackend> inner, const Options &options)
     : m_inner(std::move(inner)), m_options(options)
 {
+    m_innerIsCpu = dynamic_cast<GSCpuBackend *>(m_inner.get()) != nullptr;
     uint64_t size = 1u << 20u;
     while (size < options.ringBytes && size < (uint64_t{1} << 30u))
         size <<= 1u;
@@ -301,6 +303,7 @@ template <typename Pred>
 void GSThreadedBackend::waitProgress(const char *what, Pred pred)
 {
     ps2_host_profile::Scope profile(ps2_host_profile::GsWait);
+    ps2_perf_split::Scope perfWait(ps2_perf_split::GsWait);
     const auto start = std::chrono::steady_clock::now();
     while (std::chrono::steady_clock::now() - start < kSpin)
     {
@@ -385,6 +388,12 @@ PresentationFrame GSThreadedBackend::Present(const GSPresentationRequest &reques
 
 bool GSThreadedBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
 {
+    if (!m_innerIsCpu)
+    {
+        // D3D11's answer depends on its render targets (rare call: a direct clear from an HLE stub)
+        drain();
+        return m_inner->ClearFramebuffer(context, rgba);
+    }
     push(Cmd::Clear, ClearPayload{context, rgba});
     return GSCpuBackend::ClearFramebufferWritesPixels(context, m_hasVram);
 }
@@ -415,6 +424,8 @@ void GSThreadedBackend::SnapshotVram(std::vector<uint8_t> &out) const
 GSTransferSnapshot GSThreadedBackend::GetTransferSnapshot() const
 {
     // debug only: the transfer state as far as the GS thread has got (GSCpuBackend locks its own state)
+    if (!m_innerIsCpu)
+        drain();
     return m_inner->GetTransferSnapshot();
 }
 
@@ -546,6 +557,7 @@ void GSThreadedBackend::threadMain()
         }
 
         ps2_host_profile::setPhase(ps2_host_profile::GsCmd);
+        ps2_perf_split::Scope busy(ps2_perf_split::GsBusy); // this batch of commands (HCTP_PERF_SPLIT)
         uint32_t sinceProgress = 0u;
         while (read != write)
         {

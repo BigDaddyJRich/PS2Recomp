@@ -2,6 +2,7 @@
 
 #include "ps2_runtime.h"
 #include "runtime/ps2_host_profile.h"
+#include "runtime/ps2_perf_split.h"
 #include "ThreadNaming.h"
 
 #include <algorithm>
@@ -140,11 +141,13 @@ void ChainWorker::runGif(const uint8_t *data, uint32_t sizeBytes)
 void ChainWorker::runVif1(const uint8_t *data, uint32_t sizeBytes, uint32_t fbrst)
 {
     m_kickFbrst = fbrst;
+    ps2_perf_split::PhaseScope phase(ps2_perf_split::PhVif);
     m_runtime.memory().processVIF1Data(data, sizeBytes);
 }
 
 void ChainWorker::runPresent(const uint8_t *payload)
 {
+    ps2_perf_split::PhaseScope phase(ps2_perf_split::PhPresent);
     const PresentPayload present = load<PresentPayload>(payload);
     m_runtime.gs().presentCaptured(present.regs, present.vsyncTick);
 }
@@ -240,6 +243,7 @@ void ChainWorker::writeVif1Register(uint32_t address, uint32_t value)
 void ChainWorker::present(const GSDisplayRegs &regs, uint64_t vsyncTick)
 {
     const PresentPayload payload{regs, vsyncTick};
+    ps2_perf_split::tick();
     if (!m_async)
     {
         uint8_t bytes[sizeof(payload)];
@@ -414,7 +418,13 @@ void ChainWorker::fence(ChainFence reason)
     const auto t0 = std::chrono::steady_clock::now();
     waitProgress("the chain worker to finish", [&]()
                  { return m_stop.load(std::memory_order_acquire) || m_readPos.load(std::memory_order_acquire) >= m_localWrite; });
-    hctpFenceNote(m_runtime, int(reason), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    const auto waited = std::chrono::steady_clock::now() - t0;
+    if (ps2_perf_split::enabled())
+    {
+        ps2_perf_split::add(ps2_perf_split::EeFence, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count()));
+        ps2_perf_split::g_fences.fetch_add(1u, std::memory_order_relaxed);
+    }
+    hctpFenceNote(m_runtime, int(reason), std::chrono::duration<double, std::milli>(waited).count());
 }
 
 bool ChainWorker::waitBacklog(uint32_t maxAhead, const std::atomic<bool> &stop)
@@ -429,7 +439,10 @@ bool ChainWorker::waitBacklog(uint32_t maxAhead, const std::atomic<bool> &stop)
     const auto t0 = std::chrono::steady_clock::now();
     waitProgress("the chain worker to catch up", [&]()
                  { return stop.load(std::memory_order_acquire) || m_stop.load(std::memory_order_acquire) || caughtUp(); });
-    hctpFenceNote(m_runtime, 100, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    const auto waited = std::chrono::steady_clock::now() - t0;
+    if (ps2_perf_split::enabled())
+        ps2_perf_split::add(ps2_perf_split::ChainThrottle, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count()));
+    hctpFenceNote(m_runtime, 100, std::chrono::duration<double, std::milli>(waited).count());
     return !stop.load(std::memory_order_acquire);
 }
 
@@ -545,6 +558,8 @@ void ChainWorker::threadMain()
         }
 
         ps2_host_profile::setPhase(ps2_host_profile::ChainCmd);
+        ps2_perf_split::Scope busy(ps2_perf_split::ChainBusy); // this batch of records (HCTP_PERF_SPLIT)
+        ps2_perf_split::PhaseScope busyPhase(ps2_perf_split::PhOther, true); // HCTP_PERF_PHASES
         uint32_t sinceProgress = 0u;
         uint64_t localRead = read;
         while (localRead != write)

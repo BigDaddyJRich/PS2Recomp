@@ -1,6 +1,7 @@
 // Direct3D 11 GS renderer for the HCTP native-renderer build. Ported from WWE Crush Hour PC (KaikoClanworth1,
 // GPL-3.0, https://github.com/KaikoClanworth1/wwe-crush-hour-pc); RenderWare-specific native geometry and the
 // Crush Hour mod overlays removed. SubmitNative is the slot for HCTP's own native model draws.
+#include "runtime/ps2_perf_split.h"
 #include "runtime/gs/gs_d3d11_backend.h"
 #include "runtime/ps2_host_profile.h"
 #include "runtime/gs/ps2_gs_common.h"
@@ -456,6 +457,13 @@ struct GSD3D11Backend::Impl
     };
     std::list<RenderTarget> rts;
 
+    struct DepthRing
+    {
+        ComPtr<ID3D11Texture2D> tex;
+        uint32_t w = 0, h = 0, zbp = 0xFFFFFFFFu;
+        uint64_t frame = ~0ull;
+    };
+
     struct DepthTarget
     {
         uint32_t zbpBlock = 0;
@@ -463,6 +471,8 @@ struct GSD3D11Backend::Impl
         uint32_t psm = GS_PSM_Z32; // ZBUF.PSM of the last depth-tested draw (Z24 leaves the top byte alone)
         ComPtr<ID3D11Texture2D> tex;
         ComPtr<ID3D11DepthStencilView> dsv;
+        bool readbackObserved = false; // the guest has read this target back: Present snapshots it (depthRingCopy)
+        DepthRing ring[2];
     };
     // Depth written back to GS memory for a local->host read: in the format the depth was DRAWN in. HCTP reads its
     // Z24 buffer as PSMZ32 (flare/flash visibility, 2x2 at each light's screen position); writing 32 bits put the
@@ -1057,6 +1067,7 @@ struct GSD3D11Backend::Impl
     }
     void syncRtToVram(RenderTarget &rt)
     {
+        ps2_perf_split::PhaseScope perfPhase(ps2_perf_split::PhRtSync); // HCTP_PERF_PHASES
         const uint64_t watchIn = watchHash();
         if (std::getenv("HCTP_WATCH_BLK") && rt.fbpBlock == 4096u)
             std::printf("[watchrt] writeback fbp=%u dirtyY=%u-%u dirtyX=%u-%u alpha=%d needsUp=%d upY=%u-%u reason=%s\n", rt.fbpBlock,
@@ -1165,12 +1176,11 @@ struct GSD3D11Backend::Impl
     // GS thread, and the game thread behind it, to ~40 fps. Now the target is copied at most once a frame into a
     // ring of two staging textures, and reads are served from the previous frame's copy, which the GPU has
     // finished by then. HCTP_ZREADBACK_SYNC=1 = the exact old path (copy + wait on every read).
-    struct DepthRing
-    {
-        ComPtr<ID3D11Texture2D> tex;
-        uint32_t w = 0, h = 0, zbp = 0xFFFFFFFFu;
-        uint64_t frame = ~0ull;
-    } depthRing[2];
+    // Default since Nov 2 (ported from the Codex optimize tree): each target the guest has read is copied at Present
+    // into its own ring, and the next frame's reads Map that copy - no copy+flush on the first read of a frame, no
+    // exact fallback when HCTP skips reading for a frame (the 6-9 ms Map stalls). HCTP_ZREADBACK_ONDEMAND=1 = the
+    // previous first-read-of-the-frame copy.
+    const bool depthPresentSnapshots = std::getenv("HCTP_ZREADBACK_ONDEMAND") == nullptr;
     bool depthRingCopy(DepthRing &slot, DepthTarget &dt, const D3D11_TEXTURE2D_DESC &src)
     {
         if (!slot.tex || slot.w != src.Width || slot.h != src.Height)
@@ -1194,6 +1204,7 @@ struct GSD3D11Backend::Impl
     }
     void syncDepthRect(uint32_t sbp, uint32_t sbw, uint32_t spsm, uint32_t x0, uint32_t y0, uint32_t w, uint32_t h)
     {
+        ps2_perf_split::PhaseScope perfPhase(ps2_perf_split::PhRtSync); // HCTP_PERF_PHASES
         static const bool s_sync = std::getenv("HCTP_ZREADBACK_SYNC") != nullptr;
         if (!s_sync && syncDepthRectLate(sbp, sbw, spsm, x0, y0, w, h))
             return;
@@ -1260,19 +1271,27 @@ struct GSD3D11Backend::Impl
             return true;
         D3D11_TEXTURE2D_DESC td{};
         dt->tex->GetDesc(&td);
-        DepthRing &current = depthRing[frameCounter & 1u];
-        DepthRing &previous = depthRing[(frameCounter + 1u) & 1u];
-        // This frame's copy, made on the first read of the frame (after what the game drew before it).
-        if (current.frame != frameCounter || current.zbp != dt->zbpBlock)
+        dt->readbackObserved = true;
+        DepthRing &current = dt->ring[frameCounter & 1u];
+        DepthRing &previous = dt->ring[(frameCounter + 1u) & 1u];
+        DepthRing *snapshot = &current; // Present copied it at the end of the previous frame
+        if (!depthPresentSnapshots)
         {
-            flushPending();
-            if (!depthRingCopy(current, *dt, td))
-                return false;
+            // This frame's copy, made on the first read of the frame (after what the game drew before it).
+            if (current.frame != frameCounter || current.zbp != dt->zbpBlock)
+            {
+                flushPending();
+                if (!depthRingCopy(current, *dt, td))
+                    return false;
+            }
+            snapshot = &previous;
         }
-        if (previous.frame + 1u != frameCounter || previous.zbp != dt->zbpBlock || previous.w != td.Width || previous.h != td.Height)
+        if (snapshot->frame == ~0ull || snapshot->zbp != dt->zbpBlock || snapshot->w != td.Width || snapshot->h != td.Height)
             return false; // first frame of a burst: one exact read
+        if (depthPresentSnapshots ? snapshot->frame != frameCounter : snapshot->frame + 1u != frameCounter)
+            return false;
         D3D11_MAPPED_SUBRESOURCE m{};
-        if (FAILED(ctx->Map(previous.tex.Get(), 0, D3D11_MAP_READ, 0, &m)))
+        if (FAILED(ctx->Map(snapshot->tex.Get(), 0, D3D11_MAP_READ, 0, &m)))
             return false;
         const uint32_t wpsm = depthWritebackPsm(spsm, *dt);
         const double top = wpsm == GS_PSM_Z32 ? 4294967295.0 : wpsm == GS_PSM_Z24 ? 16777215.0 : 65535.0;
@@ -1288,8 +1307,22 @@ struct GSD3D11Backend::Impl
                 mem.WriteVram(wpsm, sbp, sbw, x, y, static_cast<uint32_t>(z));
             }
         }
-        ctx->Unmap(previous.tex.Get(), 0);
+        ctx->Unmap(snapshot->tex.Get(), 0);
         return true;
+    }
+
+    void captureDepthSnapshotsAtPresent()
+    {
+        if (!depthPresentSnapshots)
+            return;
+        for (DepthTarget &dt : depths)
+        {
+            if (!dt.readbackObserved || !dt.tex)
+                continue;
+            D3D11_TEXTURE2D_DESC td{};
+            dt.tex->GetDesc(&td);
+            depthRingCopy(dt.ring[frameCounter & 1u], dt, td);
+        }
     }
 
     void syncOverlapping(uint32_t first, uint32_t last)
@@ -1457,25 +1490,27 @@ struct GSD3D11Backend::Impl
     }
 
     // ---------------------------------------------------------------- textures
-    void loadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+    // Returns true when the palette changed. Unless legacy, pending draws (which still use the old palette) are
+    // flushed only then - most TEX0 writes reload the same palette, and each flush broke a batch.
+    bool loadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut, bool legacy)
     {
         if (!isIndexed(tex0.psm))
-            return;
+            return false;
         switch (tex0.cld)
         {
         case 1: break;
         case 2: clutCbp[0] = tex0.cbp; break;
         case 3: clutCbp[1] = tex0.cbp; break;
         case 4:
-            if (clutCbp[0] == tex0.cbp) return;
+            if (clutCbp[0] == tex0.cbp) return false;
             clutCbp[0] = tex0.cbp;
             break;
         case 5:
-            if (clutCbp[1] == tex0.cbp) return;
+            if (clutCbp[1] == tex0.cbp) return false;
             clutCbp[1] = tex0.cbp;
             break;
         default:
-            return;
+            return false;
         }
         // The CLUT source may live in a render target that has only been drawn on the GPU.
         uint32_t first, last;
@@ -1501,12 +1536,13 @@ struct GSD3D11Backend::Impl
         const bool c16 = tex0.cpsm == GS_PSM_CT16 || tex0.cpsm == GS_PSM_CT16S;
         const bool c32 = tex0.cpsm == GS_PSM_CT32 || tex0.cpsm == GS_PSM_CT24;
         if (!c16 && !c32)
-            return;
+            return false;
         const uint32_t count = four ? 16u : 256u;
         const uint32_t csaMask = c16 ? 0x1Fu : 0x0Fu;
         const uint32_t dstBase = (static_cast<uint32_t>(tex0.csa) & csaMask) << 4u;
         const bool csm1Suffix = tex0.csm == 0u && c32 && !four;
         const uint32_t firstEntry = csm1Suffix ? dstBase : 0u;
+        auto loaded = clut;
         // Palette loads happen on most TEX0 writes; reading 256 swizzled entries each time was ~8% of a
         // match frame. Reuse the raw entries while the source pages are unchanged.
         uint64_t ckey = fnv1a(&tex0.cbp, sizeof(tex0.cbp));
@@ -1547,11 +1583,11 @@ struct GSD3D11Backend::Impl
             }
             const uint32_t d = (csm1Suffix ? e : dstBase + e) & (c16 ? 0x1FFu : 0xFFu);
             if (c16)
-                clut[d] = static_cast<uint16_t>(raw);
+                loaded[d] = static_cast<uint16_t>(raw);
             else
             {
-                clut[d] = static_cast<uint16_t>(raw & 0xFFFFu);
-                clut[d + 256u] = static_cast<uint16_t>(raw >> 16u);
+                loaded[d] = static_cast<uint16_t>(raw & 0xFFFFu);
+                loaded[d + 256u] = static_cast<uint16_t>(raw >> 16u);
             }
         }
         if (!cached)
@@ -1561,7 +1597,13 @@ struct GSD3D11Backend::Impl
             fresh.stamp = cstamp;
             clutCache[ckey] = fresh;
         }
+        if (loaded == clut && !legacy)
+            return false;
+        if (!legacy)
+            flushPending();
+        clut = loaded;
         ++clutVersion;
+        return true;
     }
 
     uint32_t clutColor(const GSTex0Reg &tex0, const GSTexaReg &texa, uint32_t index)
@@ -1593,6 +1635,7 @@ struct GSD3D11Backend::Impl
 
     ID3D11ShaderResourceView *decodedTexture(const GSDrawState &st, uint32_t &outW, uint32_t &outH)
     {
+        ps2_perf_split::PhaseScope perfPhase(ps2_perf_split::PhTexDec); // HCTP_PERF_PHASES
         const GSTex0Reg &t = st.context.tex0;
         // REGION_CLAMP / REGION_REPEAT address texels beyond TW/TH (up to MAXU/MAXV, or MINU|MAXU for repeat):
         // HCTP's 2D logos and fonts use a small TW/TH with a region clamp over the whole sheet. Decode that much.
@@ -3089,6 +3132,7 @@ void GSD3D11Backend::Reset()
 
 void GSD3D11Backend::SubmitNative(const GSDrawState &state, const void *job, uint32_t jobSize)
 {
+    ps2_perf_split::PhaseScope perfPhase(ps2_perf_split::PhD3d); // HCTP_PERF_PHASES
     // HCTP: the slot for native model draws (VU1 program replacements, notes\VU1_PROGRAMS.md); not used yet.
     (void)state;
     (void)job;
@@ -3097,6 +3141,7 @@ void GSD3D11Backend::SubmitNative(const GSDrawState &state, const void *job, uin
 
 void GSD3D11Backend::Submit(const GSPrimitiveBatch &batch)
 {
+    ps2_perf_split::PhaseScope perfPhase(ps2_perf_split::PhD3d); // HCTP_PERF_PHASES
     // Called per primitive batch (~500k/s): no timing scopes here, they cost more than the work.
     std::lock_guard<std::recursive_mutex> lock(ps2host::d3dLock());
     if (!m_impl->initGpu() || batch.vertexCount == 0u)
@@ -3106,8 +3151,16 @@ void GSD3D11Backend::Submit(const GSPrimitiveBatch &batch)
 
 void GSD3D11Backend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
 {
+    ps2_perf_split::PhaseScope perfPhase(ps2_perf_split::PhD3d); // HCTP_PERF_PHASES
+    // HCTP_CLUT_LEGACY_BEHAVIOR=1 = old path (lock + flush + reload on every TEX0). Otherwise the no-load cases
+    // (non-indexed, CLD 0/6/7; GSCpuBackend::LoadClut ignores them too) return without the lock, and loadClut
+    // flushes only when the palette really changes.
+    static const bool s_legacy = std::getenv("HCTP_CLUT_LEGACY_BEHAVIOR") != nullptr;
+    if (!s_legacy && (!isIndexed(tex0.psm) || tex0.cld == 0u || tex0.cld == 6u || tex0.cld == 7u))
+        return;
     std::lock_guard lock(ps2host::d3dLock());
-    m_impl->flushPending();
+    if (s_legacy)
+        m_impl->flushPending();
     {
         // HCTP diag: with HCTP_WATCH_BLK=<cbp>:n, log CLUT loads from that address (order vs [watchblk] uploads).
         static const char *s_w = std::getenv("HCTP_WATCH_BLK");
@@ -3120,12 +3173,13 @@ void GSD3D11Backend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut
                         tex0.cbp, tex0.cpsm, tex0.csm, tex0.csa, tex0.cld, v[3], v[2], v[1], v[0]);
         }
     }
-    m_impl->loadClut(tex0, texclut);
+    m_impl->loadClut(tex0, texclut, s_legacy);
     m_impl->mem.LoadClut(tex0, texclut);
 }
 
 void GSD3D11Backend::BeginTransfer(const GSTransferCommand &command)
 {
+    ps2_perf_split::PhaseScope perfPhase(ps2_perf_split::PhXfer); // HCTP_PERF_PHASES
     std::lock_guard lock(ps2host::d3dLock());
     Impl &d = *m_impl;
     d.flushPending();
@@ -3245,6 +3299,7 @@ void GSD3D11Backend::BeginTransfer(const GSTransferCommand &command)
 
 void GSD3D11Backend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
 {
+    ps2_perf_split::PhaseScope perfPhase(ps2_perf_split::PhXfer); // HCTP_PERF_PHASES
     static const char *s_uploadDumpDir = std::getenv("PS2X_UPLOAD_DUMP"); // per packet: no getenv here
     if (const char *dumpDir = s_uploadDumpDir)
     {
@@ -3307,17 +3362,20 @@ void GSD3D11Backend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
 
 void GSD3D11Backend::Flush()
 {
+    ps2_perf_split::PhaseScope perfPhase(ps2_perf_split::PhD3d); // HCTP_PERF_PHASES
     std::lock_guard lock(ps2host::d3dLock());
     m_impl->flushPending();
 }
 
 void GSD3D11Backend::TextureFlush()
 {
+    ps2_perf_split::PhaseScope perfPhase(ps2_perf_split::PhD3d); // HCTP_PERF_PHASES
     m_impl->mem.TextureFlush();
 }
 
 void GSD3D11Backend::Sync(GSSyncReason reason)
 {
+    ps2_perf_split::PhaseScope perfPhase(ps2_perf_split::PhD3d); // HCTP_PERF_PHASES
     std::lock_guard lock(ps2host::d3dLock());
     m_impl->flushPending();
     if (reason == GSSyncReason::DebugReadback)
@@ -3333,6 +3391,7 @@ PresentationFrame GSD3D11Backend::Present(const GSPresentationRequest &request)
     d.flushPending();
     d.gpuProfFrame();
     ++d.frameCounter;
+    d.captureDepthSnapshotsAtPresent();
     {
         // Widescreen: this frame's aspect is the one its 2D was drawn for; the next frame decides from this one.
         static const bool s_hud = Impl::hudWidescreen();
@@ -3419,6 +3478,7 @@ PresentationFrame GSD3D11Backend::Present(const GSPresentationRequest &request)
 
 bool GSD3D11Backend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
 {
+    ps2_perf_split::PhaseScope perfPhase(ps2_perf_split::PhD3d); // HCTP_PERF_PHASES
     std::lock_guard lock(ps2host::d3dLock());
     Impl &d = *m_impl;
     d.flushPending();

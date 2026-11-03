@@ -1,4 +1,5 @@
 #include "runtime/ps2_host_profile.h"
+#include "runtime/ps2_perf_split.h"
 #include "runtime/ps2_host_settings.h"
 #include "runtime/ps2_pad_rumble.h"
 #include "runtime/ps2_widescreen.h"
@@ -17,6 +18,7 @@
 #include "ps2_host_backend.h"
 #if defined(PS2X_NATIVE_HOST)
 #include "runtime/gs/gs_d3d11_backend.h"
+#include "runtime/gs/gs_threaded_backend.h"
 #endif
 #include "ps2_iop_host.h"
 #include "hctp_native_vu1.h"
@@ -1040,44 +1042,84 @@ bool PS2Runtime::syncCoreSubsystems()
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
     m_gifArbiter.setProcessPacketFn([this](GifPathId path, const uint8_t *data, uint32_t size)
-                                    { m_gs.processGIFPacket(data, size, static_cast<uint8_t>(path)); });
+                                    {
+                                        ps2_perf_split::PhaseScope phase(ps2_perf_split::PhGif);
+                                        m_gs.processGIFPacket(data, size, static_cast<uint8_t>(path));
+                                    });
     m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setChainWorker(&m_chain);
     // VU1 runs where the VIF1 stream runs (the chain worker, or the game thread when inline): FBRST's DE1 / TE1 come
     // from the kick, and VPU_STAT's stop bits go back through the chain.
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
+                                     ps2_perf_split::Vu1Scope perfVu1; // HCTP_PERF_SPLIT
+                                     ps2_perf_split::PhaseScope perfPhase(ps2_perf_split::PhVu1Nat);
                                      const uint32_t fbrst = m_chain.kickFbrst();
                                      m_vu1.state().dBitEnabled = (fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
+                                     const uint64_t censusT0 = hctpNativeVu1CensusNow();
                                      if (hctpNativeVu1Mscal(m_memory.getVU1Code(), m_memory.getVU1Data(), startPC))
                                      {
+                                         hctpNativeVu1Census(m_memory.getVU1Code(), startPC, true, censusT0, 1);
                                          m_chain.noteVu1Run(0u);
                                          return;
                                      }
                                      if (hctpNativeVu1MscalGeneric(m_memory.getVU1Code(), m_memory.getVU1Data(), startPC, m_gs))
                                      {
+                                         hctpNativeVu1Census(m_memory.getVU1Code(), startPC, true, censusT0, 1);
                                          m_chain.noteVu1Run(0u);
                                          return;
                                      }
-                                     hctpNativeVu1Census(m_memory.getVU1Code(), startPC, true);
-                                     m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
-                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                   m_gs, &m_memory, startPC, top, itop, 65536);
+                                     // p00 (constants into vf13-16 / vf26-29) on the state, no interpreter call
+                                     if (m_vu1.fastEntryAllowed() &&
+                                         hctpNativeVu1P00(m_memory.getVU1Code(), m_memory.getVU1Data(), startPC, m_vu1.state()))
+                                     {
+                                         m_vu1.fastEntryDone(0x60u, top, itop);
+                                         static bool s_saidP00 = false;
+                                         if (!s_saidP00 && (s_saidP00 = true))
+                                             std::fprintf(stderr, "[vu1] p00 entry runs on the host%c", 10);
+                                         hctpNativeVu1Census(m_memory.getVU1Code(), startPC, true, censusT0, 1);
+                                         m_chain.noteVu1Run(0u);
+                                         return;
+                                     }
+                                     // empty overlay entry (stage-2 programs at 0x2a00): no interpreter call
+                                     if (m_vu1.executeEmptyEntry(m_memory.getVU1Code(), startPC, top, itop))
+                                     {
+                                         static bool s_saidEmpty = false;
+                                         if (!s_saidEmpty && (s_saidEmpty = true))
+                                             std::fprintf(stderr, "[vu1] empty overlay entries skip the interpreter (first at 0x%x)%c", startPC, 10);
+                                         hctpNativeVu1Census(m_memory.getVU1Code(), startPC, true, censusT0, 1);
+                                         m_chain.noteVu1Run(0u);
+                                         return;
+                                     }
+                                     {
+                                         ps2_perf_split::PhaseScope interp(ps2_perf_split::PhVu1Int);
+                                         m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                       m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                       m_gs, &m_memory, startPC, top, itop, 65536);
+                                     }
+                                     hctpNativeVu1Census(m_memory.getVU1Code(), startPC, true, censusT0, 0);
                                      hctpNativeVu1AfterMscal(m_memory.getVU1Data());
                                      hctpNativeVu1AfterMscalGeneric(m_memory.getVU1Data());
                                      m_chain.noteVu1Run((m_vu1.state().stoppedByD ? 0x0200u : 0u) |
                                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u)); });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
+                                     ps2_perf_split::Vu1Scope perfVu1; // HCTP_PERF_SPLIT
+                                     ps2_perf_split::PhaseScope perfPhase(ps2_perf_split::PhVu1Nat);
                                      const uint32_t fbrst = m_chain.kickFbrst();
                                      m_vu1.state().dBitEnabled = (fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
+                                     const uint64_t censusT0 = hctpNativeVu1CensusNow();
+                                     const uint32_t censusPc = m_vu1.state().pc;
+                                     // p08 / p18 batch setup natively, then the loop head (HCTP_NATIVE_SETUP=0: off)
+                                     hctpNativeVu1FirstChunk(m_memory.getVU1Code(), m_memory.getVU1Data(), m_vu1.state());
                                      // native p14 shadow batch (HCTP_NATIVE_P14=1): registers stay in the VU1 state
                                      if (!Vu1Compiled::xgkickActive(m_vu1) &&
                                          hctpNativeVu1MscntP14(m_memory.getVU1Code(), m_memory.getVU1Data(),
                                                                m_vu1.state(), top, m_gs))
                                      {
+                                         hctpNativeVu1Census(m_memory.getVU1Code(), censusPc, false, censusT0, 1);
                                          m_chain.noteVu1Run(0u);
                                          return;
                                      }
@@ -1086,16 +1128,21 @@ bool PS2Runtime::syncCoreSubsystems()
                                          hctpNativeVu1TryDraw(m_memory.getVU1Code(), m_memory.getVU1Data(),
                                                               m_vu1.state(), top, m_gs))
                                      {
+                                         hctpNativeVu1Census(m_memory.getVU1Code(), censusPc, false, censusT0, 1);
                                          m_chain.noteVu1Run(0u);
                                          return;
                                      }
-                                     hctpNativeVu1Census(m_memory.getVU1Code(), m_vu1.state().pc, false);
                                      hctpNativeVu1BeforeResume(m_memory.getVU1Code(), m_memory.getVU1Data(),
                                                                m_vu1.state(), top);
-                                     m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
-                                                  m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                  m_gs, &m_memory, top, itop, 65536);
+                                     {
+                                         ps2_perf_split::PhaseScope interp(ps2_perf_split::PhVu1Int);
+                                         m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                      m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                      m_gs, &m_memory, top, itop, 65536);
+                                     }
+                                     hctpNativeVu1Census(m_memory.getVU1Code(), censusPc, false, censusT0, 0);
                                      hctpNativeVu1AfterResume(m_memory.getVU1Data());
+                                     hctpNativeVu1AfterFirstChunk(m_vu1.state());
                                      hctpNativeVu1AfterMscalGeneric(m_memory.getVU1Data()); // p14 verify
                                      m_chain.noteVu1Run((m_vu1.state().stoppedByD ? 0x0200u : 0u) |
                                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u)); });
@@ -1163,8 +1210,24 @@ bool PS2Runtime::initialize(const char *title)
             }
             else if (!renderer || std::strcmp(renderer, "cpu") != 0)
             {
-                m_gs.setRasterBackend(std::make_unique<GSD3D11Backend>());
-                std::cerr << "[runtime] GS: Direct3D 11 renderer (native host)" << std::endl;
+                // HCTP_GS_THREAD (default on): the D3D11 renderer runs on its own GSThread, fed in order through
+                // GSThreadedBackend's command ring, so ChainThread only runs VIF1 / VU1 / the GS front end. =0 = the
+                // renderer on ChainThread as before. VENDETTA_GS_RING_MB sizes the ring (default 8).
+                const char *gsThread = std::getenv("HCTP_GS_THREAD");
+                if (!gsThread || std::strcmp(gsThread, "0") != 0)
+                {
+                    GSThreadedBackend::Options options;
+                    const char *ringMb = std::getenv("VENDETTA_GS_RING_MB");
+                    options.ringBytes = size_t{ringMb && *ringMb ? std::strtoul(ringMb, nullptr, 10) : 8u} << 20u;
+                    options.sync = std::getenv("VENDETTA_GS_SYNC") && std::strcmp(std::getenv("VENDETTA_GS_SYNC"), "0") != 0;
+                    m_gs.setRasterBackend(std::make_unique<GSThreadedBackend>(std::make_unique<GSD3D11Backend>(), options));
+                    std::cerr << "[runtime] GS: Direct3D 11 renderer (native host) on its own GS thread" << std::endl;
+                }
+                else
+                {
+                    m_gs.setRasterBackend(std::make_unique<GSD3D11Backend>());
+                    std::cerr << "[runtime] GS: Direct3D 11 renderer (native host)" << std::endl;
+                }
             }
             else
                 std::cerr << "[runtime] GS: CPU renderer (native host, HCTP_RENDERER=cpu)" << std::endl;

@@ -634,6 +634,155 @@ bool hctpNativeVu1TryDraw(const uint8_t *code, uint8_t *data, const VU1State &st
     return true;
 }
 
+// p08 / p18 first chunk of a batch: the MSCAL ends at once (E bit at 0x2a08 / 0x2a00) and the first MSCNT resumes in
+// the setup (0x2a18 / 0x2a10), run once per batch before the loop body (0x2a90 / 0x2ab0) - so that chunk always went to
+// the interpreter. The setup is done here on the real VU1 state and the pc set to the loop head (B to the body, NOP in
+// the delay slot), so the first chunk takes the native path as well (or the VU1 resumes from the loop head).
+// Setup (raw ELF words, SLUS_207.87): vi14 = 824; vf1 = [1006]; vf2 = [1007] * [1019]; vf3 = [1019]; vf15.xy = [1008].xy;
+// vi8 = MTIR vf15.y; vf29.xy = [1009].xy; vf15.w = 2047, vf15.z = -2048, vf15.x -= 2047; vf11.w = 1024;
+// vi12 = ILW [1008].z; vi1 = 1008; I = 1024. p08: vf1.xyz *= 255, vf1.w *= 128. p18: vf2.w = 0, vf30 = (1,1,1,0),
+// vf31 = [1011]. HCTP_NATIVE_SETUP=0: off. HCTP_NATIVE_VERIFY=1: the VU1 runs the setup itself and the registers it
+// leaves (the ones the loop body only reads) are compared afterwards ([nvu1] setup).
+namespace
+{
+    bool g_setupPending = false;
+    VU1State g_setupExpected;
+    int g_setupProg = 0;
+    uint64_t g_setupRuns[2] = {}, g_setupBad[2] = {};
+
+    bool firstChunkSetup(const uint8_t *code, const uint8_t *data, VU1State &s, int &prog)
+    {
+        if (s.branchPending || s.ebit || s.haltAfterDelaySlot || (s.pc != 0x2a18u && s.pc != 0x2a10u))
+            return false;
+        static uint64_t s_sig = 0, s_hash = 0;
+        uint64_t sig;
+        std::memcpy(&sig, code + 0x2a10u, 8);
+        if (sig != s_sig)
+        {
+            s_sig = sig;
+            s_hash = codeHash(code);
+        }
+        if (s.pc == 0x2a18u && s_hash == kP08Hash)
+            prog = 0;
+        else if (s.pc == 0x2a10u && s_hash == kP18Hash)
+            prog = 1;
+        else
+            return false;
+        auto ld = [&](uint32_t qw, float *dst, int lanes)
+        { std::memcpy(dst, data + qw * 16u, static_cast<size_t>(lanes) * 4u); };
+        if (prog == 1)
+        {
+            s.vf[30][0] = 1.0f, s.vf[30][1] = 1.0f, s.vf[30][2] = 1.0f, s.vf[30][3] = 0.0f;
+            ld(1011u, s.vf[31], 4);
+        }
+        s.vi[14] = 824;
+        ld(1006u, s.vf[1], 4);
+        ld(1007u, s.vf[2], 4);
+        ld(1019u, s.vf[3], 4);
+        ld(1008u, s.vf[15], 2);
+        s.vf[15][3] = 2047.0f;
+        uint32_t f;
+        std::memcpy(&f, &s.vf[15][1], 4);
+        s.vi[8] = static_cast<int16_t>(f & 0xFFFFu);
+        for (int c = 0; c < 4; ++c)
+            s.vf[2][c] *= s.vf[3][c];
+        ld(1009u, s.vf[29], 2);
+        if (prog == 0)
+        {
+            s.vf[1][0] *= 255.0f, s.vf[1][1] *= 255.0f, s.vf[1][2] *= 255.0f;
+            s.vf[1][3] *= 128.0f;
+        }
+        else
+            s.vf[2][3] = 0.0f;
+        s.vf[15][2] = -2048.0f;
+        s.vf[15][0] -= s.vf[15][3];
+        s.vf[11][3] = 1024.0f;
+        std::memcpy(&f, data + 1008u * 16u + 8u, 4);
+        s.vi[12] = static_cast<int16_t>(f & 0xFFFFu);
+        s.vi[1] = 1008;
+        s.i = 1024.0f;
+        s.pc = prog == 0 ? kP08LoopHead : kP18LoopHead;
+        return true;
+    }
+}
+
+bool hctpNativeVu1P00(const uint8_t *code, const uint8_t *data, uint32_t startPC, VU1State &st)
+{
+    // raw ELF words of p00 (SLUS_207.87 0x44c6e8), lower then upper per pair
+    static const uint32_t kP00[24] = {
+        0x100F0000u, 0x000002FFu, 0x100A03F8u, 0x000002FFu, 0x81ED537Cu, 0x000002FFu, 0x81EE537Cu, 0x000002FFu,
+        0x81EF537Cu, 0x000002FFu, 0x81F0537Cu, 0x000002FFu, 0x81FA537Cu, 0x000002FFu, 0x81FB537Cu, 0x000002FFu,
+        0x81FC537Cu, 0x000002FFu, 0x81FD537Cu, 0x000002FFu, 0x8000033Cu, 0x400002FFu, 0x8000033Cu, 0x000002FFu};
+    static const bool s_on = !(std::getenv("HCTP_NATIVE_P00") && std::getenv("HCTP_NATIVE_P00")[0] == '0');
+    if (!s_on || !code || !data || startPC != 0u || std::memcmp(code, kP00, sizeof(kP00)) != 0)
+        return false;
+    static const int kRegs[8] = {13, 14, 15, 16, 26, 27, 28, 29};
+    for (int i = 0; i < 8; ++i)
+        std::memcpy(st.vf[kRegs[i]], data + (1016u + i) * 16u, 16u);
+    st.vi[15] = 0;
+    st.vi[10] = 1024;
+    return true;
+}
+
+void hctpNativeVu1FirstChunk(const uint8_t *code, const uint8_t *data, VU1State &st)
+{
+    static const bool s_on = !(std::getenv("HCTP_NATIVE_SETUP") && std::getenv("HCTP_NATIVE_SETUP")[0] == '0');
+    g_setupPending = false;
+    if (!s_on || !code || !data || (!g_native && !g_on))
+        return;
+    int prog = 0;
+    if (g_on)
+    {
+        // verify: the VU1 runs its own setup; ours goes to a copy
+        g_setupExpected = st;
+        if (firstChunkSetup(code, data, g_setupExpected, prog))
+        {
+            g_setupPending = true;
+            g_setupProg = prog;
+        }
+        return;
+    }
+    firstChunkSetup(code, data, st, prog);
+}
+
+void hctpNativeVu1AfterFirstChunk(const VU1State &st)
+{
+    if (!g_setupPending)
+        return;
+    g_setupPending = false;
+    const VU1State &e = g_setupExpected;
+    const int p = g_setupProg;
+    auto same = [](const float *a, const float *b, int lanes) { return std::memcmp(a, b, static_cast<size_t>(lanes) * 4u) == 0; };
+    uint32_t bad = 0;
+    bad |= same(st.vf[1], e.vf[1], 4) ? 0u : 1u;
+    bad |= same(st.vf[2], e.vf[2], 4) ? 0u : 2u;
+    bad |= same(st.vf[15], e.vf[15], 4) ? 0u : 4u;
+    bad |= same(st.vf[29], e.vf[29], 2) ? 0u : 8u;
+    bad |= st.vf[11][3] == e.vf[11][3] ? 0u : 16u;
+    bad |= st.vi[8] == e.vi[8] ? 0u : 32u;
+    bad |= st.vi[14] == e.vi[14] ? 0u : 64u;
+    if (p == 1)
+        bad |= (same(st.vf[30], e.vf[30], 4) ? 0u : 128u) | (same(st.vf[31], e.vf[31], 4) ? 0u : 256u);
+    ++g_setupRuns[p];
+    if (bad)
+    {
+        ++g_setupBad[p];
+        static int s_logs = 0;
+        if (s_logs++ < 12)
+            std::fprintf(stderr, "[nvu1] setup p%02d mismatch mask=0x%x vf15 vu=(%g %g %g %g) ours=(%g %g %g %g) vi8 %d/%d vi14 %d/%d%c",
+                         p ? 18 : 8, bad, st.vf[15][0], st.vf[15][1], st.vf[15][2], st.vf[15][3], e.vf[15][0], e.vf[15][1],
+                         e.vf[15][2], e.vf[15][3], st.vi[8], e.vi[8], st.vi[14], e.vi[14], 10);
+    }
+    static auto s_last = std::chrono::steady_clock::now();
+    if (std::chrono::steady_clock::now() - s_last > std::chrono::seconds(5))
+    {
+        s_last = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "[nvu1] setup p08 runs=%llu bad=%llu p18 runs=%llu bad=%llu%c",
+                     static_cast<unsigned long long>(g_setupRuns[0]), static_cast<unsigned long long>(g_setupBad[0]),
+                     static_cast<unsigned long long>(g_setupRuns[1]), static_cast<unsigned long long>(g_setupBad[1]), 10);
+    }
+}
+
 void hctpNativeVu1BeforeResume(const uint8_t *code, const uint8_t *data, const VU1State &st, uint32_t top)
 {
     g_linePending = false;
@@ -962,38 +1111,68 @@ void hctpNativeVu1AfterMscal(const uint8_t *data)
 #include <map>
 #include <mutex>
 
-void hctpNativeVu1Census(const uint8_t *code, uint32_t pc, bool mscal)
+static bool vu1CensusOn()
 {
     static const bool s_on = std::getenv("HCTP_VU1_CENSUS") != nullptr;
-    if (!s_on || !code)
+    return s_on;
+}
+
+uint64_t hctpNativeVu1CensusNow()
+{
+    if (!vu1CensusOn())
+        return 0;
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+void hctpNativeVu1Census(const uint8_t *code, uint32_t pc, bool mscal, uint64_t t0, int native)
+{
+    if (!t0 || !code)
         return;
+    const uint64_t ns = hctpNativeVu1CensusNow() - t0;
+    struct Entry { uint32_t pc; uint64_t hash; int native; uint64_t runs, ns; };
     static std::mutex s_lock;
-    static std::map<uint64_t, uint64_t> s_counts; // (hash of the 512 bytes at the program base) ^ pc -> runs
-    static std::map<uint64_t, std::pair<uint32_t, uint64_t>> s_keys;
+    static std::map<uint64_t, Entry> s_entries; // (hash of the 512 bytes at the program base) ^ pc ^ kind -> runs, time
     static auto s_last = std::chrono::steady_clock::now();
     // program base: the overlay slot 0x2a00 for PCs inside it, the resident programs' own starts otherwise
     const uint32_t base = (pc >= 0x2a00u && pc < 0x3040u) ? 0x2a00u : (pc >= 0x3040u && pc < 0x3740u) ? 0x3040u
                           : (pc >= 0x3740u && pc < 0x3d90u) ? 0x3740u : (pc & ~0xFFu);
-    uint64_t h = 1469598103934665603ull;
-    for (uint32_t i = 0; i < 0x200u && base + i < 0x4000u; ++i)
-        h = (h ^ code[base + i]) * 1099511628211ull;
-    const uint64_t key = h ^ (static_cast<uint64_t>(pc) << 1) ^ (mscal ? 1u : 0u);
+    // hashing 512 bytes per run was ~19% of the chain worker: re-hash only when the program's first words change
+    static thread_local uint32_t s_base[4] = {~0u, ~0u, ~0u, ~0u};
+    static thread_local uint64_t s_sig[4] = {}, s_h[4] = {};
+    const uint32_t slot = (base >> 8) & 3u;
+    uint64_t sig;
+    std::memcpy(&sig, code + ((base + 0x10u) & 0x3FF8u), 8);
+    if (s_base[slot] != base || s_sig[slot] != sig)
+    {
+        uint64_t hh = 1469598103934665603ull;
+        for (uint32_t i = 0; i < 0x200u && base + i < 0x4000u; ++i)
+            hh = (hh ^ code[base + i]) * 1099511628211ull;
+        s_base[slot] = base, s_sig[slot] = sig, s_h[slot] = hh;
+    }
+    const uint64_t h = s_h[slot];
+    const uint64_t key = h ^ (static_cast<uint64_t>(pc) << 1) ^ (mscal ? 1u : 0u) ^ (static_cast<uint64_t>(native) << 40);
     std::lock_guard<std::mutex> lock(s_lock);
-    ++s_counts[key];
-    s_keys[key] = {pc | (mscal ? 0x80000000u : 0u), h};
+    Entry &e = s_entries[key];
+    e.pc = pc | (mscal ? 0x80000000u : 0u);
+    e.hash = h;
+    e.native = native;
+    ++e.runs;
+    e.ns += ns;
     const auto now = std::chrono::steady_clock::now();
     if (now - s_last < std::chrono::seconds(10))
         return;
     s_last = now;
-    std::vector<std::pair<uint64_t, uint64_t>> v(s_counts.begin(), s_counts.end());
-    std::sort(v.begin(), v.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+    std::vector<Entry> v;
+    for (const auto &kv : s_entries)
+        v.push_back(kv.second);
+    std::sort(v.begin(), v.end(), [](const Entry &x, const Entry &y) { return x.ns > y.ns; });
     for (size_t i = 0; i < v.size() && i < 16; ++i)
-    {
-        const auto &k = s_keys[v[i].first];
-        std::fprintf(stderr, "[vu1census] %s pc=0x%04x hash=%016llx runs=%llu%c", (k.first & 0x80000000u) ? "MSCAL" : "MSCNT",
-                     k.first & 0xFFFFu, static_cast<unsigned long long>(k.second), static_cast<unsigned long long>(v[i].second), 10);
-    }
-    s_counts.clear();
+        std::fprintf(stderr, "[vu1census] %s %s pc=0x%04x hash=%016llx runs=%llu ms=%.1f us/run=%.2f%c",
+                     (v[i].pc & 0x80000000u) ? "MSCAL" : "MSCNT", v[i].native ? "native" : "interp", v[i].pc & 0xFFFFu,
+                     static_cast<unsigned long long>(v[i].hash), static_cast<unsigned long long>(v[i].runs), v[i].ns / 1e6,
+                     v[i].ns / 1e3 / static_cast<double>(v[i].runs), 10);
+    s_entries.clear();
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1143,47 +1322,58 @@ namespace
             for (int c = 0; c < 4; ++c)
                 r[c] *= qv;
         };
-        uint32_t in = 0u, out = 501u;
-        for (int32_t i = 0; i < outer * inner; ++i, ++in, out += 5u)
+        // one particle per outer pass (pos [i], colour [80+i], size [160+i]); the inner loop branches back to 0x2b30
+        // (SUB vf1 -= vf14), not to the loads: it draws `inner` sprites stepping back along size*scale - a streak
+        uint32_t out = 501u;
+        for (uint32_t in = 0u; in < static_cast<uint32_t>(outer); ++in)
         {
             const float *size = qwf(data, 160u + in), *pos = qwf(data, in);
-            float colour[4], base[4], ca[4], cb[4], pa[4], pb[4];
+            float colour[4], step[4], base[4];
             std::memcpy(colour, qwf(data, 80u + in), 16);
             for (int c = 0; c < 4; ++c)
             {
-                base[c] = pos[c] - size[c] * scale;
-                ca[c] = off0[c] + base[c];
-                cb[c] = off1[c] + base[c];
+                step[c] = size[c] * scale;
+                base[c] = pos[c];
             }
-            project(ca, pa);
-            project(cb, pb);
-            float da[4], db[4];
-            for (int c = 0; c < 4; ++c)
+            for (int32_t j = 0; j < inner; ++j, out += 5u)
             {
-                da[c] = pa[c] - centre[c];
-                db[c] = pb[c] - centre[c];
-            }
-            // flags after the 4 CLIPs: [vf4 vs 23][vf13 vs 23][vf4 vs 24][vf13 vs 24]; FCAND 0x108 = bit 3 (-y of the
-            // last) | bit 8 (+y of the third)
-            const uint32_t flags = (clipBits(da, b23) << 18) | (clipBits(db, b23) << 12) | (clipBits(da, b24) << 6) | clipBits(db, b24);
-            int32_t xa[4], xb[4];
-            if (flags & 0x108u)
-            {
-                const int32_t z[4] = {0, 0, 0, 16};
-                std::memcpy(xa, z, 16);
-                std::memcpy(xb, z, 16);
-            }
-            else
+                float ca[4], cb[4], pa[4], pb[4];
                 for (int c = 0; c < 4; ++c)
                 {
-                    xa[c] = ftoi4(pa[c]);
-                    xb[c] = ftoi4(pb[c]);
+                    base[c] -= step[c];
+                    ca[c] = off0[c] + base[c];
+                    cb[c] = off1[c] + base[c];
                 }
-            std::memcpy(data + (out & 0x3FFu) * 16u, colour, 16);
-            std::memcpy(data + ((out + 1u) & 0x3FFu) * 16u, uv0, 16);
-            std::memcpy(data + ((out + 2u) & 0x3FFu) * 16u, xa, 16);
-            std::memcpy(data + ((out + 3u) & 0x3FFu) * 16u, uv1, 16);
-            std::memcpy(data + ((out + 4u) & 0x3FFu) * 16u, xb, 16);
+                project(ca, pa);
+                project(cb, pb);
+                float da[4], db[4];
+                for (int c = 0; c < 4; ++c)
+                {
+                    da[c] = pa[c] - centre[c];
+                    db[c] = pb[c] - centre[c];
+                }
+                // flags after the 4 CLIPs: [vf4 vs 23][vf13 vs 23][vf4 vs 24][vf13 vs 24]; FCAND 0x108 = bit 3 (-y of the
+                // last) | bit 8 (+y of the third)
+                const uint32_t flags = (clipBits(da, b23) << 18) | (clipBits(db, b23) << 12) | (clipBits(da, b24) << 6) | clipBits(db, b24);
+                int32_t xa[4], xb[4];
+                if (flags & 0x108u)
+                {
+                    const int32_t z[4] = {0, 0, 0, 16};
+                    std::memcpy(xa, z, 16);
+                    std::memcpy(xb, z, 16);
+                }
+                else
+                    for (int c = 0; c < 4; ++c)
+                    {
+                        xa[c] = ftoi4(pa[c]);
+                        xb[c] = ftoi4(pb[c]);
+                    }
+                std::memcpy(data + (out & 0x3FFu) * 16u, colour, 16);
+                std::memcpy(data + ((out + 1u) & 0x3FFu) * 16u, uv0, 16);
+                std::memcpy(data + ((out + 2u) & 0x3FFu) * 16u, xa, 16);
+                std::memcpy(data + ((out + 3u) & 0x3FFu) * 16u, uv1, 16);
+                std::memcpy(data + ((out + 4u) & 0x3FFu) * 16u, xb, 16);
+            }
         }
         std::memcpy(data + 500u * 16u, data + 489u * 16u, 16);
         kickAt(data, 500u, kicks);
@@ -1344,13 +1534,44 @@ bool hctpNativeVu1MscalGeneric(const uint8_t *code, uint8_t *data, uint32_t star
             g_genPending = &g;
             return false;
         }
+        const uint64_t tRun = hctpNativeVu1CensusNow();
         if (!g.run(data, kicks))
         {
             ++g.fails;
             return false; // inputs outside what the native handles: the VU1 runs it
         }
+        const uint64_t tMath = hctpNativeVu1CensusNow();
         for (const auto &k : kicks)
             gs.processGIFPacket(k.data(), static_cast<uint32_t>(k.size()), 1u);
+        if (tMath)
+        {
+            // HCTP_VU1_CENSUS=1: the native run's time split into the maths (g.run + kick copies) and the GS packets
+            const uint64_t tEnd = hctpNativeVu1CensusNow();
+            static uint64_t s_math[8] = {}, s_gif[8] = {}, s_runs[8] = {}, s_kicks[8] = {}, s_bytes[8] = {};
+            static auto s_last = std::chrono::steady_clock::now();
+            const size_t gi = static_cast<size_t>(&g - g_generic);
+            s_math[gi] += tMath - tRun;
+            s_gif[gi] += tEnd - tMath;
+            ++s_runs[gi];
+            s_kicks[gi] += kicks.size();
+            for (const auto &k : kicks)
+                s_bytes[gi] += k.size();
+            if (std::chrono::steady_clock::now() - s_last > std::chrono::seconds(10))
+            {
+                s_last = std::chrono::steady_clock::now();
+                for (size_t i = 0; i < sizeof(g_generic) / sizeof(g_generic[0]); ++i)
+                    if (s_runs[i])
+                        std::fprintf(stderr, "[vu1census] split %s runs=%llu math ms=%.1f gif ms=%.1f kicks/run=%.1f bytes/run=%.0f%c",
+                                     g_generic[i].name, static_cast<unsigned long long>(s_runs[i]), s_math[i] / 1e6,
+                                     s_gif[i] / 1e6, static_cast<double>(s_kicks[i]) / s_runs[i],
+                                     static_cast<double>(s_bytes[i]) / s_runs[i], 10);
+                std::memset(s_math, 0, sizeof(s_math));
+                std::memset(s_gif, 0, sizeof(s_gif));
+                std::memset(s_runs, 0, sizeof(s_runs));
+                std::memset(s_kicks, 0, sizeof(s_kicks));
+                std::memset(s_bytes, 0, sizeof(s_bytes));
+            }
+        }
         ++g.nativeRuns;
         genericReport();
         return true;

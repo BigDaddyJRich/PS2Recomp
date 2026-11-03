@@ -2027,7 +2027,15 @@ bool VU1Interpreter::ensureDecodedCodeCache(const uint8_t *vuCode, uint32_t code
         // only when the log no longer reaches back. The game uploads its programs many times a frame; decoding all
         // 2,048 pairs each time was ~10% of the chain worker in a 4-player match.
         uint32_t begin = 0u, end = 0u;
-        if (m_unit == Unit::VU1 && ps2_vu_code_log::writtenSince(memory, m_cachedCodeGeneration, generation, begin, end))
+        // HCTP: when the log no longer reaches back (thousands of overlay uploads between two interpreter runs, now
+        // that the hot programs run natively), compare every pair's words instead: only changed pairs re-decode.
+        const bool logged = m_unit == Unit::VU1 && ps2_vu_code_log::writtenSince(memory, m_cachedCodeGeneration, generation, begin, end);
+        if (!logged && m_unit == Unit::VU1)
+        {
+            begin = 0u;
+            end = codeSize;
+        }
+        if (m_unit == Unit::VU1)
         {
             ps2_host_profile::count(ps2_host_profile::Vu1DecodePartial);
             const uint32_t pairCount = std::min<uint32_t>(codeSize / 8u, kMaxDecodedPairs);
@@ -2178,6 +2186,51 @@ void VU1Interpreter::reportReservedInstruction(bool upper, uint32_t instruction)
               << " instruction=0x" << instruction
               << std::dec << '\n');
     m_stopRequested = true;
+}
+
+bool VU1Interpreter::fastEntryAllowed() const
+{
+    // execute() itself resets the scheduler (an XGKICK in flight is cleared) and restarts whatever ran last, so a
+    // replacement may start in the same states
+    return m_unit == Unit::VU1;
+}
+
+void VU1Interpreter::fastEntryDone(uint32_t pcAfter, uint32_t top, uint32_t itop)
+{
+    resetScheduler();
+    m_state.pc = pcAfter & microAddressMask();
+    m_state.ebit = false;
+    m_state.haltAfterDelaySlot = false;
+    m_state.stoppedByD = false;
+    m_state.stoppedByT = false;
+    m_state.top = top;
+    m_state.itop = itop;
+    m_state.branchPending = false;
+    m_state.branchTarget = 0;
+    m_state.branchDelay = 0;
+    m_state.vf[0][0] = 0.0f;
+    m_state.vf[0][1] = 0.0f;
+    m_state.vf[0][2] = 0.0f;
+    m_state.vf[0][3] = 1.0f;
+    m_lastRunEnded = true;
+}
+
+bool VU1Interpreter::executeEmptyEntry(const uint8_t *vuCode, uint32_t startPC, uint32_t top, uint32_t itop)
+{
+    static const bool enabled = !(std::getenv("HCTP_VU1_EMPTY_ENTRY") && std::getenv("HCTP_VU1_EMPTY_ENTRY")[0] == '0');
+    if (!enabled || !fastEntryAllowed())
+        return false;
+    const uint32_t pc = startPC & microAddressMask();
+    if (pc + 24u > PS2_VU1_CODE_SIZE)
+        return false;
+    uint32_t w[6];
+    std::memcpy(w, vuCode + pc, sizeof(w)); // lower, upper per pair: NOP, NOP+E, then the delay slot NOP
+    constexpr uint32_t kLowerNop = 0x8000033Cu, kUpperNop = 0x000002FFu, kEBit = 1u << 30;
+    if (w[0] != kLowerNop || w[1] != kUpperNop || w[2] != kLowerNop || w[3] != (kUpperNop | kEBit) ||
+        w[4] != kLowerNop || w[5] != kUpperNop)
+        return false;
+    fastEntryDone(pc + 24u, top, itop); // where the interpreter stops: after the E bit's delay slot
+    return true;
 }
 
 void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,

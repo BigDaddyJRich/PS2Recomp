@@ -58,6 +58,15 @@ public:
 
     void reset();
 
+    // HCTP: MSCAL on an empty overlay entry (NOP|NOP, NOP|NOP+E, NOP|NOP delay slot: p08 at 0x2a00): the
+    // state execute() + run() would leave (pc = entry + 0x18, TOP/ITOP set) without the interpreter's
+    // per-call cost. False = not that shape; run execute(). HCTP_VU1_EMPTY_ENTRY=0: off.
+    bool executeEmptyEntry(const uint8_t *vuCode, uint32_t startPC, uint32_t top, uint32_t itop);
+    // For host-side replacements of whole short MSCAL programs: allowed = VU1 (as execute(), any prior state);
+    // done = the state a finished execute() leaves (pc = pcAfter, TOP/ITOP, scheduler reset, vf0).
+    bool fastEntryAllowed() const;
+    void fastEntryDone(uint32_t pcAfter, uint32_t top, uint32_t itop);
+
     void execute(uint8_t *vuCode, uint32_t codeSize,
                  uint8_t *vuData, uint32_t dataSize,
                  GS &gs, PS2Memory *memory = nullptr,

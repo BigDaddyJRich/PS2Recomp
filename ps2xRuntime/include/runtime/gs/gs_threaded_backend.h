@@ -11,7 +11,8 @@
 #include <thread>
 #include <vector>
 
-// The GS renderer on its own thread (the default; VENDETTA_GS_ASYNC=0 draws on the game thread). The GS front end stays on the game thread (register state,
+// The GS renderer on its own thread (the default; VENDETTA_GS_ASYNC=0 draws on the game thread). The inner renderer
+// is a GSCpuBackend, or (HCTP_GS_THREAD, Nov 2) the D3D11 renderer: then the producer is ChainThread. The GS front end stays on the game thread (register state,
 // GIF parsing, CSR / SIGNAL / FINISH: everything the game can read is produced as before); only the renderer moves.
 // Its calls go, in order, into a single-producer / single-consumer ring of command records, and the GS thread runs
 // them on the GSCpuBackend it owns. Calls that return something wait until every earlier command has run, then run
@@ -27,7 +28,7 @@ public:
         bool verifyStream = false;           // VENDETTA_GS_VERIFY: hash the commands on both sides
     };
 
-    GSThreadedBackend(std::unique_ptr<GSCpuBackend> inner, const Options &options);
+    GSThreadedBackend(std::unique_ptr<GSRasterBackend> inner, const Options &options);
     ~GSThreadedBackend() override;
 
     void Initialize(uint8_t *vram, uint32_t vramSize) override;
@@ -103,7 +104,10 @@ private:
     void execute(const Header &header, const uint8_t *payload);
     void publishProgress(uint64_t readPos);
 
-    std::unique_ptr<GSCpuBackend> m_inner;
+    std::unique_ptr<GSRasterBackend> m_inner;
+    // GSCpuBackend: ClearFramebuffer's result is known without running it and GetTransferSnapshot locks its own
+    // state. Any other renderer (D3D11) answers those after a drain.
+    bool m_innerIsCpu = false;
     Options m_options;
     std::unique_ptr<uint8_t[]> m_ringStorage;
     uint8_t *m_ring = nullptr;
