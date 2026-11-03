@@ -734,7 +734,17 @@ bool hctpNativeVu1TryDraw(const uint8_t *code, uint8_t *data, const VU1State &st
             // leave the kicked packet in VU memory at TOP+33 as the VU1 would: later VU work reads it back (without
             // it: big translucent wedges over the mat / stage, Nov 3). HCTP_GPU_CHARS_VUMEM=0: off (+ lite corners)
             static const bool s_vumem = [] { const char *m = std::getenv("HCTP_GPU_CHARS_VUMEM"); return !(m && m[0] == '0'); }();
-            if (s_vumem)
+            static const bool s_poison = [] { const char *m = std::getenv("HCTP_GPU_CHARS_POISON"); return m && m[0] == '1'; }();
+            if (s_poison)
+            {
+                // probe: marker instead of the packet; GS::processGIFPacket logs any packet that carries it
+                extern bool g_hctpGpuPoison;
+                g_hctpGpuPoison = true;
+                const uint32_t pw[4] = {0x7FBADC0Du, 0x7FBADC0Du, 0x7FBADC0Du, 0x7FBADC0Du};
+                for (uint32_t i = 0; i < 1u + 3u * g_count; ++i)
+                    std::memcpy(data + ((top + 33u + i) & 0x3FFu) * 16u, pw, 16);
+            }
+            else if (s_vumem)
             {
                 std::memcpy(data + ((top + 33u) & 0x3FFu) * 16u, data + (top & 0x3FFu) * 16u, 16);
                 for (uint32_t k = 0; k < g_count; ++k)

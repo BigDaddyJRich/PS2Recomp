@@ -1199,8 +1199,27 @@ bool GS::submitNativeTris(uint64_t tagLo, uint64_t tagHi, const GSNativeVtx *v, 
     return true;
 }
 
+bool g_hctpGpuPoison = false;
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint8_t path)
 {
+    if (g_hctpGpuPoison && data)
+    {
+        for (uint32_t o = 0; o + 4 <= sizeBytes; o += 4)
+        {
+            uint32_t w;
+            std::memcpy(&w, data + o, 4);
+            if (w == 0x7FBADC0Du)
+            {
+                static int s_logs = 0;
+                uint64_t t[2];
+                std::memcpy(t, data, 16);
+                if (s_logs++ < 40)
+                    std::fprintf(stderr, "[poison] GS path=%u size=%u at=%u tag %016llx %016llx%c", path, sizeBytes, o,
+                                 static_cast<unsigned long long>(t[0]), static_cast<unsigned long long>(t[1]), 10);
+                break;
+            }
+        }
+    }
     if (path == 1u && g_hctpPath1Capture && data && sizeBytes)
         g_hctpPath1Capture->insert(g_hctpPath1Capture->end(), data, data + sizeBytes);
     gateForeignCall();
