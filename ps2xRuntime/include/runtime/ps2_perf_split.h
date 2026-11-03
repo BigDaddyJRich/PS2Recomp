@@ -42,10 +42,17 @@ namespace ps2_perf_split
         PhRtSync,  // RT / depth readback into the CPU VRAM mirror (syncRtToVram / syncDepthRect)
         PhXfer,    // BeginTransfer / UploadImage (host->local into the CPU VRAM mirror)
         PhPresent, // runPresent
+        // parts of vu1nat (hctp_native_vu1.cpp), exclusive like the others
+        PhNatS1,    // stage-1 skinning + lighting (p01-p04 MSCAL)
+        PhNatChunk, // p08/p18/p11/p19... chunk maths: clip flags, ADC, corners (computeChunk)
+        PhNatGpu,   // GPU-character draw build (corner records -> GSNativeVtx) + submit
+        PhNatGen,   // generic native programs (p17 crowd, p14, p16 ...) via MscalGeneric
+        PhNatP07,   // p07 morph weights
         PhaseCount
     };
     inline const char *const kPhaseNames[PhaseCount] = {"other", "vif", "vu1nat", "vu1int", "gif",
-                                                        "d3d", "texdec", "rtsync", "xfer", "present"};
+                                                        "d3d", "texdec", "rtsync", "xfer", "present",
+                                                        "n-s1", "n-chunk", "n-gpu", "n-gen", "n-p07"};
 
     inline bool enabled()
     {

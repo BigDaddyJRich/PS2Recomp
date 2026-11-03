@@ -4,6 +4,7 @@
 // corner: STQ, RGBA, XYZF2 incl. the backface ADC bit). Every 5 s: corners compared / matching per field.
 // HCTP_NATIVE_P08=1: chunks that need no clipping are drawn from the spec (the packet goes straight to the GS) and
 // the VU1 does not run for them; chunks with a CLIP flag stay on the VU1 (p05/p06 near-plane clipper).
+#include "runtime/ps2_perf_split.h"
 #include "hctp_native_vu1.h"
 
 #include "runtime/gs/gs_frontend.h"
@@ -636,8 +637,11 @@ bool hctpNativeVu1TryDraw(const uint8_t *code, uint8_t *data, const VU1State &st
         ++g_lineChunks;
         return true;
     }
-    if (!g_native || !computeChunk(code, data, st, top))
-        return false;
+    {
+        ps2_perf_split::PhaseScope perfCh(ps2_perf_split::PhNatChunk);
+        if (!g_native || !computeChunk(code, data, st, top))
+            return false;
+    }
     // HCTP_NATIVE_P08_CLIP=0: clipped chunks stay on the VU1 (p05/p06)
     static const char *s_clipEnv = std::getenv("HCTP_NATIVE_P08_CLIP");
     static const bool s_clip = !(s_clipEnv && s_clipEnv[0] == '0');
@@ -655,6 +659,7 @@ bool hctpNativeVu1TryDraw(const uint8_t *code, uint8_t *data, const VU1State &st
     if (s_gpuChars && !g_on && !g_chunkClip && ((s_gpuMask >> g_variant) & 1u) &&
         (g_variant == 0 || g_variant == 1 || g_variant == 3 || g_variant == 5))
     {
+        ps2_perf_split::PhaseScope perfGpu(ps2_perf_split::PhNatGpu);
         const bool p18 = g_variant == 1 || g_variant == 5;
         const float *v1 = q(data, 1006), *v1007 = q(data, 1007), *mat = q(data, 1019), *scroll = q(data, 1009);
         GSNativeVtx base{};
@@ -1229,6 +1234,7 @@ namespace
 
 bool hctpNativeVu1Mscal(const uint8_t *code, uint8_t *data, uint32_t startPC)
 {
+    ps2_perf_split::PhaseScope perfPh(ps2_perf_split::PhNatS1);
     static const bool s_init = []
     {
         const char *e = std::getenv("HCTP_NATIVE_P01");
@@ -1646,6 +1652,7 @@ namespace
 
 bool hctpNativeVu1MscalGeneric(const uint8_t *code, uint8_t *data, uint32_t startPC, GS &gs)
 {
+    ps2_perf_split::PhaseScope perfPh(ps2_perf_split::PhNatGen);
     if (!g_genericInit)
     {
         g_genericInit = true;
@@ -1907,6 +1914,7 @@ namespace
 
 bool hctpNativeVu1P07State(const uint8_t *code, uint8_t *data, uint32_t startPC, VU1State &st)
 {
+    ps2_perf_split::PhaseScope perfPh(ps2_perf_split::PhNatP07);
     static const char *e = std::getenv("HCTP_NATIVE_P07S");
     static const bool s_on = !(e && e[0] == '0');
     static const bool s_verify = std::getenv("HCTP_P07_VERIFY") && std::getenv("HCTP_P07_VERIFY")[0] == '1';
