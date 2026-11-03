@@ -212,6 +212,10 @@ namespace
         else
             return false;
         const bool p18 = g_variant == 1 || g_variant == 5; // p19 = p18's colour / STQ
+        // GPU character path: only the clip flags, the backface ADC and the last corner's RGBA / STQ are needed here
+        static const bool s_gpuLite = [] { const char *e = std::getenv("HCTP_GPU_CHARS"); return !(e && e[0] == '0'); }();
+        static thread_local bool t_full = false; // a clipped chunk: the CPU clipper needs every corner's outputs
+        const bool lite = s_gpuLite && !g_on && !t_full && (g_variant == 0 || g_variant == 1 || g_variant == 3 || g_variant == 5);
 
         uint32_t header;
         std::memcpy(&header, data + (top & 0x3FFu) * 16u, 4);
@@ -239,6 +243,16 @@ namespace
             const float *P = q(data, idx + 320u), *N = q(data, idx + 160u), *Lc = q(data, idx + 480u);
             const float light[4] = {Lc[0], Lc[1], Lc[2], p18 ? Lc[3] : 1.0f};
             Corner &o = g_expected[k];
+            if (lite && k + 1u < count)
+            {
+                o.xyz[3] = 0; // ADC below
+                const float cx = P[0] + offXY, cy = P[1] + offXY, cz = q(data, idx)[2] + offZ;
+                o.flagged = g_variant != 5 && (std::fabs(cx) > band || std::fabs(cy) > band || cz < -guard);
+                if (o.flagged)
+                    g_chunkClip = true;
+            }
+            else
+            {
             for (int c = 0; c < 4; ++c)
             {
                 float col = g_variant == 6 ? s1[c] * light[c] + s2[c] : c1[c] * s1[c] * light[c] + c1[c] * s2[c];
@@ -300,6 +314,7 @@ namespace
                 ++g_projN;
                 g_projOk += std::fabs(o.clip[0] / o.clip[3] - P[0]) < 0.05f && std::fabs(o.clip[1] / o.clip[3] - P[1]) < 0.05f;
             }
+            }
             // backface (3rd corner on): cross z of (P[k-2]-P[k-1]) x (P[k-1]-P[k]), sign + strip parity, & vi8 -> ADC
             if (k >= 2u && g_variant != 5)
             {
@@ -311,6 +326,13 @@ namespace
                 if (v & cullMask)
                     o.xyz[3] = (o.xyz[3] & 0xFFFF) | 0x8000;
             }
+        }
+        if (lite && g_chunkClip)
+        {
+            t_full = true;
+            const bool ok = computeChunk(code, data, st, top);
+            t_full = false;
+            return ok;
         }
         g_top = top;
         g_count = count;
