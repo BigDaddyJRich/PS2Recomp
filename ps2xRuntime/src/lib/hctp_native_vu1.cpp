@@ -684,13 +684,20 @@ bool hctpNativeVu1TryDraw(const uint8_t *code, uint8_t *data, const VU1State &st
             o.c0[3] = p18 ? 1.0f : q(data, idx + 160u)[3];
             s_tris.push_back(o);
         };
+        // each corner built once, then copied into the triangles that use it (was rebuilt 3x per triangle)
+        static thread_local std::vector<GSNativeVtx> s_corners;
+        s_corners.clear();
+        for (uint32_t k = 0; k < g_count; ++k)
+            corner(k);
+        s_corners.swap(s_tris); // s_corners = the corners, s_tris empty (s_corners was cleared above)
+        s_tris.reserve(static_cast<size_t>(g_count) * 3u);
         for (uint32_t k = 2; k < g_count; ++k)
         {
             if (g_expected[k].xyz[3] & 0x8000)
                 continue; // ADC: backface-culled corner
-            corner(k - 2u);
-            corner(k - 1u);
-            corner(k);
+            s_tris.push_back(s_corners[k - 2u]);
+            s_tris.push_back(s_corners[k - 1u]);
+            s_tris.push_back(s_corners[k]);
         }
         // HCTP_GPU_CHARS_VERIFY=1: vs_native's maths in C++ against the packet path's corners ([gpuverify])
         static const bool s_verify = [] { const char *v = std::getenv("HCTP_GPU_CHARS_VERIFY"); return v && v[0] == '1'; }();
