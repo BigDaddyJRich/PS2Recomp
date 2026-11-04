@@ -39,6 +39,7 @@ extern thread_local GifPathId g_gifCurrentPath;
 #include <cstring>
 #include <list>
 #include <map>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -46,6 +47,72 @@ namespace ps2host { uint64_t d3dStateEpoch(); } // win32_host.cpp: bumped when t
 
 using Microsoft::WRL::ComPtr;
 using namespace GSInternal;
+
+// HCTP_ZREAD_NODRAIN=1: the game thread answers depth StoreImage reads (CGmLensFlare::ReadZbuffer 0x228d40 PSMZ24,
+// CFlash::SynchCallBack 0x22bd20 PSMZ32) from the depth copy Present made a frame earlier, mapped here by the GS
+// thread, instead of draining the whole GS queue first (27% of the game thread in six-man). Same values the GS
+// thread path writes (syncDepthRectLate), one frame older; the top byte of a Z24-drawn target read as Z32 is 0.
+namespace
+{
+    struct ZMirror
+    {
+        const uint8_t *data = nullptr;
+        uint32_t pitch = 0, scale = 1, w = 0, h = 0, zbp = 0xFFFFFFFFu, dtPsm = 0;
+        const void *slot = nullptr; // the DepthRing it maps
+    };
+    std::mutex g_zmMutex;
+    std::vector<ZMirror> g_zm;
+    std::atomic<uint64_t> g_zmBusy{0}, g_zmHits{0}, g_zmMiss{0}, g_zmMissEmpty{0}, g_zmMissZbp{0}, g_zmMissRect{0};
+}
+
+bool hctpDepthMirrorRead(uint32_t zbp, uint32_t psm, uint32_t x0, uint32_t y0, uint32_t w, uint32_t h, uint8_t *dst)
+{
+    std::lock_guard<std::mutex> lock(g_zmMutex);
+    bool zbpSeen = false;
+    for (const ZMirror &m : g_zm)
+    {
+        if (m.zbp == zbp && m.data)
+            zbpSeen = true;
+        if (m.zbp != zbp || !m.data || x0 + w > m.w || y0 + h > m.h)
+            continue;
+        const uint32_t wpsm = (psm == GS_PSM_Z32 && m.dtPsm == GS_PSM_Z24) ? GS_PSM_Z24 : psm; // depthWritebackPsm
+        const double top = wpsm == GS_PSM_Z32 ? 4294967295.0 : wpsm == GS_PSM_Z24 ? 16777215.0 : 65535.0;
+        for (uint32_t y = y0; y < y0 + h; ++y)
+        {
+            const uint8_t *row = m.data + (y * m.scale + m.scale / 2u) * m.pitch;
+            for (uint32_t x = x0; x < x0 + w; ++x)
+            {
+                float f;
+                std::memcpy(&f, row + (x * m.scale + m.scale / 2u) * 8u, 4); // D32_FLOAT_S8X24
+                uint32_t z = static_cast<uint32_t>(std::clamp(static_cast<double>(f) * 4294967296.0, 0.0, top));
+                if (psm == GS_PSM_Z16 || psm == GS_PSM_Z16S)
+                {
+                    const uint16_t z16 = static_cast<uint16_t>(z);
+                    std::memcpy(dst, &z16, 2);
+                    dst += 2;
+                }
+                else
+                {
+                    std::memcpy(dst, &z, 4);
+                    dst += 4;
+                }
+            }
+        }
+        g_zmHits.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    g_zmMiss.fetch_add(1, std::memory_order_relaxed);
+    (g_zm.empty() ? g_zmMissEmpty : !zbpSeen ? g_zmMissZbp : g_zmMissRect).fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<int> s_log{0};
+    if (s_log.fetch_add(1) < 12)
+    {
+        std::fprintf(stderr, "[zmirror] miss zbp=0x%x psm=0x%x rect %u,%u %ux%u mirrors=%zu", zbp, psm, x0, y0, w, h, g_zm.size());
+        for (const ZMirror &m : g_zm)
+            std::fprintf(stderr, " [zbp=0x%x %ux%u]", m.zbp, m.w, m.h);
+        std::fprintf(stderr, "%c", 10);
+    }
+    return false;
+}
 
 namespace
 {
@@ -511,9 +578,13 @@ struct GSD3D11Backend::Impl
     ComPtr<ID3D11VertexShader> vsNativeS1;
     ComPtr<ID3D11PixelShader> psS1; // ps_main with perspective-interpolated tc
     ComPtr<ID3D11InputLayout> layoutS1;
-    ComPtr<ID3D11Buffer> vbS1, sbS1;
+    ComPtr<ID3D11Buffer> vbS1, sbS1, ibS1;
+    uint32_t ibS1Capacity = 0, ibS1WriteOffset = 0; // HCTP_S1_INDEXED: index ring (bytes)
+    std::vector<uint32_t> pendingS1Idx;           // indices into pendingS1 (empty = non-indexed)
+    const bool s1Indexed = [] { const char *e = std::getenv("HCTP_S1_INDEXED"); return !(e && e[0] == '0'); }();
     ComPtr<ID3D11ShaderResourceView> sbS1Srv;
-    uint32_t vbS1Capacity = 0, vbS1WriteOffset = 0, sbS1Capacity = 0;
+    uint32_t vbS1Capacity = 0, vbS1WriteOffset = 0, sbS1Capacity = 0, sbS1Write = 0;
+    int sbS1Ring = -1; // HCTP_S1_SBRING: batch constants as a NO_OVERWRITE ring (needs MapNoOverwriteOnDynamicBufferSRV)
     ComPtr<ID3D11RasterizerState> rasterCullBack;
     ComPtr<ID3D11Buffer> vb, cb, blitCb;
     uint32_t vbCapacity = 0;
@@ -583,6 +654,7 @@ struct GSD3D11Backend::Impl
         ComPtr<ID3D11DepthStencilView> dsv;
         bool readbackObserved = false; // the guest has read this target back: Present snapshots it (depthRingCopy)
         DepthRing ring[2];
+        DepthRing zring[5]; // HCTP_ZREAD_NODRAIN: the game thread's copies (ring is the GS thread's)
     };
     // Depth written back to GS memory for a local->host read: in the format the depth was DRAWN in. HCTP reads its
     // Z24 buffer as PSMZ32 (flare/flash visibility, 2x2 at each light's screen position); writing 32 bits put the
@@ -1480,7 +1552,72 @@ struct GSD3D11Backend::Impl
             D3D11_TEXTURE2D_DESC td{};
             dt.tex->GetDesc(&td);
             depthRingCopy(dt.ring[frameCounter & 1u], dt, td);
+            if (zMirrorOn)
+            {
+                // own 3-slot ring: copy into the oldest slot; map last frame's if the GPU has finished it, else keep
+                // serving the one before (the GPU runs 1-2 frames behind in heavy entrances; DO_NOT_WAIT failed there)
+                DepthRing &oldest = dt.zring[frameCounter % 5u];
+                zMirrorRelease(&oldest);
+                depthRingCopy(oldest, dt, td);
+                // newest finished copy wins (the GPU can be several frames behind the copies)
+                for (uint32_t k = 1u; k < 5u; ++k)
+                    if (zMirrorPublish(dt, dt.zring[(frameCounter + 5u - k) % 5u], frameCounter - k))
+                        break;
+            }
         }
+    }
+
+    // HCTP_ZREAD_NODRAIN: keep the previous Present's copy (finished on the GPU by now) mapped for the game thread
+    const bool zMirrorOn = [] { const char *e = std::getenv("HCTP_ZREAD_NODRAIN"); return e && e[0] == '1'; }();
+    void zMirrorRelease(DepthRing *slot)
+    {
+        std::lock_guard<std::mutex> lock(g_zmMutex);
+        for (size_t i = 0; i < g_zm.size(); ++i)
+            if (g_zm[i].slot == slot)
+            {
+                ctx->Unmap(slot->tex.Get(), 0);
+                g_zm.erase(g_zm.begin() + static_cast<std::ptrdiff_t>(i));
+                return;
+            }
+    }
+    // true = this slot serves the game thread now (mapped already or just mapped)
+    bool zMirrorPublish(DepthTarget &dt, DepthRing &prev, uint64_t frame)
+    {
+        if (!prev.tex || prev.frame != frame || prev.zbp != dt.zbpBlock)
+            return false;
+        {
+            std::lock_guard<std::mutex> lock(g_zmMutex);
+            for (const ZMirror &z : g_zm)
+                if (z.slot == &prev)
+                    return true; // already mapped (and no newer copy is finished)
+        }
+        D3D11_MAPPED_SUBRESOURCE m{};
+        if (FAILED(ctx->Map(prev.tex.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m)))
+        {
+            g_zmBusy.fetch_add(1, std::memory_order_relaxed);
+            return false; // still busy on the GPU: try an older copy
+        }
+        for (DepthRing &r : dt.zring) // the newer copy replaces this target's older mapping
+            if (&r != &prev)
+                zMirrorRelease(&r);
+        ZMirror z;
+        z.data = static_cast<const uint8_t *>(m.pData);
+        z.pitch = m.RowPitch;
+        z.scale = scale;
+        z.w = dt.w;
+        z.h = dt.h;
+        z.zbp = dt.zbpBlock;
+        z.dtPsm = dt.psm;
+        z.slot = &prev;
+        std::lock_guard<std::mutex> lock(g_zmMutex);
+        g_zm.push_back(z);
+        static uint64_t s_last = 0;
+        if (++s_last % 600u == 0u)
+            std::fprintf(stderr, "[zmirror] hits=%llu miss=%llu (none mapped %llu, other zbp %llu, rect outside %llu) gpu-busy maps %llu%c",
+                         static_cast<unsigned long long>(g_zmHits.load()), static_cast<unsigned long long>(g_zmMiss.load()),
+                         static_cast<unsigned long long>(g_zmMissEmpty.load()), static_cast<unsigned long long>(g_zmMissZbp.load()),
+                         static_cast<unsigned long long>(g_zmMissRect.load()), static_cast<unsigned long long>(g_zmBusy.load()), 10);
+        return true;
     }
 
     void syncOverlapping(uint32_t first, uint32_t last)
@@ -2479,12 +2616,30 @@ struct GSD3D11Backend::Impl
             }
         }
         const size_t at = pendingS1.size();
-        pendingS1.resize(at + chunk.indexCount);
-        for (uint32_t i = 0; i < chunk.indexCount; ++i)
+        if (s1Indexed)
         {
-            GSNativeS1Corner &o = pendingS1[at + i];
-            o = chunk.s1Corners[chunk.index[i]];
-            o.nrm[3] += static_cast<float>(s1Slot);
+            // each corner once + an index list (was one 80-byte copy per triangle corner: ~3x the GS-thread work)
+            pendingS1.resize(at + chunk.cornerCount);
+            for (uint32_t i = 0; i < chunk.cornerCount; ++i)
+            {
+                GSNativeS1Corner &o = pendingS1[at + i];
+                o = chunk.s1Corners[i];
+                o.nrm[3] += static_cast<float>(s1Slot);
+            }
+            const size_t ia = pendingS1Idx.size();
+            pendingS1Idx.resize(ia + chunk.indexCount);
+            for (uint32_t i = 0; i < chunk.indexCount; ++i)
+                pendingS1Idx[ia + i] = static_cast<uint32_t>(at) + chunk.index[i];
+        }
+        else
+        {
+            pendingS1.resize(at + chunk.indexCount);
+            for (uint32_t i = 0; i < chunk.indexCount; ++i)
+            {
+                GSNativeS1Corner &o = pendingS1[at + i];
+                o = chunk.s1Corners[chunk.index[i]];
+                o.nrm[3] += static_cast<float>(s1Slot);
+            }
         }
         if (pendingS1.size() > 60000 || pendingS1Const.size() >= 4088)
             flushPending();
@@ -2505,6 +2660,7 @@ struct GSD3D11Backend::Impl
         {
             pendingS1.clear();
             pendingS1Const.clear();
+            pendingS1Idx.clear();
             return;
         }
         if (native && !s1 && (pendingNative.empty() || !gpuReady || !vsNative || !layoutNative))
@@ -2528,8 +2684,9 @@ struct GSD3D11Backend::Impl
             std::vector<GSNativeS1Corner> &v;
             std::vector<GSNativeS1Const> &k;
             bool on;
-            ~ClearS1() { if (on) { v.clear(); k.clear(); } }
-        } clearS1{pendingS1, pendingS1Const, s1};
+            std::vector<uint32_t> &ix;
+            ~ClearS1() { if (on) { v.clear(); k.clear(); ix.clear(); } }
+        } clearS1{pendingS1, pendingS1Const, s1, pendingS1Idx};
         const GSDrawState &st = pendingState;
         const auto &c = st.context;
 
@@ -2849,6 +3006,7 @@ struct GSD3D11Backend::Impl
         // ---- vertex upload
         const uint32_t bytes = static_cast<uint32_t>(pending.size() * sizeof(Vtx));
         UINT firstVertex = 0;
+        UINT s1FirstIndex = 0;
         if (s1)
         {
             const uint32_t nbytes = static_cast<uint32_t>(pendingS1.size() * sizeof(GSNativeS1Corner));
@@ -2873,14 +3031,61 @@ struct GSD3D11Backend::Impl
                 mapType = D3D11_MAP_WRITE_DISCARD;
                 vbS1WriteOffset = 0;
             }
+            // batch constants: a structured buffer. Ring (default): NO_OVERWRITE at sbS1Write, DISCARD only on wrap,
+            // the corners' batch index (nrm.w) shifted by the ring base; a ~2 MB DISCARD per draw made the driver wait.
+            const uint32_t nconst = static_cast<uint32_t>(pendingS1Const.size());
+            if (sbS1Ring < 0)
+            {
+                D3D11_FEATURE_DATA_D3D11_OPTIONS o{};
+                const char *e = std::getenv("HCTP_S1_SBRING");
+                sbS1Ring = (!(e && e[0] == '0') && SUCCEEDED(dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &o, sizeof(o))) &&
+                            o.MapNoOverwriteOnDynamicBufferSRV) ? 1 : 0;
+                std::fprintf(stderr, "[gpus1] constants ring %d%c", sbS1Ring, 10);
+            }
+            const bool sbWrap = sbS1Ring != 1 || sbS1Write + nconst > sbS1Capacity;
+            const uint32_t sbBase = sbWrap ? 0u : sbS1Write;
             if (FAILED(ctx->Map(vbS1.Get(), 0, mapType, 0, &m)))
                 return;
             std::memcpy(static_cast<uint8_t *>(m.pData) + vbS1WriteOffset, pendingS1.data(), nbytes);
+            if (sbBase)
+            {
+                auto *cv = reinterpret_cast<GSNativeS1Corner *>(static_cast<uint8_t *>(m.pData) + vbS1WriteOffset);
+                for (size_t i = 0; i < pendingS1.size(); ++i)
+                    cv[i].nrm[3] += static_cast<float>(sbBase);
+            }
             ctx->Unmap(vbS1.Get(), 0);
             firstVertex = vbS1WriteOffset / static_cast<UINT>(sizeof(GSNativeS1Corner));
             vbS1WriteOffset += nbytes;
-            // batch constants: a structured buffer rewritten per draw (DISCARD)
-            const uint32_t nconst = static_cast<uint32_t>(pendingS1Const.size());
+            if (!pendingS1Idx.empty())
+            {
+                const uint32_t ibytes = static_cast<uint32_t>(pendingS1Idx.size() * sizeof(uint32_t));
+                if (!ibS1 || ibytes > ibS1Capacity)
+                {
+                    ibS1.Reset();
+                    D3D11_BUFFER_DESC bd{};
+                    bd.ByteWidth = std::max<uint32_t>(ibytes * 2u, 4u << 20);
+                    bd.Usage = D3D11_USAGE_DYNAMIC;
+                    bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+                    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+                    if (FAILED(dev->CreateBuffer(&bd, nullptr, &ibS1)))
+                        return;
+                    ibS1Capacity = bd.ByteWidth;
+                    ibS1WriteOffset = ibS1Capacity; // forces DISCARD below
+                }
+                D3D11_MAPPED_SUBRESOURCE im{};
+                D3D11_MAP imt = D3D11_MAP_WRITE_NO_OVERWRITE;
+                if (ibS1WriteOffset + ibytes > ibS1Capacity)
+                {
+                    imt = D3D11_MAP_WRITE_DISCARD;
+                    ibS1WriteOffset = 0;
+                }
+                if (FAILED(ctx->Map(ibS1.Get(), 0, imt, 0, &im)))
+                    return;
+                std::memcpy(static_cast<uint8_t *>(im.pData) + ibS1WriteOffset, pendingS1Idx.data(), ibytes);
+                ctx->Unmap(ibS1.Get(), 0);
+                s1FirstIndex = ibS1WriteOffset / 4u;
+                ibS1WriteOffset += ibytes;
+            }
             if (nconst > sbS1Capacity)
             {
                 sbS1.Reset();
@@ -2896,11 +3101,13 @@ struct GSD3D11Backend::Impl
                 if (FAILED(dev->CreateBuffer(&bd, nullptr, &sbS1)) || FAILED(dev->CreateShaderResourceView(sbS1.Get(), nullptr, &sbS1Srv)))
                     return;
                 sbS1Capacity = cap;
+                sbS1Write = 0;
             }
-            if (FAILED(ctx->Map(sbS1.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
+            if (FAILED(ctx->Map(sbS1.Get(), 0, sbWrap ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE, 0, &m)))
                 return;
-            std::memcpy(m.pData, pendingS1Const.data(), nconst * sizeof(GSNativeS1Const));
+            std::memcpy(static_cast<GSNativeS1Const *>(m.pData) + sbBase, pendingS1Const.data(), nconst * sizeof(GSNativeS1Const));
             ctx->Unmap(sbS1.Get(), 0);
+            sbS1Write = sbBase + nconst;
         }
         else if (native)
         {
@@ -3171,7 +3378,13 @@ struct GSD3D11Backend::Impl
                 if (pendingS1Cull)
                     ctx->RSSetState(rasterCullBack.Get());
             }
-            ctx->Draw(static_cast<UINT>(s1 ? pendingS1.size() : native ? pendingNative.size() : pending.size()), firstVertex);
+            if (s1 && !pendingS1Idx.empty())
+            {
+                ctx->IASetIndexBuffer(ibS1.Get(), DXGI_FORMAT_R32_UINT, 0);
+                ctx->DrawIndexed(static_cast<UINT>(pendingS1Idx.size()), s1FirstIndex, static_cast<INT>(firstVertex));
+            }
+            else
+                ctx->Draw(static_cast<UINT>(s1 ? pendingS1.size() : native ? pendingNative.size() : pending.size()), firstVertex);
             if (s1 && pendingS1Cull)
                 ctx->RSSetState(raster.Get());
             gpEnd(gq);
@@ -3617,6 +3830,9 @@ void GSD3D11Backend::Reset()
     m_impl->pending.clear();
     m_impl->hasPending = false;
     m_impl->rts.clear();
+    for (auto &dt : m_impl->depths)
+        for (auto &r : dt.zring)
+            m_impl->zMirrorRelease(&r);
     m_impl->depths.clear();
     m_impl->texCache.clear();
     m_impl->hasDisplay = false;

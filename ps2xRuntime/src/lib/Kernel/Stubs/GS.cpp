@@ -1,10 +1,12 @@
 #include "Common.h"
+#include <chrono>
 #include "GS.h"
 #include "ps2_log.h"
 #include "runtime/gs/ps2_gs_common.h"
 #include "runtime/gs/ps2_gs_psmct16.h"
 #include "runtime/ee_scheduler.h"
 
+bool hctpDepthMirrorRead(uint32_t zbp, uint32_t psm, uint32_t x0, uint32_t y0, uint32_t w, uint32_t h, uint8_t *dst);
 namespace ps2_stubs
 {
     namespace
@@ -734,6 +736,18 @@ namespace ps2_stubs
         }
 
         uint32_t sbp = static_cast<uint32_t>(img.vram_addr); // block units, as sceGsSetDefStoreImage got them
+        // HCTP_ZREAD_NODRAIN=1: depth reads (lens flare / flash visibility) from the D3D11 backend's mapped copy of the
+        // previous frame's depth, without draining the GS thread (gs_d3d11_backend.cpp hctpDepthMirrorRead)
+        static const bool s_zNoDrain = [] { const char *e = std::getenv("HCTP_ZREAD_NODRAIN"); return e && e[0] == '1'; }();
+        if (s_zNoDrain && (img.psm == 0x30u || img.psm == 0x31u || img.psm == 0x32u || img.psm == 0x3Au) &&
+            hctpDepthMirrorRead(sbp, img.psm, img.x, img.y, img.width, img.height, dst))
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
+        // HCTP_STOREIMAGE_LOG=1: log StoreImage reads slower than 1 ms (caller ra, psm, size, ms) - entrance hand-off hitch
+        static const bool s_siLog = std::getenv("HCTP_STOREIMAGE_LOG") != nullptr;
+        const auto siT0 = std::chrono::steady_clock::now();
         uint64_t bitbltbuf = (static_cast<uint64_t>(sbp & 0x3FFFu) << 0) |
                              (static_cast<uint64_t>(fbw & 0x3Fu) << 16) |
                              (static_cast<uint64_t>(img.psm & 0x3Fu) << 24) |
@@ -784,6 +798,14 @@ namespace ps2_stubs
         ps2TraceGuestRangeWrite(rdram, dstAddr, totalImageBytes, "sceGsExecStoreImage", ctx);
         runtime->gs().consumeLocalToHostBytes(dst, totalImageBytes);
         runtime->guestFree(pktAddr);
+        if (s_siLog)
+        {
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - siT0).count();
+            if (ms >= 1.0)
+                std::fprintf(stderr, "[storeimage] ra=0x%x psm=0x%x sbp=0x%x %ux%u %u B %.2f ms%c", static_cast<unsigned>(getRegU32(ctx, 31)),
+                             static_cast<unsigned>(img.psm), sbp, static_cast<unsigned>(img.width), static_cast<unsigned>(img.height),
+                             totalImageBytes, ms, 10);
+        }
 
         setReturnS32(ctx, 0);
     }
