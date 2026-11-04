@@ -115,7 +115,9 @@ namespace
                         continue;
                     const std::string &top = nameOf(context.Rip);
                     ++totals[id];
-                    if (top.rfind("ntdll!", 0) != 0 && top.rfind("KERNELBASE!", 0) != 0 && top.rfind("win32u!", 0) != 0)
+                    // VCRUNTIME/ucrtbase leaves (memcpy etc. show as the nearest export, e.g. _NLG_Return2): name the callers too
+                    const bool crtLeaf = top.rfind("VCRUNTIME140!", 0) == 0 || top.rfind("ucrtbase!", 0) == 0;
+                    if (!crtLeaf && top.rfind("ntdll!", 0) != 0 && top.rfind("KERNELBASE!", 0) != 0 && top.rfind("win32u!", 0) != 0)
                     {
                         ++hits[id][top];
                         continue;
@@ -123,7 +125,7 @@ namespace
                     // A wait: name it after the first game-exe frames that called it (driver/system frames skipped).
                     std::string key = top;
                     uint32_t found = 0;
-                    for (uint32_t i = 1; i < frameCount && found < 4u; ++i)
+                    for (uint32_t i = 1; i < frameCount && found < (crtLeaf ? 2u : 4u); ++i)
                         if (frames[i] > exeBase && frames[i] < exeEnd)
                         {
                             key += " <- " + nameOf(frames[i]);

@@ -426,6 +426,22 @@ float4 ps_main(VsOut i) : SV_Target
                 g_fpsPresents = 0;
                 g_fpsWindowStart = now;
                 g_fpsKickStart = kicks;
+                {
+                    // HCTP_FPS_JITTER_LOG=1: how many 0.5 s overlay readings were not 60 (frame pacing), every 10 s
+                    static const bool s_jit = std::getenv("HCTP_FPS_JITTER_LOG") != nullptr;
+                    static uint32_t s_win = 0, s_off = 0, s_offGame = 0;
+                    if (s_jit)
+                    {
+                        ++s_win;
+                        s_off += static_cast<int>(g_presentFps + 0.5) != 60 ? 1u : 0u;
+                        s_offGame += static_cast<int>(g_gameFps + 0.5) != 60 ? 1u : 0u;
+                        if (s_win == 20u)
+                        {
+                            std::fprintf(stderr, "[fpsjitter] of 20 overlay readings: fps!=60 %u, game!=60 %u%c", s_off, s_offGame, 10);
+                            s_win = s_off = s_offGame = 0;
+                        }
+                    }
+                }
                 g_titleFps.store(static_cast<int>(g_presentFps + 0.5));
                 g_titleGameFps.store(static_cast<int>(g_gameFps + 0.5));
             }
