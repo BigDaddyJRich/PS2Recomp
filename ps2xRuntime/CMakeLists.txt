@@ -500,6 +500,40 @@ elseif(EXISTS "${ROOT_MAIN_CPP}")
     list(APPEND RUNNER_SRC_FILES "${ROOT_MAIN_CPP}")
 endif()
 
+# Heavy generated sources: the recompiler emits some multi-megabyte functions, and MSVC /O2 needs gigabytes for each
+# (measured Nov 4: one unity batch of four 2-5 MB functions peaked at 27.6 GB of commit; players' 16 GB PCs ran out).
+# They stay out of the unity batches and, with Ninja, compile in their own object library through a job pool of
+# PS2X_RUNNER_HEAVY_JOBS, so only that many of them are ever in the compiler at once next to the normal compiles.
+set(PS2X_RUNNER_HEAVY_SOURCE_BYTES 1048576 CACHE STRING "Runner sources bigger than this compile alone (not in a unity batch)")
+set(PS2X_RUNNER_HEAVY_JOBS 1 CACHE STRING "How many heavy runner sources compile at once (Ninja)")
+set(PS2X_RUNNER_HEAVY_INLINE "/Ob0" CACHE STRING "Inline option for heavy runner sources (MSVC; empty = the build's own)")
+set(RUNNER_HEAVY_SRC_FILES)
+foreach(RUNNER_SRC_FILE IN LISTS RUNNER_SRC_FILES)
+    if(EXISTS "${RUNNER_SRC_FILE}")
+        file(SIZE "${RUNNER_SRC_FILE}" RUNNER_SRC_SIZE)
+        if(RUNNER_SRC_SIZE GREATER PS2X_RUNNER_HEAVY_SOURCE_BYTES)
+            list(APPEND RUNNER_HEAVY_SRC_FILES "${RUNNER_SRC_FILE}")
+        endif()
+    endif()
+endforeach()
+if(RUNNER_HEAVY_SRC_FILES AND CMAKE_GENERATOR MATCHES "Ninja")
+    list(REMOVE_ITEM RUNNER_SRC_FILES ${RUNNER_HEAVY_SRC_FILES})
+    set_property(GLOBAL APPEND PROPERTY JOB_POOLS ps2x_heavy=${PS2X_RUNNER_HEAVY_JOBS})
+    add_library(ps2EntryRunnerHeavy OBJECT ${RUNNER_HEAVY_SRC_FILES})
+    set_target_properties(ps2EntryRunnerHeavy PROPERTIES JOB_POOL_COMPILE ps2x_heavy)
+    target_link_libraries(ps2EntryRunnerHeavy PRIVATE ps2_runtime)
+    if(PS2X_DEFAULT_BOOT_ELF_DEFINE)
+        target_compile_definitions(ps2EntryRunnerHeavy PRIVATE PS2X_DEFAULT_BOOT_ELF="${PS2X_DEFAULT_BOOT_ELF_DEFINE}")
+    endif()
+    if(MSVC)
+        # /Ob0: inlining the runtime's helpers into a multi-MB function is what costs the memory (sub_00419D90, 5 MB:
+        # /O2 /Ob1 12.5 GB, /O1 12.5 GB, /O2 /Ob0 0.53 GB); these are load-time functions (~0.5% in sampler runs)
+        target_compile_options(ps2EntryRunnerHeavy PRIVATE /FS ${PS2X_RUNNER_HEAVY_INLINE})
+    endif()
+elseif(RUNNER_HEAVY_SRC_FILES)
+    set_source_files_properties(${RUNNER_HEAVY_SRC_FILES} PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+endif()
+
 if(PS2X_IS_ANDROID)
     add_library(ps2EntryRunner SHARED
         ${RUNNER_SRC_FILES}
@@ -594,6 +628,9 @@ target_link_libraries(ps2EntryRunner
     PRIVATE
     ps2_runtime
 )
+if(TARGET ps2EntryRunnerHeavy)
+    target_sources(ps2EntryRunner PRIVATE $<TARGET_OBJECTS:ps2EntryRunnerHeavy>)
+endif()
 
 if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     target_sources(ps2EntryRunner PRIVATE
