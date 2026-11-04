@@ -476,6 +476,13 @@ namespace ps2_host_settings
             // morph weights (MSCAL 0x2800): OFF - leg/arm/finger shake (Oct 21 split test, Jordan); likely the VU1's
             // 0x2908 blend reading registers the skipped 0x2800 run would have set. =1 turns it back on
             fillSwitch("HCTP_NATIVE_P07", "0");
+            // the HCTP PC shortcut's (run_hctp_d3d11.bat) performance set, so players' builds match it (Nov 4):
+            // GPU stage-1 OFF (59/61 frame bounce, Taker bike flicker) with its constants ring, lite GPU-character
+            // corners, flare/flash depth reads from the mirror (no GS drain)
+            fillSwitch("HCTP_GPU_STAGE1", "0");
+            fillSwitch("HCTP_S1_SBRING", "0");
+            fillSwitch("HCTP_GPU_CHARS_LITE", "1");
+            fillSwitch("HCTP_ZREAD_NODRAIN", "1");
             // Jordan's requested shine reduction, also used by the entrance test.
             // Explicit HCTP_NO_GLOSS=0 restores the reflection-map paths.
             fillSwitch("HCTP_NO_GLOSS", "1");
