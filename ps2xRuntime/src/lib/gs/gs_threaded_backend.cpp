@@ -347,6 +347,35 @@ void GSThreadedBackend::SubmitNativeTris(const GSDrawState &state, const GSNativ
 {
     if (chunk.indexCount == 0u)
         return;
+    if (chunk.s1Corners)
+    {
+        // GPU stage-1: head | serial u64, cull u32, has-const u32 | GSNativeS1Const (only for a new serial) | corners | index
+        static uint64_t s_lastSerial = 0;
+        const bool withConst = chunk.s1 && chunk.s1Serial != s_lastSerial;
+        s_lastSerial = chunk.s1Serial;
+        const uint32_t cornerBytes = chunk.cornerCount * static_cast<uint32_t>(sizeof(GSNativeS1Corner));
+        const uint32_t indexBytes = (chunk.indexCount * 2u + 15u) & ~15u;
+        const uint32_t constBytes = withConst ? chunk.s1Count * static_cast<uint32_t>(sizeof(GSNativeS1Const)) : 0u;
+        uint8_t *dst = reserve(Cmd::NativeTrisS1, kNativeTrisHead + 16u + constBytes + cornerBytes + indexBytes);
+        std::memcpy(dst, &state, sizeof(GSDrawState));
+        std::memcpy(dst + sizeof(GSDrawState), &chunk.cornerCount, 4);
+        std::memcpy(dst + sizeof(GSDrawState) + 4u, &chunk.indexCount, 4);
+        uint8_t *p = dst + kNativeTrisHead;
+        const uint32_t hasConst = withConst ? chunk.s1Count : 0u; // constant count
+        std::memcpy(p, &chunk.s1Serial, 8);
+        std::memcpy(p + 8, &chunk.s1Cull, 4);
+        std::memcpy(p + 12, &hasConst, 4);
+        p += 16;
+        if (withConst)
+        {
+            std::memcpy(p, chunk.s1, constBytes);
+            p += constBytes;
+        }
+        std::memcpy(p, chunk.s1Corners, cornerBytes);
+        std::memcpy(p + cornerBytes, chunk.index, chunk.indexCount * 2u);
+        commit();
+        return;
+    }
     // head: state, u32 corners, u32 indices (16-aligned) | GSNativeConst | corners | u16 index (padded to 16)
     const uint32_t cornerBytes = chunk.cornerCount * static_cast<uint32_t>(sizeof(GSNativeCorner));
     const uint32_t indexBytes = (chunk.indexCount * 2u + 15u) & ~15u;
@@ -655,6 +684,29 @@ void GSThreadedBackend::execute(const Header &header, const uint8_t *payload)
         p += sizeof(GSNativeConst);
         chunk.corners = reinterpret_cast<const GSNativeCorner *>(p);
         chunk.index = reinterpret_cast<const uint16_t *>(p + chunk.cornerCount * sizeof(GSNativeCorner));
+        m_inner->SubmitNativeTris(state, chunk);
+        break;
+    }
+    case Cmd::NativeTrisS1:
+    {
+        const GSDrawState state = load<GSDrawState>(payload);
+        GSNativeChunk chunk;
+        std::memcpy(&chunk.cornerCount, payload + sizeof(GSDrawState), 4);
+        std::memcpy(&chunk.indexCount, payload + sizeof(GSDrawState) + 4u, 4);
+        const uint8_t *p = payload + kNativeTrisHead;
+        uint32_t hasConst;
+        std::memcpy(&chunk.s1Serial, p, 8);
+        std::memcpy(&chunk.s1Cull, p + 8, 4);
+        std::memcpy(&hasConst, p + 12, 4);
+        p += 16;
+        if (hasConst)
+        {
+            chunk.s1 = reinterpret_cast<const GSNativeS1Const *>(p);
+            chunk.s1Count = hasConst;
+            p += hasConst * sizeof(GSNativeS1Const);
+        }
+        chunk.s1Corners = reinterpret_cast<const GSNativeS1Corner *>(p);
+        chunk.index = reinterpret_cast<const uint16_t *>(p + chunk.cornerCount * sizeof(GSNativeS1Corner));
         m_inner->SubmitNativeTris(state, chunk);
         break;
     }

@@ -1175,7 +1175,7 @@ bool GS::submitNativeTris(uint64_t tagLo, uint64_t tagHi, const GSNativeChunk &c
         updatePreferredDisplaySourceForDraw(batch);
         // HCTP_GPU_CHARS_CPUVTX=1 (test): the corners as ordinary GS triangles (vs_native's maths in C++)
         static const bool s_cpuVtx = [] { const char *e = std::getenv("HCTP_GPU_CHARS_CPUVTX"); return e && e[0] == '1'; }();
-        if (s_cpuVtx)
+        if (s_cpuVtx && !chunk.s1Corners)
         {
             for (uint32_t i = 0; i + 2u < count; i += 3u)
             {

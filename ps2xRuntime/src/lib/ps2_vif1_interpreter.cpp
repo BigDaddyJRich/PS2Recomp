@@ -5,6 +5,7 @@
 #include <set>
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_vu_code_log.h"
+#include "hctp_native_vu1.h"
 #include <cstring>
 #include <vector>
 #include <chrono>
@@ -717,6 +718,9 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
             const bool zeroExtend = (imm & 0x4000u) != 0u;
 
+            // GPU stage-1: a pending batch's outputs get computed before an UNPACK overwrites them (hctp_native_vu1.cpp)
+            if (g_hctpS1Pending && m_vu1Data && totalBytes > 0 && wl != 0u)
+                hctpNativeVu1S1VifWrite(m_vu1Data, vuAddr, ((writeVectorCount + wl - 1u) / wl) * (cl > wl ? cl : wl));
             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {
                 const uint8_t *srcBase = data + pos;

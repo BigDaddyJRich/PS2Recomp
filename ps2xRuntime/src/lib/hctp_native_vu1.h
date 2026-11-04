@@ -42,3 +42,9 @@ void hctpNativeVu1AfterMscalGeneric(const uint8_t *data = nullptr);
 // p14 shadow volumes (MSCNT at 0x2a18 / 0x3038): HCTP_NATIVE_P14=1 runs the batch natively (true = skip the VU1; the
 // registers are updated in st); HCTP_NATIVE_VERIFY=1 runs it on copies and compares the PATH1 packets
 bool hctpNativeVu1MscntP14(const uint8_t *code, uint8_t *data, VU1State &st, uint32_t top, GS &gs);
+// GPU stage-1 (HCTP_GPU_STAGE1): a batch whose stage-1 outputs exist only on the GPU is pending; before anything
+// else may read VU memory b..b+480 the outputs are computed on the CPU. why: 0 chunk, 1 vif, 2 mscal, 3 mscnt
+extern bool g_hctpS1Pending;
+void hctpNativeVu1S1Need(uint8_t *data, int why);
+// a VIF1 UNPACK about to write VU1 data [addr, addr + len) (qwords, wraps at 1024)
+void hctpNativeVu1S1VifWrite(uint8_t *data, uint32_t addr, uint32_t len);

@@ -1083,6 +1083,8 @@ bool PS2Runtime::syncCoreSubsystems()
                                          return;
                                      }
                                      // p07 morph weights 0x2800 with the registers it leaves (HCTP_NATIVE_P07S=0 off)
+                                     if (g_hctpS1Pending && startPC == 0x2800u)
+                                         hctpNativeVu1S1Need(m_memory.getVU1Data(), 2);
                                      if (m_vu1.fastEntryAllowed() &&
                                          hctpNativeVu1P07State(m_memory.getVU1Code(), m_memory.getVU1Data(), startPC, m_vu1.state()))
                                      {
@@ -1101,6 +1103,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                          m_chain.noteVu1Run(0u);
                                          return;
                                      }
+                                     hctpNativeVu1S1Need(m_memory.getVU1Data(), 2); // GPU stage-1: the interpreter may read it
                                      {
                                          ps2_perf_split::PhaseScope interp(ps2_perf_split::PhVu1Int);
                                          m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
@@ -1125,6 +1128,9 @@ bool PS2Runtime::syncCoreSubsystems()
                                      // p08 / p18 batch setup natively, then the loop head (HCTP_NATIVE_SETUP=0: off)
                                      hctpNativeVu1FirstChunk(m_memory.getVU1Code(), m_memory.getVU1Data(), m_vu1.state());
                                      // native p14 shadow batch (HCTP_NATIVE_P14=1): registers stay in the VU1 state
+                                     static const bool s_nativeP14 = std::getenv("HCTP_NATIVE_P14") && std::getenv("HCTP_NATIVE_P14")[0] == '1';
+                                     if (g_hctpS1Pending && s_nativeP14)
+                                         hctpNativeVu1S1Need(m_memory.getVU1Data(), 3);
                                      if (!Vu1Compiled::xgkickActive(m_vu1) &&
                                          hctpNativeVu1MscntP14(m_memory.getVU1Code(), m_memory.getVU1Data(),
                                                                m_vu1.state(), top, m_gs))
@@ -1142,6 +1148,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                          m_chain.noteVu1Run(0u);
                                          return;
                                      }
+                                     hctpNativeVu1S1Need(m_memory.getVU1Data(), 3); // GPU stage-1: the VU1 may read it
                                      hctpNativeVu1BeforeResume(m_memory.getVU1Code(), m_memory.getVU1Data(),
                                                                m_vu1.state(), top);
                                      {

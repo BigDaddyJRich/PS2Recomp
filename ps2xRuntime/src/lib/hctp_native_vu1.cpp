@@ -151,10 +151,9 @@ namespace
         return on;
     }
 
-    bool computeChunk(const uint8_t *code, const uint8_t *data, const VU1State &st, uint32_t top)
+    // which stage-2 program (g_variant) the chunk at st.pc is; false = none we handle
+    bool detectVariant(const uint8_t *code, const VU1State &st)
     {
-        if (!code || !data)
-            return false;
         static uint64_t s_hashCode = 0, s_hash = 0;
         // the overlay at 0x2a00 changes rarely compared with the chunk rate: hash only when its first words change
         uint64_t sig;
@@ -167,7 +166,7 @@ namespace
         if (s_hash == kP18Hash && g_p18 && g_p18PcLog < 12)
         {
             ++g_p18PcLog;
-            std::fprintf(stderr, "[nvu1] p18 candidate pc=0x%x top=0x%x%c", st.pc, top, 10);
+            std::fprintf(stderr, "[nvu1] p18 candidate pc=0x%x %c", st.pc, 10);
         }
         if (st.pc == kP09LoopHead)
         {
@@ -227,6 +226,15 @@ namespace
             ++g_p18Seen;
         }
         else
+            return false;
+        return true;
+    }
+
+    bool computeChunk(const uint8_t *code, const uint8_t *data, const VU1State &st, uint32_t top)
+    {
+        if (!code || !data)
+            return false;
+        if (!detectVariant(code, st))
             return false;
         const bool p18 = g_variant == 1 || g_variant == 5; // p19 = p18's colour / STQ
         // GPU character path: only the clip flags, the backface ADC and the last corner's RGBA / STQ are needed here
@@ -601,6 +609,444 @@ namespace
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// GPU stage-1 (default on with the GPU character path; HCTP_GPU_STAGE1=0 off): the stage-1 MSCAL (p01-p04) only
+// snapshots its inputs (positions b, normals b+160, weights b+640) and constants (bones 801.., lights 1012-1018,
+// projection 1020-1023, fog [800].zw); the VU1 and the CPU skip it. A stage-2 chunk of p08 / p18 / p11 / p19 then goes
+// to the renderer with those inputs (GSNativeS1Corner) and vs_native_s1 does skin + light + projection + clipping.
+// Anything else that could read the stage-1 outputs (another program, the interpreter, a VIF write over them) first
+// gets them computed on the CPU from the snapshot (materialise), exactly as the VU1 would have left them.
+// HCTP_GPU_STAGE1_VERIFY=1: the CPU path runs as before; the snapshot maths is compared with the stage-1 outputs and
+// the GPU back-face rule with the packet path's ADC ([gpus1] every 5 s).
+bool g_hctpS1Pending = false;
+namespace
+{
+    struct S1Batch
+    {
+        uint32_t b = 0, count = 0;
+        int bones = 4;
+        GSNativeS1Const k{};
+        bool chunkConst = false; // k.s1 / s2 / k.xy / misc.w set by a chunk
+        std::vector<float> in;   // per vertex: pos4, nrm4, wt4
+        uint64_t serial = 0;
+    };
+    // One draw group = the stage-1 MSCALs since the last stage-2 chunk: p01-p04 are the 4/3/2/1-bone variants, each
+    // run on its own vertex range (b, count, own bones), and the chunks after them index all of those ranges.
+    std::vector<S1Batch> g_s1q; // storage reused; g_s1n live
+    uint32_t g_s1n = 0;
+    bool g_s1GroupOpen = false; // no chunk drawn since the group's first MSCAL
+    uint64_t g_s1GroupSerial = 0;
+    std::vector<GSNativeS1Const> g_s1Arr; // the group's constants as sent (chunk constants applied)
+    uint64_t g_s1ArrSerial = ~0ull;
+    float g_s1Chunk[13] = {}; // s1, s2, scroll xy, near offset of the group's chunks
+    bool g_s1ChunkSet = false;
+    uint64_t g_s1GroupHist[9] = {};
+    S1Batch g_s1v; // verify mode's snapshot
+    uint64_t g_s1Serial = 0;
+    int g_gpuS1 = -1; // -1 = not read yet
+    bool g_gpuS1Verify = false;
+    bool g_s1VerifyPending = false;
+    uint64_t g_s1Batches = 0, g_s1GpuChunks = 0, g_s1Refused = 0, g_s1Mat[5] = {}, g_s1Dropped = 0;
+    uint64_t g_s1VerVerts = 0, g_s1VerBad = 0, g_s1VerTris = 0, g_s1VerCullBad = 0, g_s1VerNearBad = 0, g_s1VerLastBad = 0;
+    uint64_t g_s1Vi8[4] = {}; // vi8 seen at GPU-eligible chunks: 0, 32, 64, other
+    int g_s1Dumps = 0;
+    const char *const kS1MatWhy[5] = {"chunk", "vif", "mscal", "mscnt", "refused"};
+
+    bool gpuS1On()
+    {
+        if (g_gpuS1 < 0)
+        {
+            const char *e = std::getenv("HCTP_GPU_STAGE1"), *c = std::getenv("HCTP_GPU_CHARS"), *v = std::getenv("HCTP_GPU_STAGE1_VERIFY");
+            g_gpuS1Verify = v && v[0] == '1';
+            g_gpuS1 = (!(e && e[0] == '0') && !(c && c[0] == '0') && !g_gpuS1Verify) ? 1 : 0;
+            std::fprintf(stderr, "[gpus1] GPU stage-1 %d verify %d%c", g_gpuS1, g_gpuS1Verify ? 1 : 0, 10);
+        }
+        return g_gpuS1 == 1;
+    }
+
+    // the stage-1 outputs of snapshot vertex i (p01Compute's maths): pos4, normal3 + q, screen3 + fog, light4
+    void s1Vertex(const S1Batch &s, uint32_t i, float *o)
+    {
+        const float *pos = &s.in[static_cast<size_t>(i) * 12u], *nrm = pos + 4, *wt = pos + 8;
+        float v[4] = {0, 0, 0, 0}, n[3] = {0, 0, 0};
+        for (int k = 0; k < s.bones; ++k)
+        {
+            const float(*M)[4] = &s.k.m[4 * k];
+            for (int c = 0; c < 4; ++c)
+            {
+                const float sk = M[0][c] * pos[0] + M[1][c] * pos[1] + M[2][c] * pos[2] + M[3][c] * pos[3];
+                v[c] += sk * wt[k];
+            }
+            for (int c = 0; c < 3; ++c)
+            {
+                const float sn = M[0][c] * nrm[0] + M[1][c] * nrm[1] + M[2][c] * nrm[2];
+                n[c] += sn * wt[k];
+            }
+        }
+        float cl[4];
+        for (int c = 0; c < 4; ++c)
+            cl[c] = s.k.pm[0][c] * v[0] + s.k.pm[1][c] * v[1] + s.k.pm[2][c] * v[2] + s.k.pm[3][c] * v[3];
+        const float qv = 1.0f / cl[3];
+        const float fog = std::fmin(std::fmax(s.k.misc[0] + cl[3] * s.k.misc[1], 0.0f), 255.0f);
+        if (s.k.misc[2] != 0.0f)
+        {
+            const float inv = 1.0f / std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+            for (float &c : n)
+                c *= inv;
+        }
+        float d[4];
+        for (int c = 0; c < 4; ++c)
+            d[c] = std::fmax(s.k.l[0][c] * n[0] + s.k.l[1][c] * n[1] + s.k.l[2][c] * n[2], 0.0f);
+        for (int c = 0; c < 4; ++c)
+            o[c] = v[c];
+        o[4] = n[0];
+        o[5] = n[1];
+        o[6] = n[2];
+        o[7] = qv;
+        o[8] = cl[0] * qv;
+        o[9] = cl[1] * qv;
+        o[10] = cl[2] * qv;
+        o[11] = fog;
+        for (int c = 0; c < 4; ++c)
+            o[12 + c] = s.k.c[0][c] * d[0] + s.k.c[1][c] * d[1] + s.k.c[2][c] * d[2];
+    }
+
+    // the snapshot at the stage-1 MSCAL (inputs + constants as p01Compute reads them); false = not a batch we take
+    bool s1Snapshot(const uint8_t *data, int bones, bool weights, bool normalise, S1Batch &s)
+    {
+        uint32_t w800[4];
+        std::memcpy(w800, data + 800u * 16u, 16);
+        const uint32_t count = w800[0] & 0xFFFFu, b = w800[1] & 0xFFFFu;
+        if (count == 0u || count > 160u || b + 640u + count > 1024u)
+            return false;
+        s.b = b;
+        s.count = count;
+        s.bones = bones;
+        std::memset(&s.k, 0, sizeof(s.k));
+        std::memcpy(s.k.m, data + 801u * 16u, static_cast<size_t>(bones) * 64u);
+        std::memcpy(s.k.pm, data + 1020u * 16u, 64);
+        std::memcpy(s.k.l, data + 1012u * 16u, 48);
+        std::memcpy(s.k.c, data + 1016u * 16u, 48);
+        const float *hdr = q(data, 800);
+        s.k.misc[0] = hdr[2];
+        s.k.misc[1] = hdr[3];
+        s.k.misc[2] = normalise ? 1.0f : 0.0f;
+        s.chunkConst = false;
+        s.in.resize(static_cast<size_t>(count) * 12u);
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            float *o = &s.in[static_cast<size_t>(i) * 12u];
+            std::memcpy(o, q(data, b + i), 16);
+            std::memcpy(o + 4, q(data, b + 160u + i), 16);
+            if (weights)
+            {
+                std::memcpy(o + 8, q(data, b + 640u + i), 16);
+                for (int k = bones; k < 4; ++k)
+                    o[8 + k] = 0.0f; // unused bones: zero matrices, zero weight (no NaN from leftover lanes)
+            }
+            else
+            {
+                o[8] = 1.0f;
+                o[9] = o[10] = o[11] = 0.0f;
+            }
+        }
+        s.serial = ++g_s1Serial;
+        return true;
+    }
+
+    // the queued batch whose range holds VU address idx, -1 = none
+    int s1Find(uint32_t idx)
+    {
+        for (uint32_t j = 0; j < g_s1n; ++j)
+            if (idx >= g_s1q[j].b && idx < g_s1q[j].b + g_s1q[j].count)
+                return static_cast<int>(j);
+        return -1;
+    }
+
+    void s1Report()
+    {
+        static auto s_last = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (now - s_last <= std::chrono::seconds(5))
+            return;
+        s_last = now;
+        std::fprintf(stderr, "[gpus1] batches=%llu gpu chunks=%llu refused=%llu dropped=%llu materialised chunk=%llu vif=%llu mscal=%llu mscnt=%llu refused=%llu vi8 0:%llu 32:%llu 64:%llu other:%llu%c",
+                     static_cast<unsigned long long>(g_s1Batches), static_cast<unsigned long long>(g_s1GpuChunks),
+                     static_cast<unsigned long long>(g_s1Refused), static_cast<unsigned long long>(g_s1Dropped),
+                     static_cast<unsigned long long>(g_s1Mat[0]), static_cast<unsigned long long>(g_s1Mat[1]),
+                     static_cast<unsigned long long>(g_s1Mat[2]), static_cast<unsigned long long>(g_s1Mat[3]),
+                     static_cast<unsigned long long>(g_s1Mat[4]), static_cast<unsigned long long>(g_s1Vi8[0]),
+                     static_cast<unsigned long long>(g_s1Vi8[1]), static_cast<unsigned long long>(g_s1Vi8[2]),
+                     static_cast<unsigned long long>(g_s1Vi8[3]), 10);
+        std::fprintf(stderr, "[gpus1] group sizes (stage-1 MSCALs per draw group) 1:%llu 2:%llu 3:%llu 4:%llu 5+:%llu%c",
+                     static_cast<unsigned long long>(g_s1GroupHist[1]), static_cast<unsigned long long>(g_s1GroupHist[2]),
+                     static_cast<unsigned long long>(g_s1GroupHist[3]), static_cast<unsigned long long>(g_s1GroupHist[4]),
+                     static_cast<unsigned long long>(g_s1GroupHist[5] + g_s1GroupHist[6] + g_s1GroupHist[7] + g_s1GroupHist[8]), 10);
+        if (g_gpuS1Verify)
+            std::fprintf(stderr, "[gpus1] verify verts=%llu bad=%llu tris=%llu cull-bad=%llu near-bad=%llu last-corner-bad=%llu%c",
+                         static_cast<unsigned long long>(g_s1VerVerts), static_cast<unsigned long long>(g_s1VerBad),
+                         static_cast<unsigned long long>(g_s1VerTris), static_cast<unsigned long long>(g_s1VerCullBad),
+                         static_cast<unsigned long long>(g_s1VerNearBad), static_cast<unsigned long long>(g_s1VerLastBad), 10);
+    }
+
+    // the pending batch's outputs into VU memory (b, b+160, b+320, b+480), as the VU1 would have left them
+    void s1Materialise(uint8_t *data, int why)
+    {
+        if (!g_hctpS1Pending || !data)
+            return;
+        g_hctpS1Pending = false;
+        ++g_s1Mat[why];
+        float o[16];
+        for (uint32_t j = 0; j < g_s1n; ++j)
+        {
+            const S1Batch &s = g_s1q[j];
+            for (uint32_t i = 0; i < s.count; ++i)
+            {
+                s1Vertex(s, i, o);
+                std::memcpy(data + ((s.b + i) & 0x3FFu) * 16u, o, 16);
+                std::memcpy(data + ((s.b + 160u + i) & 0x3FFu) * 16u, o + 4, 16);
+                std::memcpy(data + ((s.b + 320u + i) & 0x3FFu) * 16u, o + 8, 16);
+                std::memcpy(data + ((s.b + 480u + i) & 0x3FFu) * 16u, o + 12, 16);
+            }
+        }
+        g_s1n = 0;
+    }
+
+    // one corner's packet values (computeChunk's maths) from stage-1 outputs o[16]: RGBA, STQ
+    void s1CornerOut(const float *o, const float *c0, const float *c1, const GSNativeS1Const &k, int variant, int32_t rgba[4], float stq[3])
+    {
+        const bool p18 = variant == 1 || variant == 5;
+        const float light[4] = {o[12], o[13], o[14], p18 ? o[15] : 1.0f};
+        for (int c = 0; c < 4; ++c)
+            rgba[c] = ftoi(std::fmin(c1[c] * k.s1[c] * light[c] + c1[c] * k.s2[c], 255.0f), 1.0f);
+        const float st3[3] = {c0[0] + k.k[0], c0[1] + k.k[1], c0[2]};
+        for (int c = 0; c < 3; ++c)
+            stq[c] = p18 ? st3[c] : st3[c] * o[7];
+    }
+
+    // the chunk constants (computeChunk / the GPU character path's s1, s2, scroll) + near offset into the batch
+    // constants; a change starts a new serial (the renderer keeps one constant slot per serial)
+    void s1ChunkConst(const uint8_t *data, int variant)
+    {
+        const bool p18 = variant == 1 || variant == 5;
+        const float *v1 = q(data, 1006), *v1007 = q(data, 1007), *mat = q(data, 1019), *scroll = q(data, 1009);
+        float c[13];
+        for (int i = 0; i < 4; ++i)
+        {
+            c[i] = p18 ? v1[i] : v1[i] * (i == 3 ? 128.0f : 255.0f);
+            c[4 + i] = (p18 && i == 3) ? 0.0f : v1007[i] * mat[i];
+        }
+        c[8] = variant == 3 ? 0.0f : scroll[0];
+        c[9] = variant == 3 ? 0.0f : scroll[1];
+        c[10] = c[11] = 0.0f;
+        c[12] = q(data, 1008)[0];
+        if (!g_s1ChunkSet || std::memcmp(c, g_s1Chunk, sizeof(c)) != 0)
+        {
+            std::memcpy(g_s1Chunk, c, sizeof(c));
+            g_s1ChunkSet = true;
+            g_s1GroupSerial = ++g_s1Serial;
+        }
+        if (g_s1ArrSerial == g_s1GroupSerial)
+            return;
+        g_s1ArrSerial = g_s1GroupSerial;
+        g_s1Arr.resize(g_s1n);
+        for (uint32_t j = 0; j < g_s1n; ++j)
+        {
+            GSNativeS1Const &k = g_s1Arr[j];
+            k = g_s1q[j].k;
+            std::memcpy(k.s1, c, 16);
+            std::memcpy(k.s2, c + 4, 16);
+            std::memcpy(k.k, c + 8, 16);
+            k.misc[3] = c[12];
+        }
+    }
+
+    // a stage-2 chunk of the pending batch to the renderer; false = not taken (the caller materialises)
+    bool s1Draw(const uint8_t *code, uint8_t *data, const VU1State &st, uint32_t top, GS &gs)
+    {
+        if (!detectVariant(code, st) || !(g_variant == 0 || g_variant == 1 || g_variant == 3 || g_variant == 5))
+            return false;
+        static const uint32_t s_gpuMask = [] { const char *e = std::getenv("HCTP_GPU_CHARS_MASK"); return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 0xFFu; }();
+        if (!((s_gpuMask >> g_variant) & 1u))
+            return false;
+        uint32_t header;
+        std::memcpy(&header, data + (top & 0x3FFu) * 16u, 4);
+        const uint32_t count = header & 0x7FFFu;
+        if (count == 0u || count > 48u)
+            return false;
+        const int32_t cullMask = st.vi[8];
+        const bool cullTest = g_variant != 5 && cullMask != 0;
+        ++g_s1Vi8[cullMask == 0 ? 0 : cullMask == 32 ? 1 : cullMask == 64 ? 2 : 3];
+        if (cullTest && cullMask != 32)
+            return false; // the GPU cull is one winding rule: other vi8 modes stay on the CPU
+        static thread_local std::vector<GSNativeS1Corner> s_corners;
+        static thread_local std::vector<uint16_t> s_index;
+        s_corners.resize(count);
+        const float mode = g_variant == 1 ? 1.0f : g_variant == 5 ? 2.0f : 0.0f;
+        for (uint32_t k = 0; k < count; ++k)
+        {
+            const uint32_t idx = cornerIndex(data, top, k);
+            const int j = s1Find(idx);
+            if (j < 0)
+                return false; // a corner outside the group's stage-1 outputs
+            const S1Batch &s = g_s1q[static_cast<size_t>(j)];
+            const float *in = &s.in[static_cast<size_t>(idx - s.b) * 12u];
+            GSNativeS1Corner &o = s_corners[k];
+            std::memcpy(o.pos, in, 48); // pos, nrm, wt
+            o.nrm[3] = static_cast<float>(j); // the renderer adds the group's first constant slot
+            std::memcpy(o.c1, q(data, top + 2u + 2u * k), 16);
+            std::memcpy(o.c0, q(data, top + 1u + 2u * k), 12);
+            o.c0[3] = mode;
+        }
+        // strip -> list; with the back-face test the odd triangles are flipped so one winding rule (D3D CULL_BACK)
+        // gives p08's (cross z < 0) + (odd) & vi8 rule (p11 has no parity flip)
+        const bool flipOdd = cullTest && g_variant != 3;
+        s_index.clear();
+        for (uint32_t k = 2; k < count; ++k)
+        {
+            const bool odd = ((k - 2u) & 1u) != 0u;
+            s_index.push_back(static_cast<uint16_t>(flipOdd && odd ? k - 1u : k - 2u));
+            s_index.push_back(static_cast<uint16_t>(flipOdd && odd ? k - 2u : k - 1u));
+            s_index.push_back(static_cast<uint16_t>(k));
+        }
+        s1ChunkConst(data, g_variant);
+        GSNativeChunk chunk;
+        chunk.s1Corners = s_corners.data();
+        chunk.s1 = g_s1Arr.data();
+        chunk.s1Count = g_s1n;
+        chunk.s1Serial = g_s1GroupSerial;
+        chunk.s1Cull = cullTest ? 1u : 0u;
+        chunk.cornerCount = count;
+        chunk.index = s_index.data();
+        chunk.indexCount = static_cast<uint32_t>(s_index.size());
+        // the GS's RGBAQ after the strip = the last corner's
+        float o[16];
+        const uint32_t lastIdx = cornerIndex(data, top, count - 1u);
+        const size_t lastJ = static_cast<size_t>(s1Find(lastIdx));
+        s1Vertex(g_s1q[lastJ], lastIdx - g_s1q[lastJ].b, o);
+        int32_t rgba[4];
+        float stq[3];
+        s1CornerOut(o, q(data, top + 1u + 2u * (count - 1u)), q(data, top + 2u + 2u * (count - 1u)), g_s1Arr[lastJ], g_variant, rgba, stq);
+        const uint8_t lastRgba[4] = {static_cast<uint8_t>(rgba[0]), static_cast<uint8_t>(rgba[1]), static_cast<uint8_t>(rgba[2]),
+                                     static_cast<uint8_t>(rgba[3])};
+        uint64_t tag[2];
+        std::memcpy(tag, data + (top & 0x3FFu) * 16u, 16);
+        bool submitted;
+        {
+            ps2_perf_split::PhaseScope perfSub(ps2_perf_split::PhNatSub);
+            submitted = chunk.indexCount == 0u || gs.submitNativeTris(tag[0], tag[1], chunk, lastRgba, stq);
+        }
+        if (!submitted)
+        {
+            ++g_s1Refused;
+            return false;
+        }
+        ++g_s1GpuChunks;
+        if (g_s1GroupOpen)
+            ++g_s1GroupHist[std::min<uint32_t>(g_s1n, 8u)];
+        g_s1GroupOpen = false; // the next stage-1 MSCAL starts a new group
+        s1Report();
+        return true;
+    }
+
+    // verify: the snapshot maths against the stage-1 outputs the CPU / VU1 left in VU memory
+    void s1VerifyBatch(const uint8_t *data)
+    {
+        if (!g_s1VerifyPending || !data)
+            return;
+        g_s1VerifyPending = false;
+        const S1Batch &s = g_s1v;
+        float o[16];
+        for (uint32_t i = 0; i < s.count; ++i)
+        {
+            s1Vertex(s, i, o);
+            bool ok = true;
+            for (int sec = 0; sec < 4 && ok; ++sec)
+            {
+                const float *vu = q(data, s.b + 160u * static_cast<uint32_t>(sec) + i);
+                for (int c = 0; c < 4; ++c)
+                    if (!(std::fabs(o[sec * 4 + c] - vu[c]) <= 1e-4f * std::fmax(1.0f, std::fabs(vu[c]))))
+                        ok = false;
+            }
+            ++g_s1VerVerts;
+            if (!ok)
+            {
+                ++g_s1VerBad;
+                if (g_s1Dumps++ < 8)
+                {
+                    const float *vu = q(data, s.b + 320u + i);
+                    std::fprintf(stderr, "[gpus1] mismatch b=%u i=%u bones=%d screen %g %g %g %g / vu %g %g %g %g%c", s.b, i, s.bones,
+                                 o[8], o[9], o[10], o[11], vu[0], vu[1], vu[2], vu[3], 10);
+                }
+            }
+        }
+        s1Report();
+    }
+
+    // verify, per packet-path chunk: the GPU rules (winding + vi8, near plane, last corner) against computeChunk's
+    void s1VerifyChunk(const uint8_t *data, const VU1State &st)
+    {
+        if (!g_gpuS1Verify || g_count < 1u || !(g_variant == 0 || g_variant == 1 || g_variant == 3 || g_variant == 5))
+            return;
+        const int32_t cullMask = st.vi[8];
+        ++g_s1Vi8[cullMask == 0 ? 0 : cullMask == 32 ? 1 : cullMask == 64 ? 2 : 3];
+        const bool cullTest = g_variant != 5 && cullMask != 0;
+        if (cullTest && cullMask != 32)
+            return;
+        for (uint32_t k = 2; k < g_count; ++k)
+        {
+            const float *P0 = q(data, cornerIndex(data, g_top, k - 2u) + 320u), *P1 = q(data, cornerIndex(data, g_top, k - 1u) + 320u);
+            const float *P2 = q(data, cornerIndex(data, g_top, k) + 320u);
+            float area = (P1[0] - P0[0]) * (P2[1] - P0[1]) - (P2[0] - P0[0]) * (P1[1] - P0[1]); // > 0: clockwise (y down)
+            if (g_variant != 3 && ((k - 2u) & 1u))
+                area = -area;
+            const bool gpuCulled = cullTest && area < 0.0f;
+            const bool cpuCulled = (g_expected[k].xyz[3] & 0x8000) != 0 && !g_expected[k].flagged && !g_expected[k - 1u].flagged &&
+                                   !g_expected[k - 2u].flagged;
+            const bool anyFlag = g_expected[k].flagged || g_expected[k - 1u].flagged || g_expected[k - 2u].flagged;
+            ++g_s1VerTris;
+            if (!anyFlag && gpuCulled != cpuCulled && area != 0.0f)
+                ++g_s1VerCullBad;
+        }
+        const float nearOff = q(data, 1008)[0];
+        if (g_variant != 5 && std::fabs(nearOff - (st.vf[15][0] + std::fabs(st.vf[15][3]))) > 1e-3f)
+            ++g_s1VerNearBad;
+        s1Report();
+    }
+}
+
+void hctpNativeVu1S1Need(uint8_t *data, int why)
+{
+    if (g_hctpS1Pending)
+        s1Materialise(data, why);
+}
+
+void hctpNativeVu1S1VifWrite(uint8_t *data, uint32_t addr, uint32_t len)
+{
+    if (!g_hctpS1Pending)
+        return;
+    // the outputs live at b, b+160, b+320, b+480 (count qwords each)
+    for (uint32_t j = 0; j < g_s1n; ++j)
+    {
+    const uint32_t b = g_s1q[j].b, n = g_s1q[j].count;
+    for (uint32_t sec = 0; sec < 4u; ++sec)
+    {
+        const uint32_t lo = (b + 160u * sec) & 0x3FFu;
+        for (uint32_t part = 0; part < 2u; ++part)
+        {
+            // the write [addr, addr+len) mod 1024 as up to two plain ranges
+            const uint32_t a0 = part == 0u ? addr : 0u;
+            const uint32_t a1 = part == 0u ? std::min(addr + len, 1024u) : (addr + len > 1024u ? addr + len - 1024u : 0u);
+            if (a1 > a0 && a0 < lo + n && lo < a1)
+            {
+                s1Materialise(data, 1);
+                return;
+            }
+        }
+    }
+    }
+}
+
 void hctpNativeVu1Init()
 {
     const char *v = std::getenv("HCTP_NATIVE_VERIFY");
@@ -629,6 +1075,13 @@ void hctpNativeVu1Init()
 
 bool hctpNativeVu1TryDraw(const uint8_t *code, uint8_t *data, const VU1State &st, uint32_t top, GS &gs)
 {
+    if (g_hctpS1Pending)
+    {
+        ps2_perf_split::PhaseScope perfGpu(ps2_perf_split::PhNatGpu);
+        if (s1Draw(code, data, st, top, gs))
+            return true;
+        s1Materialise(data, 0); // this chunk reads the outputs on the CPU / VU1
+    }
     if (g_lines && !g_on && lineChunk(code, data, st, top))
     {
         for (size_t i = 0; i < g_linePacket.size() / 16u; ++i)
@@ -645,6 +1098,8 @@ bool hctpNativeVu1TryDraw(const uint8_t *code, uint8_t *data, const VU1State &st
     // HCTP_NATIVE_P08_CLIP=0: clipped chunks stay on the VU1 (p05/p06)
     static const char *s_clipEnv = std::getenv("HCTP_NATIVE_P08_CLIP");
     static const bool s_clip = !(s_clipEnv && s_clipEnv[0] == '0');
+    if (g_gpuS1Verify)
+        s1VerifyChunk(data, st);
     if (g_chunkClip && (g_variant != 0 || !s_clip || !buildClipPacket(data, st, top)))
     {
         ++g_vuChunks;
@@ -1256,8 +1711,51 @@ bool hctpNativeVu1Mscal(const uint8_t *code, uint8_t *data, uint32_t startPC)
     }();
     (void)s_init;
     g_p01Pending = false;
+    const bool gpuS1 = gpuS1On();
     if (!data || !isP01(code, startPC))
-        return false;
+        return false; // other programs: ps2_runtime materialises before the ones that may read stage-1
+    if (gpuS1 && !g_on && !g_s1GroupOpen)
+    {
+        // the first stage-1 MSCAL after a drawn chunk: the old group was fully drawn on the GPU
+        if (g_s1n)
+            ++g_s1Dropped;
+        g_s1n = 0;
+        g_hctpS1Pending = false;
+        g_s1GroupOpen = true;
+    }
+    {
+        const Stage1Prog &prog = kStage1[g_s1];
+        uint32_t w1010;
+        std::memcpy(&w1010, data + 1010u * 16u, 4);
+        const bool normalise = prog.normalise && (w1010 & 0xFFFFu) == 0u;
+        if (gpuS1 && !g_on)
+        {
+            // a range that overlaps a queued one (its outputs get overwritten) or a full queue: the queue to VU memory
+            uint32_t w800[2];
+            std::memcpy(w800, data + 800u * 16u, 8);
+            const uint32_t nb = w800[1] & 0xFFFFu, nc = w800[0] & 0xFFFFu;
+            bool overlap = g_s1n >= 8u;
+            for (uint32_t j = 0; j < g_s1n && !overlap; ++j)
+                overlap = nb < g_s1q[j].b + g_s1q[j].count && g_s1q[j].b < nb + nc;
+            if (overlap)
+                s1Materialise(data, 2);
+            if (g_s1q.size() <= g_s1n)
+                g_s1q.emplace_back();
+            if (s1Snapshot(data, prog.bones, prog.weights, normalise, g_s1q[g_s1n]))
+            {
+                ++g_s1n;
+                g_s1ArrSerial = ~0ull;
+                g_s1GroupSerial = ++g_s1Serial;
+                g_hctpS1Pending = true;
+                ++g_s1Batches;
+                return true; // the VU1 and the CPU skip stage-1
+            }
+            // not taken: the VU1 / CPU writes its outputs, the queued ones must be there too
+            s1Materialise(data, 2);
+        }
+        if (g_gpuS1Verify && !g_on)
+            g_s1VerifyPending = s1Snapshot(data, prog.bones, prog.weights, normalise, g_s1v);
+    }
     if (g_on)
     {
         g_p01Pending = p01Compute(data);
@@ -1275,11 +1773,13 @@ bool hctpNativeVu1Mscal(const uint8_t *code, uint8_t *data, uint32_t startPC)
     }
     ++g_p01NativeBatches;
     p01Report();
+    s1VerifyBatch(data);
     return true;
 }
 
 void hctpNativeVu1AfterMscal(const uint8_t *data)
 {
+    s1VerifyBatch(data);
     if (!g_p01Pending || !data)
         return;
     g_p01Pending = false;

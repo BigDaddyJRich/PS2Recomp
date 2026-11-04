@@ -288,8 +288,39 @@ struct GSNativeConst
     float k[4];
 };
 
+// HCTP GPU stage-1 (HCTP_GPU_STAGE1): the corner carries the stage-1 INPUTS (VU1 p01-p04: position, normal, blend
+// weights) and vs_native_s1 does the skinning, the light sum and the projection as well. nrm.w = the batch constant
+// slot (the renderer fills it), c0.w = mode: 0 p08 (L.w = 1, STQ * q), 1 p18 (L.w = light.w, STQ * 1), 2 p19 (as p18,
+// no near clip).
+struct GSNativeS1Corner
+{
+    float pos[4];
+    float nrm[4];
+    float wt[4];
+    float c1[4];
+    float c0[4];
+};
+
+// one stage-1 batch's constants (+ the stage-2 chunk constants), float4 rows as the VU1 reads them
+struct GSNativeS1Const
+{
+    float m[16][4];  // 4 bones (801 + 4k): rows; unused bones zero
+    float pm[4][4];  // projection 1020-1023
+    float l[3][4];   // light directions 1012-1014
+    float c[3][4];   // light colours 1016-1018
+    float misc[4];   // fog a, fog b ([800].zw), normalise (1 / 0), near offset ([1008].x)
+    float s1[4];     // colour scale (GSNativeConst::s1)
+    float s2[4];     // colour add
+    float k[4];      // ST scroll xy, XYOFFSET xy (the renderer fills zw)
+};
+
 struct GSNativeChunk
 {
+    const GSNativeS1Corner *s1Corners = nullptr; // set: a GPU stage-1 chunk (corners / k unused)
+    const GSNativeS1Const *s1 = nullptr;         // the group's constants (s1Count, corner nrm.w = index); nullptr = as the last chunk's (s1Serial)
+    uint32_t s1Count = 0;
+    uint64_t s1Serial = 0;
+    uint32_t s1Cull = 0;                         // 1: cull back faces (odd strip triangles already flipped)
     const GSNativeCorner *corners = nullptr;
     uint32_t cornerCount = 0;
     const uint16_t *index = nullptr; // 3 per triangle

@@ -80,6 +80,7 @@ private:
         ResetPresentation,
         Verify,
         NativeTris, // GSDrawState, u32 count (padded to 16), GSNativeConst, corners, u16 index (GSNativeChunk)
+        NativeTrisS1, // GPU stage-1 chunk (GSThreadedBackend::SubmitNativeTris)
     };
     struct alignas(16) Header
     {

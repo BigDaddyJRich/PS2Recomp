@@ -199,7 +199,10 @@ Texture2D gsPal : register(t3);
 SamplerState gsSamp : register(s0);
 
 struct VsIn  { float4 pos : POSITION; float4 col : COLOR0; float4 tc : TEXCOORD0; };
-struct PsIn  { float4 pos : SV_Position; noperspective float4 col : COLOR0; noperspective float4 tc : TEXCOORD0; };
+#ifndef TC_INTERP
+#define TC_INTERP noperspective
+#endif
+struct PsIn  { float4 pos : SV_Position; noperspective float4 col : COLOR0; TC_INTERP float4 tc : TEXCOORD0; };
 struct PsOut { float4 c0 : SV_Target0; float4 c1 : SV_Target1; };
 
 PsIn vs_main(VsIn v)
@@ -233,6 +236,71 @@ PsIn vs_native(NVsIn v)
     o.pos = float4(hx / rtSize.x * 2.0 - 1.0, 1.0 - y / rtSize.y * 2.0, z, 1.0);
     o.col = (float4)(ci & 255);
     o.tc = float4(stq.x, stq.y, q, p0.w != 0.0 ? (float)fi : 255.0);
+    return o;
+}
+
+// HCTP GPU stage-1 (GSNativeS1Corner): VU1 p01-p04 (4-bone skin, 3 directional lights, projection, fog) and then
+// vs_native's p08/p18 corner maths. Clip space is real (w = projected w): the rasteriser clips the near plane
+// (SV_ClipDistance0 = view z + [1008].x, the plane p05/p06 clip against) and w > 0. tc goes out times w and the
+// ps_main build with TC_INTERP=linear divides it again, so S/Q and T/Q per pixel are screen-linear as on the GS.
+struct S1Const { float4 m[16]; float4 pm[4]; float4 l[3]; float4 c[3]; float4 misc; float4 s1; float4 s2; float4 k; };
+StructuredBuffer<S1Const> s1Const : register(t4);
+struct SVsIn { float4 Pos : POSITION; float4 N : TEXCOORD1; float4 W : TEXCOORD6; float4 C1 : COLOR0; float4 C0 : TEXCOORD2; };
+struct SVsOut { float4 pos : SV_Position; noperspective float4 col : COLOR0; float4 tc : TEXCOORD0; float2 clip : SV_ClipDistance0; };
+SVsOut vs_native_s1(SVsIn v)
+{
+    const S1Const b = s1Const[(uint)v.N.w];
+    precise float4 pos = 0.0;
+    precise float3 n = 0.0;
+    [unroll] for (int k = 0; k < 4; ++k)
+    {
+        precise float4 sk = b.m[4 * k] * v.Pos.x + b.m[4 * k + 1] * v.Pos.y + b.m[4 * k + 2] * v.Pos.z + b.m[4 * k + 3] * v.Pos.w;
+        pos += sk * v.W[k];
+        precise float3 sn = b.m[4 * k].xyz * v.N.x + b.m[4 * k + 1].xyz * v.N.y + b.m[4 * k + 2].xyz * v.N.z;
+        n += sn * v.W[k];
+    }
+    precise float4 cl = b.pm[0] * pos.x + b.pm[1] * pos.y + b.pm[2] * pos.z + b.pm[3] * pos.w;
+    const float w = cl.w;
+    const float qv = 1.0 / w;
+    const float fog = min(max(b.misc.x + w * b.misc.y, 0.0), 255.0);
+    if (b.misc.z != 0.0)
+        n *= 1.0 / sqrt(dot(n, n));
+    const float4 d = max(b.l[0] * n.x + b.l[1] * n.y + b.l[2] * n.z, 0.0);
+    float4 L = b.c[0] * d.x + b.c[1] * d.y + b.c[2] * d.z;
+    const float mode = v.C0.w;
+    if (mode == 0.0)
+        L.w = 1.0;
+    precise float4 col = min(v.C1 * b.s1 * L + v.C1 * b.s2, 255.0); // MUL/MADD, MINI 255
+    const int4 ci = (int4)col;                                       // FTOI0
+    precise float3 stq = float3(v.C0.x + b.k.x, v.C0.y + b.k.y, v.C0.z) * (mode == 0.0 ? qv : 1.0);
+    const float nearD = mode == 2.0 ? 1.0 : pos.z + b.misc.w;
+    SVsOut o;
+    const float3 P = cl.xyz * qv;
+    // exact path only inside p08's CLIP band (|P.xy - 2048| <= 1024): further out FTOI4 overflows and the PS2 would
+    // have sent the triangle to its clipper
+    if (nearD >= 0.0 && w > 1e-5 && abs(P.x - 2048.0) <= 1024.0 && abs(P.y - 2048.0) <= 1024.0)
+    {
+        // a drawn corner: the packet path's FTOI4 / Z24 values, times w
+        const float x = (float)((int)(P.x * 16.0)) / 16.0 - b.k.z;
+        const float y = (float)((int)(P.y * 16.0)) / 16.0 - b.k.w;
+        const uint zi = ((uint)((int)(P.z * 16.0)) >> 4) & 0xFFFFFFu;
+        const float z = min((float)zi, p4.w) / 4294967296.0;
+        const float hx = rtSize.w + (x - rtSize.w) * abs(rtSize.z);
+        o.pos = float4((hx / rtSize.x * 2.0 - 1.0) * w, (1.0 - y / rtSize.y * 2.0) * w, z * w, w);
+    }
+    else
+    {
+        // outside the band or clipped away: the same mapping kept linear in clip space (no divide, no FTOI) so the
+        // clipper's new corners are right
+        const float xw = cl.x - b.k.z * w, yw = cl.y - b.k.w * w;
+        const float hxw = rtSize.w * w + (xw - rtSize.w * w) * abs(rtSize.z);
+        const float zw = w > 0.0 ? min(max(cl.z, 0.0), p4.w * w) : cl.z;
+        o.pos = float4(hxw / rtSize.x * 2.0 - w, w - yw / rtSize.y * 2.0, zw / 4294967296.0, w);
+    }
+    const uint fi = ((uint)((int)(fog * 16.0)) >> 4) & 0xFFu;
+    o.col = (float4)(ci & 255);
+    o.tc = float4(stq * w, p0.w != 0.0 ? (float)fi : 255.0);
+    o.clip = float2(nearD, w - 1e-5);
     return o;
 }
 
@@ -439,6 +507,14 @@ struct GSD3D11Backend::Impl
     ComPtr<ID3D11InputLayout> layoutNative;
     ComPtr<ID3D11Buffer> vbNative;
     uint32_t vbNativeCapacity = 0, vbNativeWriteOffset = 0;
+    // HCTP GPU stage-1 (GSNativeS1Corner): own shaders, vertex ring, batch-constant buffer (t4), back-face raster state
+    ComPtr<ID3D11VertexShader> vsNativeS1;
+    ComPtr<ID3D11PixelShader> psS1; // ps_main with perspective-interpolated tc
+    ComPtr<ID3D11InputLayout> layoutS1;
+    ComPtr<ID3D11Buffer> vbS1, sbS1;
+    ComPtr<ID3D11ShaderResourceView> sbS1Srv;
+    uint32_t vbS1Capacity = 0, vbS1WriteOffset = 0, sbS1Capacity = 0;
+    ComPtr<ID3D11RasterizerState> rasterCullBack;
     ComPtr<ID3D11Buffer> vb, cb, blitCb;
     uint32_t vbCapacity = 0;
     uint32_t vbWriteOffset = 0; // append-only ring: NO_OVERWRITE maps, DISCARD on wrap
@@ -654,8 +730,15 @@ struct GSD3D11Backend::Impl
     GSDrawState pendingState{};
     bool hasPending = false;
     std::vector<GSNativeVtx> pendingNative; // the pending draw is GPU-character corners (pending stays empty)
+    std::vector<GSNativeS1Corner> pendingS1;     // ... or GPU stage-1 corners (pendingIsS1)
+    std::vector<GSNativeS1Const> pendingS1Const; // their batch constants (corner nrm.w = index)
+    std::vector<GSNativeS1Const> s1Cur;          // the last group constants received (threaded: sent once per serial)
+    uint64_t s1CurSerial = ~0ull;
+    int s1Slot = -1; // s1Cur's first index in pendingS1Const, -1 = not in this pending draw
+    bool pendingIsS1 = false;
+    uint32_t pendingS1Cull = 0;
     bool pendingIsNative = false;
-    bool boundNative = false;
+    int boundNative = 0; // 0 packet vertices, 1 GPU characters, 2 GPU stage-1
     float pendingNativeMaxY = 0.0f;
     float pendingNativeBox[4] = {1e9f, 1e9f, -1e9f, -1e9f}; // x0 y0 x1 y1 of the native corners (dirty rect)
     uint64_t frameCounter = 0;
@@ -881,10 +964,11 @@ struct GSD3D11Backend::Impl
         dev = ps2host::device();
         ctx = ps2host::context();
 
+        const D3D_SHADER_MACRO *defines = nullptr;
         auto compile = [&](const char *entry, const char *target, ComPtr<ID3DBlob> &out) -> bool
         {
             ComPtr<ID3DBlob> err;
-            if (FAILED(D3DCompile(kGsShader, std::strlen(kGsShader), "gs_d3d11", nullptr, nullptr, entry, target,
+            if (FAILED(D3DCompile(kGsShader, std::strlen(kGsShader), "gs_d3d11", defines, nullptr, entry, target,
                                   D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &out, &err)))
             {
                 std::fprintf(stderr, "[gs-d3d11] shader %s failed: %s\n", entry,
@@ -924,6 +1008,24 @@ struct GSD3D11Backend::Impl
             };
             dev->CreateInputLayout(iln, 7, vsnb->GetBufferPointer(), vsnb->GetBufferSize(), &layoutNative);
         }
+        ComPtr<ID3DBlob> vss1b, pss1b;
+        if (compile("vs_native_s1", "vs_5_0", vss1b))
+        {
+            dev->CreateVertexShader(vss1b->GetBufferPointer(), vss1b->GetBufferSize(), nullptr, &vsNativeS1);
+            const D3D11_INPUT_ELEMENT_DESC ils[] = {
+                {"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                {"TEXCOORD", 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                {"TEXCOORD", 6, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 32, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 48, D3D11_INPUT_PER_VERTEX_DATA, 0},
+                {"TEXCOORD", 2, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 64, D3D11_INPUT_PER_VERTEX_DATA, 0},
+            };
+            dev->CreateInputLayout(ils, 5, vss1b->GetBufferPointer(), vss1b->GetBufferSize(), &layoutS1);
+            static const D3D_SHADER_MACRO kPersp[] = {{"TC_INTERP", "linear"}, {nullptr, nullptr}};
+            defines = kPersp;
+            if (compile("ps_main", "ps_5_0", pss1b))
+                dev->CreatePixelShader(pss1b->GetBufferPointer(), pss1b->GetBufferSize(), nullptr, &psS1);
+            defines = nullptr;
+        }
 
         D3D11_BUFFER_DESC cbd{};
         cbd.ByteWidth = sizeof(DrawCB);
@@ -952,6 +1054,8 @@ struct GSD3D11Backend::Impl
         rd.ScissorEnable = TRUE;
         rd.DepthClipEnable = FALSE;
         dev->CreateRasterizerState(&rd, &raster);
+        rd.CullMode = D3D11_CULL_BACK; // GPU stage-1: FrontCounterClockwise FALSE = clockwise on screen is front
+        dev->CreateRasterizerState(&rd, &rasterCullBack);
 
         D3D11_BLEND_DESC bd{};
         bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
@@ -2293,9 +2397,15 @@ struct GSD3D11Backend::Impl
     {
         const DrawKey key = makeKey(st);
         const auto &c = st.context;
-        if (hasPending && (!pendingIsNative || !(key == pendingKey) || c.xyoffset.ofx != pendingState.context.xyoffset.ofx ||
-                           c.xyoffset.ofy != pendingState.context.xyoffset.ofy))
+        const bool s1 = chunk.s1Corners != nullptr;
+        if (hasPending && (!pendingIsNative || pendingIsS1 != s1 || (s1 && pendingS1Cull != chunk.s1Cull) || !(key == pendingKey) ||
+                           c.xyoffset.ofx != pendingState.context.xyoffset.ofx || c.xyoffset.ofy != pendingState.context.xyoffset.ofy))
             flushPending();
+        if (s1)
+        {
+            submitS1(st, chunk);
+            return;
+        }
         if (!hasPending)
         {
             pendingKey = key;
@@ -2332,6 +2442,54 @@ struct GSD3D11Backend::Impl
             flushPending();
     }
 
+    // GPU stage-1 chunk: corners + batch constants; positions exist only on the GPU, so the dirty box is the scissor
+    void submitS1(const GSDrawState &st, const GSNativeChunk &chunk)
+    {
+        const auto &c = st.context;
+        if (!hasPending)
+        {
+            pendingKey = makeKey(st);
+            pendingState = st;
+            hasPending = true;
+            pendingIsNative = true;
+            pendingIsS1 = true;
+            pendingS1Cull = chunk.s1Cull;
+            pendingS1Const.clear();
+            s1Slot = -1;
+            pendingNativeMaxY = static_cast<float>(c.scissor.y1);
+            pendingNativeBox[0] = static_cast<float>(c.scissor.x0);
+            pendingNativeBox[1] = static_cast<float>(c.scissor.y0);
+            pendingNativeBox[2] = static_cast<float>(c.scissor.x1);
+            pendingNativeBox[3] = static_cast<float>(c.scissor.y1);
+        }
+        if (chunk.s1 && chunk.s1Serial != s1CurSerial)
+        {
+            s1Cur.assign(chunk.s1, chunk.s1 + chunk.s1Count);
+            s1CurSerial = chunk.s1Serial;
+            s1Slot = -1;
+        }
+        if (s1Slot < 0)
+        {
+            s1Slot = static_cast<int>(pendingS1Const.size());
+            for (GSNativeS1Const k : s1Cur)
+            {
+                k.k[2] = static_cast<float>(c.xyoffset.ofx) / 16.0f;
+                k.k[3] = snapOfy(c.xyoffset.ofy);
+                pendingS1Const.push_back(k);
+            }
+        }
+        const size_t at = pendingS1.size();
+        pendingS1.resize(at + chunk.indexCount);
+        for (uint32_t i = 0; i < chunk.indexCount; ++i)
+        {
+            GSNativeS1Corner &o = pendingS1[at + i];
+            o = chunk.s1Corners[chunk.index[i]];
+            o.nrm[3] += static_cast<float>(s1Slot);
+        }
+        if (pendingS1.size() > 60000 || pendingS1Const.size() >= 4088)
+            flushPending();
+    }
+
     void flushPending()
     {
         if (!hasPending)
@@ -2339,8 +2497,17 @@ struct GSD3D11Backend::Impl
         ps2_host_profile::Scope profScope(ps2_host_profile::GsDraw);
         hasPending = false;
         const bool native = pendingIsNative;
+        const bool s1 = native && pendingIsS1;
         pendingIsNative = false;
-        if (native && (pendingNative.empty() || !gpuReady || !vsNative || !layoutNative))
+        pendingIsS1 = false;
+        s1Slot = -1;
+        if (s1 && (pendingS1.empty() || !gpuReady || !vsNativeS1 || !layoutS1 || !psS1))
+        {
+            pendingS1.clear();
+            pendingS1Const.clear();
+            return;
+        }
+        if (native && !s1 && (pendingNative.empty() || !gpuReady || !vsNative || !layoutNative))
         {
             pendingNative.clear();
             return;
@@ -2356,6 +2523,13 @@ struct GSD3D11Backend::Impl
             bool on;
             ~ClearNative() { if (on) v.clear(); }
         } clearNative{pendingNative, native};
+        struct ClearS1
+        {
+            std::vector<GSNativeS1Corner> &v;
+            std::vector<GSNativeS1Const> &k;
+            bool on;
+            ~ClearS1() { if (on) { v.clear(); k.clear(); } }
+        } clearS1{pendingS1, pendingS1Const, s1};
         const GSDrawState &st = pendingState;
         const auto &c = st.context;
 
@@ -2675,7 +2849,60 @@ struct GSD3D11Backend::Impl
         // ---- vertex upload
         const uint32_t bytes = static_cast<uint32_t>(pending.size() * sizeof(Vtx));
         UINT firstVertex = 0;
-        if (native)
+        if (s1)
+        {
+            const uint32_t nbytes = static_cast<uint32_t>(pendingS1.size() * sizeof(GSNativeS1Corner));
+            if (nbytes > vbS1Capacity)
+            {
+                vbS1.Reset();
+                ++pipeGen;
+                vbS1WriteOffset = 0;
+                D3D11_BUFFER_DESC bd{};
+                bd.ByteWidth = std::max<uint32_t>(nbytes, 16u << 20);
+                bd.Usage = D3D11_USAGE_DYNAMIC;
+                bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+                bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+                if (FAILED(dev->CreateBuffer(&bd, nullptr, &vbS1)))
+                    return;
+                vbS1Capacity = bd.ByteWidth;
+            }
+            D3D11_MAPPED_SUBRESOURCE m{};
+            D3D11_MAP mapType = D3D11_MAP_WRITE_NO_OVERWRITE;
+            if (vbS1WriteOffset + nbytes > vbS1Capacity)
+            {
+                mapType = D3D11_MAP_WRITE_DISCARD;
+                vbS1WriteOffset = 0;
+            }
+            if (FAILED(ctx->Map(vbS1.Get(), 0, mapType, 0, &m)))
+                return;
+            std::memcpy(static_cast<uint8_t *>(m.pData) + vbS1WriteOffset, pendingS1.data(), nbytes);
+            ctx->Unmap(vbS1.Get(), 0);
+            firstVertex = vbS1WriteOffset / static_cast<UINT>(sizeof(GSNativeS1Corner));
+            vbS1WriteOffset += nbytes;
+            // batch constants: a structured buffer rewritten per draw (DISCARD)
+            const uint32_t nconst = static_cast<uint32_t>(pendingS1Const.size());
+            if (nconst > sbS1Capacity)
+            {
+                sbS1.Reset();
+                sbS1Srv.Reset();
+                D3D11_BUFFER_DESC bd{};
+                const uint32_t cap = std::max<uint32_t>(nconst, 4096u);
+                bd.ByteWidth = cap * static_cast<uint32_t>(sizeof(GSNativeS1Const));
+                bd.Usage = D3D11_USAGE_DYNAMIC;
+                bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+                bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+                bd.StructureByteStride = static_cast<uint32_t>(sizeof(GSNativeS1Const));
+                if (FAILED(dev->CreateBuffer(&bd, nullptr, &sbS1)) || FAILED(dev->CreateShaderResourceView(sbS1.Get(), nullptr, &sbS1Srv)))
+                    return;
+                sbS1Capacity = cap;
+            }
+            if (FAILED(ctx->Map(sbS1.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
+                return;
+            std::memcpy(m.pData, pendingS1Const.data(), nconst * sizeof(GSNativeS1Const));
+            ctx->Unmap(sbS1.Get(), 0);
+        }
+        else if (native)
         {
             const uint32_t nbytes = static_cast<uint32_t>(pendingNative.size() * sizeof(GSNativeVtx));
             if (nbytes > vbNativeCapacity)
@@ -2821,9 +3048,10 @@ struct GSD3D11Backend::Impl
 
         // ---- pipeline
         const uint64_t hostEpoch = ps2host::d3dStateEpoch();
-        if (native != boundNative)
+        const int nativeMode = s1 ? 2 : native ? 1 : 0;
+        if (nativeMode != boundNative)
         {
-            boundNative = native;
+            boundNative = nativeMode;
             ++pipeGen; // the vertex format / shader change
         }
         if (bound.gen != pipeGen || bound.hostEpoch != hostEpoch)
@@ -2834,13 +3062,13 @@ struct GSD3D11Backend::Impl
             bound.vp.Width = -1.0f; // force
             bound.sc.right = -1;
             ctx->RSSetState(raster.Get());
-            ctx->IASetInputLayout(native ? layoutNative.Get() : layout.Get());
+            ctx->IASetInputLayout(s1 ? layoutS1.Get() : native ? layoutNative.Get() : layout.Get());
             ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            UINT stride = native ? static_cast<UINT>(sizeof(GSNativeVtx)) : static_cast<UINT>(sizeof(Vtx)), offset = 0;
-            ID3D11Buffer *vbp = native ? vbNative.Get() : vb.Get();
+            UINT stride = s1 ? static_cast<UINT>(sizeof(GSNativeS1Corner)) : native ? static_cast<UINT>(sizeof(GSNativeVtx)) : static_cast<UINT>(sizeof(Vtx)), offset = 0;
+            ID3D11Buffer *vbp = s1 ? vbS1.Get() : native ? vbNative.Get() : vb.Get();
             ctx->IASetVertexBuffers(0, 1, &vbp, &stride, &offset);
-            ctx->VSSetShader(native ? vsNative.Get() : vs.Get(), nullptr, 0);
-            ctx->PSSetShader(ps.Get(), nullptr, 0);
+            ctx->VSSetShader(s1 ? vsNativeS1.Get() : native ? vsNative.Get() : vs.Get(), nullptr, 0);
+            ctx->PSSetShader(s1 ? psS1.Get() : ps.Get(), nullptr, 0);
             ctx->GSSetShader(nullptr, nullptr, 0);
             ID3D11Buffer *cbp = cb.Get();
             ctx->VSSetConstantBuffers(0, 1, &cbp);
@@ -2935,7 +3163,17 @@ struct GSD3D11Backend::Impl
                 bound.ds = ds;
             }
             const int gq = gpOn ? gpBegin({gpKey[0], gpKey[1], gpKey[2], gpKey[3], gpKey[4] | (afailSelect != 0.0f ? 1u : 0u), gpKey[5], gpKey[6] | (depthWrite ? 0x80000000u : 0u)}, gpPx, static_cast<uint32_t>(pending.size())) : -1;
-            ctx->Draw(static_cast<UINT>(native ? pendingNative.size() : pending.size()), firstVertex);
+            if (s1)
+            {
+                // the batch constants (t4) and the back-face state for this draw only; the cached pipeline keeps raster
+                ID3D11ShaderResourceView *sb = sbS1Srv.Get();
+                ctx->VSSetShaderResources(4, 1, &sb);
+                if (pendingS1Cull)
+                    ctx->RSSetState(rasterCullBack.Get());
+            }
+            ctx->Draw(static_cast<UINT>(s1 ? pendingS1.size() : native ? pendingNative.size() : pending.size()), firstVertex);
+            if (s1 && pendingS1Cull)
+                ctx->RSSetState(raster.Get());
             gpEnd(gq);
         };
 
