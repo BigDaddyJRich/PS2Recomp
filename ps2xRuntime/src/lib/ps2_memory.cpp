@@ -34,6 +34,44 @@ namespace ps2_stubs { void mpegIpuToDmaStart(uint8_t *rdram, uint32_t &chcr, uin
 
 namespace
 {
+    // DMA chain snapshots (PendingTransfer::chainData) recycled: a fresh large vector per kick cost the game thread
+    // ~15% (page faults on new pages + regrowth copies + NtFreeVirtualMemory). HCTP_CHAINBUF_POOL=0 = old behaviour.
+    std::mutex g_chainPoolMutex;
+    std::vector<std::vector<uint8_t>> g_chainPool;
+    bool chainPoolOn()
+    {
+        static const bool on = [] { const char *e = std::getenv("HCTP_CHAINBUF_POOL"); return !(e && e[0] == '0'); }();
+        return on;
+    }
+    std::vector<uint8_t> takeChainBuf()
+    {
+        if (chainPoolOn())
+        {
+            std::lock_guard<std::mutex> lock(g_chainPoolMutex);
+            if (!g_chainPool.empty())
+            {
+                std::vector<uint8_t> v = std::move(g_chainPool.back());
+                g_chainPool.pop_back();
+                v.clear();
+                return v;
+            }
+        }
+        return {};
+    }
+    template <class List>
+    void recycleChainBufs(List &list)
+    {
+        if (!chainPoolOn())
+            return;
+        std::lock_guard<std::mutex> lock(g_chainPoolMutex);
+        for (auto &p : list)
+            if (p.chainData.capacity() != 0u && g_chainPool.size() < 16u && p.chainData.capacity() <= (64u << 20))
+                g_chainPool.push_back(std::move(p.chainData));
+    }
+}
+
+namespace
+{
     // Guest RAM: PS2_RAM_BACKING_SIZE reserved, pages committed on request (zero-filled by the host).
     uint8_t *reserveGuestRam()
     {
@@ -1645,7 +1683,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
                     const int kMaxChainTags = 1 << 20; // runaway guard only (was 4096: long chains were cut, PS2Recomp-Fixer row 43)
-                    std::vector<uint8_t> chainBuf;
+                    std::vector<uint8_t> chainBuf = takeChainBuf();
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                     {
@@ -2242,6 +2280,7 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
+    recycleChainBufs(m_pendingGifTransfers);
     m_pendingGifTransfers.clear();
 
     const bool hadVif0 = !m_pendingVif0Transfers.empty();
@@ -2300,6 +2339,7 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
+    recycleChainBufs(m_pendingVif0Transfers);
     m_pendingVif0Transfers.clear();
 
     const bool hadVif1 = !m_pendingVif1Transfers.empty();
@@ -2358,6 +2398,7 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
+    recycleChainBufs(m_pendingVif1Transfers);
     m_pendingVif1Transfers.clear();
 
     // the GIF arbiter's queue to the GS (the chain does it after the data it was given; nothing to do if none)
