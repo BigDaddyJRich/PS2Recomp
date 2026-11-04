@@ -57,12 +57,21 @@ namespace
     struct ZMirror
     {
         const uint8_t *data = nullptr;
-        uint32_t pitch = 0, scale = 1, w = 0, h = 0, zbp = 0xFFFFFFFFu, dtPsm = 0;
+        uint32_t pitch = 0, scale = 1, bpp = 8, w = 0, h = 0, zbp = 0xFFFFFFFFu, dtPsm = 0;
         const void *slot = nullptr; // the DepthRing it maps
     };
     std::mutex g_zmMutex;
     std::vector<ZMirror> g_zm;
     std::atomic<uint64_t> g_zmBusy{0}, g_zmHits{0}, g_zmMiss{0}, g_zmMissEmpty{0}, g_zmMissZbp{0}, g_zmMissRect{0};
+
+    // One PS2 pixel's depth from a mapped depth copy: the full-scale copy has scale x scale D32_FLOAT_S8X24 texels
+    // (float + stencil/pad, bpp 8) per pixel - read the centre one; the 1x snapshot has one float (scale 1, bpp 4).
+    float depthAt(const uint8_t *data, uint32_t pitch, uint32_t scale, uint32_t bpp, uint32_t x, uint32_t y)
+    {
+        float f;
+        std::memcpy(&f, data + (y * scale + scale / 2u) * pitch + (x * scale + scale / 2u) * bpp, 4);
+        return f;
+    }
 }
 
 bool hctpDepthMirrorRead(uint32_t zbp, uint32_t psm, uint32_t x0, uint32_t y0, uint32_t w, uint32_t h, uint8_t *dst)
@@ -79,11 +88,9 @@ bool hctpDepthMirrorRead(uint32_t zbp, uint32_t psm, uint32_t x0, uint32_t y0, u
         const double top = wpsm == GS_PSM_Z32 ? 4294967295.0 : wpsm == GS_PSM_Z24 ? 16777215.0 : 65535.0;
         for (uint32_t y = y0; y < y0 + h; ++y)
         {
-            const uint8_t *row = m.data + (y * m.scale + m.scale / 2u) * m.pitch;
             for (uint32_t x = x0; x < x0 + w; ++x)
             {
-                float f;
-                std::memcpy(&f, row + (x * m.scale + m.scale / 2u) * 8u, 4); // D32_FLOAT_S8X24
+                const float f = depthAt(m.data, m.pitch, m.scale, m.bpp, x, y);
                 uint32_t z = static_cast<uint32_t>(std::clamp(static_cast<double>(f) * 4294967296.0, 0.0, top));
                 if (psm == GS_PSM_Z16 || psm == GS_PSM_Z16S)
                 {
@@ -502,6 +509,14 @@ float4 ps_blit(BlitOut i) : SV_Target
 {
     return blitTex.SampleLevel(blitSamp, blitRect.xy + i.uv * blitRect.zw, 0);
 }
+// Depth snapshot for host reads (blitRect.x = scale): one texel per PS2 pixel, the centre sample of its scale x scale
+// block - the sample the readers took from the full copy - so the CPU copy is 640x512 floats at any scale.
+Texture2D<float> zsnapTex : register(t0);
+float ps_zsnap(BlitOut i) : SV_Target
+{
+    int s = (int)blitRect.x;
+    return zsnapTex.Load(int3(int2(i.pos.xy) * s + s / 2, 0));
+}
 // DATE pre-pass: keep (stencil = 1) the pixels whose destination alpha bit 7 equals DATM (blitRect.x).
 // Render-target alpha is stored as GS alpha / 128, so bit 7 set <=> stored value >= 1.0.
 Texture2D dateTex : register(t1);
@@ -566,7 +581,7 @@ struct GSD3D11Backend::Impl
     ComPtr<ID3D11Device> dev;
     ComPtr<ID3D11DeviceContext> ctx;
     ComPtr<ID3D11VertexShader> vs, vsBlit;
-    ComPtr<ID3D11PixelShader> ps, psBlit, psDate;
+    ComPtr<ID3D11PixelShader> ps, psBlit, psDate, psZsnap;
     ComPtr<ID3D11BlendState> blendNoColor;
     ComPtr<ID3D11DepthStencilState> dsDateMark;
     ComPtr<ID3D11InputLayout> layout;
@@ -643,6 +658,7 @@ struct GSD3D11Backend::Impl
         ComPtr<ID3D11Texture2D> tex;
         uint32_t w = 0, h = 0, zbp = 0xFFFFFFFFu;
         uint64_t frame = ~0ull;
+        bool oneX = false; // holds the 1x R32_FLOAT snapshot (depthSnapResolve), not the full-scale depth
     };
 
     struct DepthTarget
@@ -652,6 +668,9 @@ struct GSD3D11Backend::Impl
         uint32_t psm = GS_PSM_Z32; // ZBUF.PSM of the last depth-tested draw (Z24 leaves the top byte alone)
         ComPtr<ID3D11Texture2D> tex;
         ComPtr<ID3D11DepthStencilView> dsv;
+        ComPtr<ID3D11ShaderResourceView> srv;   // depth as R32_FLOAT_X8X24 (snapshot source)
+        ComPtr<ID3D11Texture2D> snap;           // w x h R32_FLOAT: one depth per PS2 pixel
+        ComPtr<ID3D11RenderTargetView> snapRtv; // null = HCTP_ZSNAP_FULL (whole-target copies)
         bool readbackObserved = false; // the guest has read this target back: Present snapshots it (depthRingCopy)
         DepthRing ring[2];
         DepthRing zring[5]; // HCTP_ZREAD_NODRAIN: the game thread's copies (ring is the GS thread's)
@@ -1049,11 +1068,13 @@ struct GSD3D11Backend::Impl
             }
             return true;
         };
-        ComPtr<ID3DBlob> vsb, psb, vsbb, psbb, psdb;
+        ComPtr<ID3DBlob> vsb, psb, vsbb, psbb, psdb, pszb;
         if (!compile("vs_main", "vs_5_0", vsb) || !compile("ps_main", "ps_5_0", psb) ||
-            !compile("vs_blit", "vs_5_0", vsbb) || !compile("ps_blit", "ps_5_0", psbb) || !compile("ps_date", "ps_5_0", psdb))
+            !compile("vs_blit", "vs_5_0", vsbb) || !compile("ps_blit", "ps_5_0", psbb) || !compile("ps_date", "ps_5_0", psdb) ||
+            !compile("ps_zsnap", "ps_5_0", pszb))
             return false;
         dev->CreatePixelShader(psdb->GetBufferPointer(), psdb->GetBufferSize(), nullptr, &psDate);
+        dev->CreatePixelShader(pszb->GetBufferPointer(), pszb->GetBufferSize(), nullptr, &psZsnap);
         dev->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, &vs);
         dev->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, &ps);
         dev->CreateVertexShader(vsbb->GetBufferPointer(), vsbb->GetBufferSize(), nullptr, &vsBlit);
@@ -1184,7 +1205,8 @@ struct GSD3D11Backend::Impl
     }
 
     void blit(ID3D11ShaderResourceView *src, ID3D11RenderTargetView *dst, float dstW, float dstH,
-              float u0, float v0, float us, float vs_, bool linear, float dstX = 0.0f, float dstY = 0.0f)
+              float u0, float v0, float us, float vs_, bool linear, float dstX = 0.0f, float dstY = 0.0f,
+              ID3D11PixelShader *pixelShader = nullptr)
     {
         ++pipeGen;
         D3D11_MAPPED_SUBRESOURCE m{};
@@ -1205,7 +1227,7 @@ struct GSD3D11Backend::Impl
         ctx->IASetInputLayout(nullptr);
         ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx->VSSetShader(vsBlit.Get(), nullptr, 0);
-        ctx->PSSetShader(psBlit.Get(), nullptr, 0);
+        ctx->PSSetShader(pixelShader ? pixelShader : psBlit.Get(), nullptr, 0);
         ID3D11Buffer *b = blitCb.Get();
         ctx->PSSetConstantBuffers(0, 1, &b);
         ctx->PSSetShaderResources(0, 1, &src);
@@ -1399,8 +1421,7 @@ struct GSD3D11Backend::Impl
     // A local->host transfer of a Z buffer (CGmLensFlare::ReadZbuffer 0x228d40 / CFlash::SynchCallBack 0x22bd20
     // StoreImage a 4x4 PSMZ24 block at the flash's screen position to hide flashes behind wrestlers): GS depth
     // lives only on the GPU, so write the requested rect of the depth target back to GS memory first.
-    ComPtr<ID3D11Texture2D> depthStaging;
-    uint32_t depthStagingW = 0, depthStagingH = 0;
+    DepthRing depthExact; // the exact (copy + wait) read's staging copy
     // One-frame-late depth reads (default): the readers are visibility tests for flares/flashes, many tiny reads
     // a frame during an entrance. Copying the whole depth target and waiting for the GPU on every read stalled the
     // GS thread, and the game thread behind it, to ~40 fps. Now the target is copied at most once a frame into a
@@ -1411,26 +1432,64 @@ struct GSD3D11Backend::Impl
     // exact fallback when HCTP skips reading for a frame (the 6-9 ms Map stalls). HCTP_ZREADBACK_ONDEMAND=1 = the
     // previous first-read-of-the-frame copy.
     const bool depthPresentSnapshots = std::getenv("HCTP_ZREADBACK_ONDEMAND") == nullptr;
-    bool depthRingCopy(DepthRing &slot, DepthTarget &dt, const D3D11_TEXTURE2D_DESC &src)
+    // Entrance-start stutter at 5x (Nov 4): every copy below was the whole scaled D32_FLOAT_S8X24 target (640x512 x
+    // 5x5 x 8 B = 65 MB) into CPU-readable staging, two a frame per read-back target plus 7 such staging textures
+    // created when the first flare/flash read came - for 2x2/4x4 reads. Now the GPU first reduces the target to one
+    // float per PS2 pixel (ps_zsnap, the same centre sample the readers took) and only that 1.3 MB is copied.
+    // HCTP_ZSNAP_FULL=1 = the old whole-target copies.
+    const bool zSnapSmall = std::getenv("HCTP_ZSNAP_FULL") == nullptr;
+    void depthSnapResolve(DepthTarget &dt)
     {
-        if (!slot.tex || slot.w != src.Width || slot.h != src.Height)
+        gpTag = "depth-snap";
+        blit(dt.srv.Get(), dt.snapRtv.Get(), static_cast<float>(dt.w), static_cast<float>(dt.h), static_cast<float>(scale),
+             0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, psZsnap.Get());
+    }
+    // snapReady: dt.snap already holds this depth (a second copy of the same frame)
+    bool depthRingCopy(DepthRing &slot, DepthTarget &dt, const D3D11_TEXTURE2D_DESC &src, bool snapReady = false)
+    {
+        const bool oneX = dt.snapRtv != nullptr;
+        if (!slot.tex || slot.w != src.Width || slot.h != src.Height || slot.oneX != oneX)
         {
             slot.tex.Reset();
             D3D11_TEXTURE2D_DESC td = src;
+            if (oneX)
+            {
+                td.Width = dt.w;
+                td.Height = dt.h;
+                td.Format = DXGI_FORMAT_R32_FLOAT;
+            }
             td.Usage = D3D11_USAGE_STAGING;
             td.BindFlags = 0;
             td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
             td.MiscFlags = 0;
             if (FAILED(dev->CreateTexture2D(&td, nullptr, &slot.tex)))
                 return false;
-            slot.w = src.Width;
+            slot.w = src.Width; // the depth target's size: what the readers compare against
             slot.h = src.Height;
+            slot.oneX = oneX;
         }
+        if (oneX && !snapReady)
+            depthSnapResolve(dt);
         gpTag = "depth-ring-copy";
-        ctx->CopyResource(slot.tex.Get(), dt.tex.Get()); // depth-stencil copies must be whole-resource
+        ctx->CopyResource(slot.tex.Get(), oneX ? dt.snap.Get() : dt.tex.Get()); // depth-stencil copies must be whole-resource
         slot.zbp = dt.zbpBlock;
         slot.frame = frameCounter;
         return true;
+    }
+    // read a mapped ring slot's depth for the rect into GS memory in the format the depth was drawn in
+    void depthWriteback(const DepthRing &slot, const D3D11_MAPPED_SUBRESOURCE &m, const DepthTarget &dt, uint32_t sbp,
+                        uint32_t sbw, uint32_t spsm, uint32_t x0, uint32_t y0, uint32_t w, uint32_t h)
+    {
+        const uint32_t wpsm = depthWritebackPsm(spsm, dt);
+        const double top = wpsm == GS_PSM_Z32 ? 4294967295.0 : wpsm == GS_PSM_Z24 ? 16777215.0 : 65535.0;
+        const uint32_t s = slot.oneX ? 1u : scale, bpp = slot.oneX ? 4u : 8u;
+        for (uint32_t y = y0; y < y0 + h && y < dt.h; ++y)
+            for (uint32_t x = x0; x < x0 + w && x < dt.w; ++x)
+            {
+                const float f = depthAt(static_cast<const uint8_t *>(m.pData), m.RowPitch, s, bpp, x, y);
+                const double z = std::clamp(static_cast<double>(f) * 4294967296.0, 0.0, top);
+                mem.WriteVram(wpsm, sbp, sbw, x, y, static_cast<uint32_t>(z));
+            }
     }
     void syncDepthRect(uint32_t sbp, uint32_t sbw, uint32_t spsm, uint32_t x0, uint32_t y0, uint32_t w, uint32_t h)
     {
@@ -1453,38 +1512,13 @@ struct GSD3D11Backend::Impl
         flushPending();
         D3D11_TEXTURE2D_DESC td{};
         dt->tex->GetDesc(&td);
-        if (!depthStaging || depthStagingW != td.Width || depthStagingH != td.Height)
-        {
-            depthStaging.Reset();
-            td.Usage = D3D11_USAGE_STAGING;
-            td.BindFlags = 0;
-            td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-            td.MiscFlags = 0;
-            if (FAILED(dev->CreateTexture2D(&td, nullptr, &depthStaging)))
-                return;
-            depthStagingW = td.Width;
-            depthStagingH = td.Height;
-        }
-        gpTag = "depth-readback";
-        ctx->CopyResource(depthStaging.Get(), dt->tex.Get()); // depth-stencil copies must be whole-resource
-        D3D11_MAPPED_SUBRESOURCE m{};
-        if (FAILED(ctx->Map(depthStaging.Get(), 0, D3D11_MAP_READ, 0, &m)))
+        if (!depthRingCopy(depthExact, *dt, td))
             return;
-        const uint32_t wpsm = depthWritebackPsm(spsm, *dt);
-        const double top = wpsm == GS_PSM_Z32 ? 4294967295.0 : wpsm == GS_PSM_Z24 ? 16777215.0 : 65535.0;
-        for (uint32_t y = y0; y < y0 + h && y < dt->h; ++y)
-        {
-            const uint32_t sy = y * scale + scale / 2u;
-            const uint8_t *row = static_cast<const uint8_t *>(m.pData) + sy * m.RowPitch;
-            for (uint32_t x = x0; x < x0 + w && x < dt->w; ++x)
-            {
-                float f;
-                std::memcpy(&f, row + (x * scale + scale / 2u) * 8u, 4); // D32_FLOAT_S8X24: float + stencil/pad
-                const double z = std::clamp(static_cast<double>(f) * 4294967296.0, 0.0, top);
-                mem.WriteVram(wpsm, sbp, sbw, x, y, static_cast<uint32_t>(z));
-            }
-        }
-        ctx->Unmap(depthStaging.Get(), 0);
+        D3D11_MAPPED_SUBRESOURCE m{};
+        if (FAILED(ctx->Map(depthExact.tex.Get(), 0, D3D11_MAP_READ, 0, &m)))
+            return;
+        depthWriteback(depthExact, m, *dt, sbp, sbw, spsm, x0, y0, w, h);
+        ctx->Unmap(depthExact.tex.Get(), 0);
     }
 
     // false = not handled (no previous-frame copy yet, or no depth target): the caller does the exact read.
@@ -1523,20 +1557,7 @@ struct GSD3D11Backend::Impl
         D3D11_MAPPED_SUBRESOURCE m{};
         if (FAILED(ctx->Map(snapshot->tex.Get(), 0, D3D11_MAP_READ, 0, &m)))
             return false;
-        const uint32_t wpsm = depthWritebackPsm(spsm, *dt);
-        const double top = wpsm == GS_PSM_Z32 ? 4294967295.0 : wpsm == GS_PSM_Z24 ? 16777215.0 : 65535.0;
-        for (uint32_t y = y0; y < y0 + h && y < dt->h; ++y)
-        {
-            const uint32_t sy = y * scale + scale / 2u;
-            const uint8_t *row = static_cast<const uint8_t *>(m.pData) + sy * m.RowPitch;
-            for (uint32_t x = x0; x < x0 + w && x < dt->w; ++x)
-            {
-                float f;
-                std::memcpy(&f, row + (x * scale + scale / 2u) * 8u, 4); // D32_FLOAT_S8X24: float + stencil/pad
-                const double z = std::clamp(static_cast<double>(f) * 4294967296.0, 0.0, top);
-                mem.WriteVram(wpsm, sbp, sbw, x, y, static_cast<uint32_t>(z));
-            }
-        }
+        depthWriteback(*snapshot, m, *dt, sbp, sbw, spsm, x0, y0, w, h);
         ctx->Unmap(snapshot->tex.Get(), 0);
         return true;
     }
@@ -1558,7 +1579,7 @@ struct GSD3D11Backend::Impl
                 // serving the one before (the GPU runs 1-2 frames behind in heavy entrances; DO_NOT_WAIT failed there)
                 DepthRing &oldest = dt.zring[frameCounter % 5u];
                 zMirrorRelease(&oldest);
-                depthRingCopy(oldest, dt, td);
+                depthRingCopy(oldest, dt, td, true); // dt.snap was made for the ring copy above
                 // newest finished copy wins (the GPU can be several frames behind the copies)
                 for (uint32_t k = 1u; k < 5u; ++k)
                     if (zMirrorPublish(dt, dt.zring[(frameCounter + 5u - k) % 5u], frameCounter - k))
@@ -1603,7 +1624,8 @@ struct GSD3D11Backend::Impl
         ZMirror z;
         z.data = static_cast<const uint8_t *>(m.pData);
         z.pitch = m.RowPitch;
-        z.scale = scale;
+        z.scale = prev.oneX ? 1u : scale;
+        z.bpp = prev.oneX ? 4u : 8u;
         z.w = dt.w;
         z.h = dt.h;
         z.zbp = dt.zbpBlock;
@@ -1762,26 +1784,49 @@ struct GSD3D11Backend::Impl
                 // is big enough (new ones start at 640x512).
                 if (d.w >= w && d.h >= h)
                     return &d;
-                d.tex.Reset();
-                d.dsv.Reset();
                 d.w = std::max(w, d.w);
                 d.h = std::max(h, d.h);
-                if (!createTexture(d.w * scale, d.h * scale, D3D11_BIND_DEPTH_STENCIL, d.tex, DXGI_FORMAT_D32_FLOAT_S8X24_UINT))
-                    return nullptr;
-                dev->CreateDepthStencilView(d.tex.Get(), nullptr, &d.dsv);
-                ctx->ClearDepthStencilView(d.dsv.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
-                return &d;
+                return createDepthTex(d) ? &d : nullptr;
             }
         DepthTarget d;
         d.zbpBlock = zbpBlock;
         d.w = std::max(w, 640u); // room for the frame-sized targets that share this ZBP (see above)
         d.h = std::max(h, 512u);
-        if (!createTexture(d.w * scale, d.h * scale, D3D11_BIND_DEPTH_STENCIL, d.tex, DXGI_FORMAT_D32_FLOAT_S8X24_UINT))
+        if (!createDepthTex(d))
             return nullptr;
-        dev->CreateDepthStencilView(d.tex.Get(), nullptr, &d.dsv);
-        ctx->ClearDepthStencilView(d.dsv.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
         depths.push_back(std::move(d));
         return &depths.back();
+    }
+    // (Re)creates d's scaled depth buffer, cleared; with the 1x snapshot (zSnapSmall) the buffer is typeless so the
+    // snapshot pass can read it.
+    bool createDepthTex(DepthTarget &d)
+    {
+        d.tex.Reset();
+        d.dsv.Reset();
+        d.srv.Reset();
+        d.snap.Reset();
+        d.snapRtv.Reset();
+        if (!createTexture(d.w * scale, d.h * scale, D3D11_BIND_DEPTH_STENCIL | (zSnapSmall ? D3D11_BIND_SHADER_RESOURCE : 0u),
+                           d.tex, zSnapSmall ? DXGI_FORMAT_R32G8X24_TYPELESS : DXGI_FORMAT_D32_FLOAT_S8X24_UINT))
+            return false;
+        D3D11_DEPTH_STENCIL_VIEW_DESC dv{};
+        dv.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+        dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+        if (FAILED(dev->CreateDepthStencilView(d.tex.Get(), &dv, &d.dsv)))
+            return false;
+        ctx->ClearDepthStencilView(d.dsv.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
+        if (zSnapSmall)
+        {
+            D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+            sv.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+            sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            sv.Texture2D.MipLevels = 1;
+            // no snapshot target = the readers fall back to whole-target copies
+            if (SUCCEEDED(dev->CreateShaderResourceView(d.tex.Get(), &sv, &d.srv)) &&
+                createTexture(d.w, d.h, D3D11_BIND_RENDER_TARGET, d.snap, DXGI_FORMAT_R32_FLOAT))
+                dev->CreateRenderTargetView(d.snap.Get(), nullptr, &d.snapRtv);
+        }
+        return true;
     }
 
     // ---------------------------------------------------------------- textures
