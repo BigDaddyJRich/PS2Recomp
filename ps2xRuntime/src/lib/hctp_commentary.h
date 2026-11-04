@@ -28,6 +28,9 @@ extern "C" void hctpCommentaryEvent(uint32_t event);
 // An entrance starts (hooks in the overrides): Howard Finkel introduces roster id `rosterId`
 // from BGM/FINKEL.afs + BGM/FINKEL_LINES.csv (roster_id,kind,clip,text; tools/build_finkel_pack.py).
 extern "C" void hctpCommentaryEntrance(uint32_t rosterId);
+extern "C" void hctpCommentaryEntranceGroup(const uint32_t *rosterIds, uint32_t count);
+extern "C" void hctpCommentarySetTitleMatch(uint32_t belt);
+extern "C" void hctpCommentaryRumbleEntrant(uint32_t rosterId);
 
 // A wrestler's move made a sound (GameSE hook): chara = CChar* (guest address), moveId = CChar+0xA4.
 // New moves that are in SvR's finisher tables (11-12 Cole/Tazz, 28-29 JR/King: wrestler, move, clip, delay) get called.
@@ -45,3 +48,6 @@ extern "C" void hctpCommentaryBrand(int brand);
 
 // Who is in the match (roster ids), sent at the opening bell -> wrestler-specific banter (SvR tables 4 / 22, w0 = id).
 extern "C" void hctpCommentaryParticipants(const uint32_t *rosterIds, uint32_t count);
+
+// The match rule (eRuleType at 0x4920C0) and bra & panties flag (rule +0x27), sent at the opening bell before the bell event.
+extern "C" void hctpCommentaryBellRule(uint32_t rule, uint32_t braPanties);

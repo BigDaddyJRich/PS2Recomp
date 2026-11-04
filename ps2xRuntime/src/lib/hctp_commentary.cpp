@@ -40,10 +40,13 @@ namespace
     struct TeamTables
     {
         int welcome, prediction, title, banter, wrestlerBanter, outside, matchEnd, tag, interfere, finisherA, finisherB,
-            moveReaction; // rows (move id, clip, chance %) - "What a shot!", "That's so dirty" (ids 1200-1203)
+            moveReaction, // rows (move id, clip, chance %) - "What a shot!", "That's so dirty" (ids 1200-1203)
+            women,        // women's-match banter (SvR cat 9: Cole id 9, JR id 27)
+            braPanties;   // bra & panties banter (SvR cat 11: Cole id 11, JR id 30)
     };
-    constexpr TeamTables kColeTazz = {0, 1, 2, 3, 4, 5, 6, 8, 9, 11, 12, 7};
-    constexpr TeamTables kJrKing = {18, 19, 20, 21, 22, 5 /*no Raw table found yet*/, 23, 25, 26, 28, 29, 24};
+    constexpr TeamTables kColeTazz = {0, 1, 2, 3, 4, 5, 6, 8, 9, 11, 12, 7, 10, 13};
+    // JR/King outside = id 21 (SvR maps cat 4 punishment to the JR banter table, 0x34c6b0)
+    constexpr TeamTables kJrKing = {18, 19, 20, 21, 22, 21, 23, 25, 26, 28, 29, 24, 27, 30};
 
     using Clock = std::chrono::steady_clock;
 
@@ -170,6 +173,80 @@ namespace
             std::fprintf(stderr, "%c", 10);
         }
 
+        // at the opening bell (cage / HIAC / Chamber / Rumble have no entrances): rule byte 0x4920C0 and the B&P flag
+        // (rule object +0x27: MakeKindBit2 0x1d37b0 only allows the Brapan moves 0x1130-0x113D when it is set)
+        void setBellRule(uint32_t rule, bool braPanties)
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            matchRule_ = rule & 0xFFu;
+            braPanties_ = braPanties;
+            std::fprintf(stderr, "[hctp-pbp] bell rule 0x%02X%s%c", matchRule_, braPanties ? " (bra & panties)" : "", 10);
+            // Royal Rumble (0x0D debug "ROYAL RUMBLE" / 0x52): no entrance events. Opening bell (inMatch_ still false;
+            // the match-end bell comes with it true): LoW Finkel 1369 "it is now time for the Royal Rumble ... the
+            // individual who drew number one" + the first starter, 1418 "here is the individual who drew number two"
+            // + the second; later entrants: rumbleEntrant (CGameSync::Draw spawn hook)
+            if ((matchRule_ == 0x0Du || matchRule_ == 0x52u) && !inMatch_)
+            {
+                rumbleCount_ = 0;
+                std::vector<uint32_t> starters;
+                for (uint32_t id : participants_)
+                    if ((id & kRosterMask) != 0x31u && (id & kRosterMask) != 0x33u && starters.size() < 2u)
+                        starters.push_back(id & kRosterMask);
+                for (size_t k = 0; k < starters.size(); ++k)
+                {
+                    queue_.push_back({uint16_t(k ? 1418 : 1369), k ? 0.25 : 1.0, 14u});
+                    if (int nm = nameClip(starters[k]); nm >= 0)
+                        queue_.push_back({uint16_t(nm), 0.25, 14u});
+                    ++rumbleCount_;
+                    std::fprintf(stderr, "[hctp-pbp] rumble starter #%zu roster 0x%02X%c", k + 1, starters[k], 10);
+                }
+                cv_.notify_all();
+            }
+        }
+
+        // every wrestler in the match is a woman (referees 0x31 / 0x33 and empty lists do not count)
+        bool womenMatch() const
+        {
+            uint32_t n = 0;
+            for (uint32_t id : participants_)
+            {
+                const uint32_t r = id & kRosterMask;
+                if (r == 0x31u || r == 0x33u)
+                    continue;
+                if (!isFemale(r))
+                    return false;
+                ++n;
+            }
+            if (n)
+                return true;
+            return !entrants_.empty() &&
+                   std::all_of(entrants_.begin(), entrants_.end(), [](uint32_t id) { return isFemale(id & kRosterMask); });
+        }
+
+        // a row whose clips (w[from]..) talk about a man (BGM/PBP_MALE_LINES.csv, tools/build_male_lines.py)
+        bool maleRow(const Row &r, int from) const
+        {
+            for (int k = from; k < 8 && r.w[k] != kNone; ++k)
+                if (maleLines_.count({r.part, r.w[k]}))
+                    return true;
+            return false;
+        }
+
+        void loadMaleLines()
+        {
+            std::ifstream f("BGM/PBP_MALE_LINES.csv");
+            std::string row;
+            std::getline(f, row);
+            while (std::getline(f, row))
+            {
+                std::stringstream ss(row);
+                std::string a, b;
+                if (std::getline(ss, a, ',') && std::getline(ss, b, ','))
+                    maleLines_.insert({uint32_t(std::strtoul(a.c_str(), nullptr, 10)), uint32_t(std::strtoul(b.c_str(), nullptr, 10))});
+            }
+            std::cerr << "[hctp-pbp] male-pronoun lines (skipped for women): " << maleLines_.size() << std::endl;
+        }
+
         void setTagMatch(bool tag)
         {
             std::lock_guard<std::mutex> lock(m_);
@@ -200,6 +277,7 @@ namespace
             case 0x03: case 0x04: case 0x07: return 1375;                         // tag team
             case 0x06: case 0x08: case 0x09: return 1376;                         // six-man tag
             case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15: case 0x16: return 1389; // hardcore
+            case 0x0E: return 1398;                                               // King of the Ring tournament
             case 0x17: return 1379;                                               // triple threat
             case 0x18: return 1380;                                               // fatal four-way
             case 0x19: return 1385;                                               // 4/5/6-man over the top battle royal
@@ -261,7 +339,7 @@ namespace
             // key on HCTP's own ids (beta moves.pac == HCTP), so only retail rows use the translated id
             const uint32_t hctpMove = moveId;
             const auto pit = charaRoster_.find(chara); // who did it (CChar -> roster id, set by the hook)
-            const uint32_t performer = pit != charaRoster_.end() ? pit->second : 0xFFFFFFFFu;
+            uint32_t performer = pit != charaRoster_.end() ? pit->second : 0xFFFFFFFFu;
             if (const auto it = moveMap_.find(moveId); it != moveMap_.end())
             {
                 always = it->second.second;
@@ -273,6 +351,23 @@ namespace
             if (last == hctpMove)
                 return; // same move still playing
             last = hctpMove;
+            // attacker and receiver both report the move: the chara that reported it first is the attacker (Jordan:
+            // Torrie's "she can slap that hard" row, w0 0x2A, played whenever Torrie RECEIVED the women's slap 4740)
+            {
+                const auto now = Clock::now();
+                auto st = moveStarter_.find(hctpMove);
+                if (st == moveStarter_.end() || now - st->second.second > std::chrono::seconds(3))
+                    moveStarter_[hctpMove] = {chara, now};
+                else if (st->second.first != chara)
+                {
+                    const auto ait = charaRoster_.find(st->second.first);
+                    const uint32_t attacker = ait != charaRoster_.end() ? ait->second : 0xFFFFFFFFu;
+                    if (attacker != performer)
+                        std::fprintf(stderr, "[hctp-pbp] move %u: receiver 0x%X -> attacker 0x%X%c", hctpMove, performer, attacker, 10);
+                    performer = attacker;
+                }
+            }
+            const bool femalePerformer = performer < 0x100u && isFemale(performer);
             if (loggedMoves_.insert(hctpMove).second && loggedMoves_.size() < 2000)
                 std::fprintf(stderr, "[hctp-pbp] move %u -> svr %u (chara %08x)%c", hctpMove, moveId, chara, 10);
             // timeline for mapping moves by hand ("the Spear was at 1:32"): every new move, seconds since the bell
@@ -290,11 +385,12 @@ namespace
                     if ((t == coin || r.part != 13) && // the coin is SvR's rule for its own rows; added packs always
                         r.w[1] == (r.part == 13 ? moveId : hctpMove) && r.w[2] < clipCount(r.part) &&
                         (r.part == 13 && r.owner == 0xFFFFu ? (r.w[0] == 0xFFu || r.w[0] == who)
-                                                             : (r.owner == 0xFFFFu || r.owner == performer)))
+                                                             : (r.owner == 0xFFFFu || r.owner == performer)) &&
+                        !(femalePerformer && (r.part != 13 || r.w[0] == 0xFFu) && maleRow(r, 2)))
                         rows.push_back(&r);
             if (rows.empty())
             {
-                moveReaction(moveId, false, performer, hctpMove);
+                moveReaction(moveId, false, performer, hctpMove, femalePerformer);
                 return;
             }
             // attacker and receiver both carry the move id while it happens: one call per move
@@ -313,7 +409,7 @@ namespace
 
         // an ordinary move: the team's reaction line for it, by the game's own chance (w2 %), only when nobody is
         // talking and at most every 10 s (banter and finisher calls come first). Called with m_ held.
-        void moveReaction(uint32_t moveId, bool always, uint32_t performer, uint32_t hctpMove)
+        void moveReaction(uint32_t moveId, bool always, uint32_t performer, uint32_t hctpMove, bool femalePerformer)
         {
             const int t = team().moveReaction;
             const auto now = Clock::now();
@@ -330,7 +426,8 @@ namespace
                 return;
             std::vector<const Row *> rows;
             for (const Row &r : tables_[t])
-                if (r.w[0] == (r.part == 13 ? moveId : hctpMove) && r.w[1] < clipCount(r.part) && (r.owner == 0xFFFFu || r.owner == performer))
+                if (r.w[0] == (r.part == 13 ? moveId : hctpMove) && r.w[1] < clipCount(r.part) && (r.owner == 0xFFFFu || r.owner == performer) &&
+                    !(femalePerformer && maleRow(r, 1)))
                     rows.push_back(&r);
             if (rows.empty())
                 return;
@@ -354,13 +451,126 @@ namespace
         void entrance(uint32_t rosterId)
         {
             std::lock_guard<std::mutex> lock(m_);
+            entranceLocked(rosterId);
+        }
+
+        // SvR ring announcer (SLUS_210.60 0x211c10): everyone walking out in ONE entrance is one group. A known team
+        // gets one team call instead of the members' intros; any other group = each member's intro back to back.
+        // Tag champions in one entrance (runner bit 24): the team call follows the whole group.
+        void entranceGroup(const uint32_t *ids, uint32_t n)
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            if (n < 2u)
+            {
+                if (n)
+                    entranceLocked(ids[0]);
+                return;
+            }
+            // a new show first (entranceLocked clears it too, but 'before' below must not count the old show)
+            if (Clock::now() - lastEntrance_ > std::chrono::minutes(4))
+                entrants_.clear();
+            std::vector<uint32_t> g;
+            for (uint32_t k = 0; k < n; ++k)
+                g.push_back(ids[k] & kRosterMask);
+            std::sort(g.begin(), g.end());
+            int teamClip = -1; // Finkel only: SYM StableCall 0x3a3ef0 team lines, LoW DX
+            if (n == 2u && g[0] == 0x0F && g[1] == 0x10) teamClip = 232;            // "D-Von, Bubba Ray, the Dudley Boyz"
+            else if (n == 2u && g[0] == 0x0C && g[1] == 0x0D) teamClip = 236;       // "Matt, Jeff, the Hardy Boyz"
+            else if (n == 2u && g[0] == 0x21 && g[1] == 0x23) teamClip = 1587;      // "Jamal and Rosey. 3-Minute Warning!"
+            // other known teams walking out together: the members, then Finkel's team call (FINKEL_LINES team_<key>)
+            const std::string key = stableKey(g);
+            const size_t before = entrants_.size();
+            inGroup_ = true;
+            if (teamClip >= 0)
+            {
+                std::fprintf(stderr, "[hctp-pbp] shared entrance: known team -> Finkel team call %d%c", teamClip, 10);
+                introOverride_ = teamClip;
+                entranceLocked(ids[0]);
+                introOverride_ = -1;
+                if (entrants_.size() > before) // leader announced -> the partners are done too
+                    for (uint32_t k = 1; k < n; ++k)
+                        entrants_.push_back(ids[k]);
+            }
+            else
+                for (uint32_t k = 0; k < n; ++k)
+                    entranceLocked(ids[k]);
+            inGroup_ = false;
+            if (teamClip < 0 && !key.empty() && entrants_.size() > before)
+                if (int c = pickConnector("team_" + key); c >= 0)
+                {
+                    queue_.push_back({uint16_t(c), 0.25, 14u});
+                    std::fprintf(stderr, "[hctp-pbp] %s together -> Finkel %d%c", key.c_str(), c, 10);
+                    cv_.notify_all();
+                }
+            // tag champions together: "They are the WWE Tag Team Champions!" / "The World Tag Team Champions!"
+            uint32_t belt = 0;
+            for (uint32_t k = 0; k < n && !belt; ++k)
+                if ((ids[k] >> 24) & 1u)
+                    belt = (ids[k] >> kBeltShift) & 0xFFu;
+            if (entrants_.size() > before && (belt == 3u || belt == 4u) &&
+                !(teamTitleSaid_ & (1u << belt)))
+                if (int c = pickConnector("team_title_b" + std::to_string(belt - 1u)); c >= 0)
+                {
+                    queue_.push_back({uint16_t(c), 0.25, 14u});
+                    teamTitleSaid_ |= 1u << belt;
+                    std::fprintf(stderr, "[hctp-pbp] tag champions together (belt %u) -> Finkel team call %d%c", belt - 1u, c, 10);
+                    cv_.notify_all();
+                }
+        }
+
+        // 2K14 Finkel team calls (Jordan-verified Nov 2): FINKEL_LINES team_<key> ("Degeneration X!") after the members,
+        // only when exactly these wrestlers walk out in ONE entrance (pairings, not stables; Jordan Nov 2). g = sorted ids.
+        static std::string stableKey(const std::vector<uint32_t> &g)
+        {
+            // one rule for every team: 2+ different wrestlers walking out together, all members of the same team list.
+            // Not the game's stables (people overlap). Several lists fit -> the smallest one (Matt + Jeff = Hardys,
+            // Matt + Lita = Team Extreme). FINKEL_LINES team_<key> = the call; a team with no clip stays silent.
+            struct Team { const char *key; std::initializer_list<uint32_t> ids; };
+            static const Team kTeams[] = {
+                {"hardys", {0x0C, 0x0D}},
+                {"teamextreme", {0x0C, 0x0D, 0x0E}},
+                {"dudleys", {0x0F, 0x10, 0x2B}},
+                {"dx", {0x02, 0x2D, 0x24}},
+                {"evolution", {0x02, 0x1E, 0x3C, 0x3D}},
+                {"powertrip", {0x01, 0x02}},
+                {"bod", {0x03, 0x48, 0x07}},
+                {"nwo", {0x20, 0x42}},
+                {"edgechristian", {0x0A, 0x0B}},
+                {"3mw", {0x21, 0x22, 0x23}},
+            };
+            if (g.size() < 2u || std::adjacent_find(g.begin(), g.end()) != g.end())
+                return {};
+            const Team *best = nullptr;
+            for (const Team &t : kTeams)
+                if (std::all_of(g.begin(), g.end(), [&](uint32_t r) { return std::find(t.ids.begin(), t.ids.end(), r) != t.ids.end(); }) &&
+                    (!best || t.ids.size() < best->ids.size()))
+                    best = &t;
+            return best ? best->key : std::string();
+        }
+
+        int pickConnector(const std::string &kind)
+        {
+            std::vector<int> c;
+            if (const auto it = finkel_.find(kConnectors); it != finkel_.end())
+                for (const auto &l : it->second)
+                    if (l.kind == kind)
+                        c.push_back(l.clip);
+            return c.empty() ? -1 : c[std::uniform_int_distribution<size_t>(0, c.size() - 1)(rng_)];
+        }
+
+        void entranceLocked(uint32_t rosterId)
+        {
             if (!loaded_ || inMatch_)
                 return;
             // HCTP eRuleType 0x52 is Royal Rumble (ConvSelectPosition special-cases the same value). Only the first two entrants
             // receive the pre-match entrance sequence; later entrants are
             // handled by the Rumble scene itself rather than Finkel's normal
             // opponent/team connectors.
-            const bool royalRumble = matchRule_ == 0x52u;
+            // 0x52 = ConvSelectPosition's Rumble, 0x0D = the debug table's "ROYAL RUMBLE" (which one a real Rumble uses
+            // is unlogged - accept both). Only the first two entrants have entrances: 1369 on #1, 1418 on #2.
+            const bool royalRumble = matchRule_ == 0x52u || matchRule_ == 0x0Du;
+            if (royalRumble)
+                std::fprintf(stderr, "[hctp-pbp] Royal Rumble entrance #%zu (rule 0x%02X)%c", entrants_.size() + 1u, matchRule_, 10);
             if (royalRumble && entrants_.size() >= 2u)
                 return;
             auto pick = [&](uint32_t who, const std::string &kind, bool noTitle) -> int {
@@ -391,13 +601,23 @@ namespace
             // a belt holder (hook: CTitleHistoryData holders, belt + 1 above kBeltShift): Finkel's separate title
             // call ("the WWE Champion", 2K14; FINKEL_LINES connector kinds title_b<belt> / title_half_b<belt>) goes
             // right before the name, so the pieced intro is used whenever it exists
-            const uint32_t belt = rosterId >> kBeltShift;
-            int title = -1;
+            const bool withPartner = (rosterId >> 24) & 1u; // tag-belt partner on the same team (runner hook)
+            const uint32_t belt = (rosterId >> kBeltShift) & 0xFFu;
+            int title = -1, titleFull = -1;
             if (belt != 0u)
             {
                 const std::string b = std::to_string(belt - 1u);
-                title = pick(kConnectors, "title_half_b" + b, false); // tag belts: "one half of the ... Champions"
-                if (title < 0)
+                const bool tagBelt = belt - 1u == 2u || belt - 1u == 3u;
+                // the wrestler's own whole intro with the belt (LoW "From ..., the co-holder of the WWE Tag Team
+                // Championship, NAME"; FINKEL_LINES kind title_full_b<belt>) beats a pieced title call
+                titleFull = pick(who, "title_full_b" + b, false);
+                // tag belts: "one half of the ... Champions" only when his partner is not with him; together the team
+                // call after both names covers it
+                if (!(tagBelt && withPartner))
+                    title = pick(kConnectors, "title_half_b" + b, false);
+                // tag belts (2 = WWE Tag / SmackDown, 3 = World Tag / Raw): each partner gets only "one half of the ...
+                // Champions"; the plural team call (team_title_b<belt>) follows the second partner (Jordan Nov 2)
+                if (title < 0 && !tagBelt)
                     title = pick(kConnectors, "title_b" + b, false);
                 // The shipped HCTP FINKEL_LINES.csv labels these clips as
                 // generic rows, not title_bN keys. Keep the holder lookup
@@ -416,11 +636,9 @@ namespace
                         {473, 474}, // Women's title
                     };
                     const uint32_t beltIndex = belt - 1u;
-                    if (beltIndex < 9u)
+                    if (beltIndex < 9u && !tagBelt) // tag fallbacks 477/478 are the plural / no "one half of" call
                     {
-                        const bool tagBelt = beltIndex == 2u || beltIndex == 3u;
-                        title = kTitleClips[beltIndex][tagBelt ? 1 :
-                            std::uniform_int_distribution<int>(0, 1)(rng_)];
+                        title = kTitleClips[beltIndex][std::uniform_int_distribution<int>(0, 1)(rng_)];
                         if (title >= 0)
                             std::fprintf(stderr, "[hctp-pbp] dynamic title belt %u -> Finkel clip %d%c",
                                          beltIndex, title, 10);
@@ -434,7 +652,13 @@ namespace
             // both a SYM pieced intro and a LoW one-line intro: alternate at random so intros vary match to match
             const bool pieced = from >= 0 && weight >= 0 && name >= 0;
             const bool useFull = full >= 0 && (!pieced || (title < 0 && std::uniform_int_distribution<int>(0, 1)(rng_) == 1));
-            if (int special = pick(who, "special", false); special >= 0)
+            if (titleFull >= 0)
+            {
+                intro = {titleFull};
+                title = -1;
+                std::fprintf(stderr, "[hctp-pbp] belt %u: wrestler's own title intro -> Finkel %d%c", belt - 1u, titleFull, 10);
+            }
+            else if (int special = pick(who, "special", false); special >= 0)
                 intro = {special}; // people who break the format ("the CEO of World Wrestling Entertainment ...")
             else if (useFull)
                 intro = {full}; // Legends of WrestleMania: "From ..., weighing ... pounds, NAME" in one line
@@ -453,7 +677,30 @@ namespace
                 std::fprintf(stderr, "[hctp-pbp] entrance roster 0x%02X: no Finkel lines, silent%c", rosterId & kRosterMask, 10);
                 return; // Jordan: no lines at all rather than generic ones
             }
-            if (title >= 0) // "... weighing 295 pounds, | the WWE Champion, | Brock Lesnar" (one-line intros: title first)
+            // SYM FinkelCall time tables (notes/COMMENTARY_BEAT_FOR_BEAT_20261102.md): tag / six-man / handicap teams
+            // are called by NAME only (tables 4-11: connector, name; table 28: "and his partner", short name).
+            // HCTP_PBP_TAG_FULL=1 keeps the from / weight intros for team members.
+            // Jordan Nov 2: everyone gets the full intro (hometown, weight, name); HCTP_PBP_TAG_NAMES=1 = SYM names only
+            static const bool tagFull = [] { const char *e = std::getenv("HCTP_PBP_TAG_NAMES"); return !(e && *e == '1'); }();
+            if (tagMatch_ && !tagFull && titleFull < 0)
+            {
+                const bool newShow = Clock::now() - lastEntrance_ > std::chrono::minutes(4); // entrants_ cleared below
+                const bool partner = !newShow && entrants_.size() % teamSize_ != 0u;
+                int nm = -1;
+                size_t len = partner ? SIZE_MAX : 0; // leader: longest name (SYM field 15), partner: shortest (field 17)
+                if (const auto it = finkel_.find(who); it != finkel_.end())
+                    for (const auto &l : it->second)
+                        if (l.kind == "name" && !isTitleLine(l.text) && l.text.rfind("this is", 0) != 0 &&
+                            (partner ? l.text.size() < len : l.text.size() > len))
+                            nm = l.clip, len = l.text.size();
+                if (nm >= 0 && partner) // each team's first man keeps his full intro (Jordan Nov 2)
+                    intro = {nm};
+            }
+            if (introOverride_ >= 0) // SvR: a known team in one entrance = ONE team call, no titles / members
+                intro = {introOverride_}, title = -1;
+            // the champion's title right before his name, in every match (Jordan Nov 2): "From Greenwich, Connecticut,
+            // weighing 255 pounds, the World Heavyweight Champion, Triple H" (one-line intros: title first)
+            if (title >= 0)
                 intro.insert(intro.size() > 1 ? intro.end() - 1 : intro.begin(), title);
             // a new show once the last entrance was long ago (or a match ended since)
             const auto now = Clock::now();
@@ -466,11 +713,30 @@ namespace
             std::vector<int> seq;
             if (entrants_.empty())
             {
+                teamTitleSaid_ = 0;
+                // title match: LoW "The following contest is for the WWE / Intercontinental / WWE Tag Team Championship"
+                // (1399-1401) for a one-fall match; a match-type opener is followed by LoW "And is for the ..."
+                // (1407-1409); other belts: SYM championship pieces after the opener (SYM time table 12/20 code 4)
+                static constexpr int kFollowingFor[9] = {1399, -1, 1401, -1, 1400, -1, -1, -1, -1};
+                static constexpr int kAndIsFor[9] = {1407, -1, 1409, -1, 1408, -1, -1, -1, -1};
+                static constexpr int kSymFor[9] = {481, 483, 489, -1, 484, -1, 490, 486, 487};
+                const int tb = titleMatchBelt_;
                 if (royalRumble)
                     seq.push_back(1369); // "Ladies and gentlemen, it is now time for the Royal Rumble..."
-                else if (openerClip_ >= 0)
-                    seq.push_back(openerClip_);
-                else if (int c = pick(kConnectors, tagMatch_ ? "open_tag" : "open", false); c >= 0) seq.push_back(c);
+                else if (tb >= 0 && openerClip_ < 0 && kFollowingFor[tb] >= 0)
+                    seq.push_back(kFollowingFor[tb]);
+                else
+                {
+                    if (openerClip_ >= 0)
+                        seq.push_back(openerClip_);
+                    else if (int c = pick(kConnectors, tagMatch_ ? "open_tag" : "open", false); c >= 0)
+                        seq.push_back(c);
+                    if (tb >= 0)
+                        if (int c = kAndIsFor[tb] >= 0 && openerClip_ >= 0 ? kAndIsFor[tb] : kSymFor[tb]; c >= 0)
+                            seq.push_back(c);
+                }
+                if (tb >= 0)
+                    std::fprintf(stderr, "[hctp-pbp] title match belt %d -> opener %d..%c", tb, seq.empty() ? -1 : seq.back(), 10);
             }
             else if (royalRumble)
             {
@@ -478,7 +744,7 @@ namespace
             }
             else
             {
-                const bool prevFemale = isFemale(entrants_.front() & kRosterMask);
+                const bool prevFemale = isFemale(entrants_.back() & kRosterMask); // the wrestler just announced (his / her partner)
                 // Team boundaries come from the match cast count: 2-v-2 groups by two,
                 // 3-v-3 groups by three. The first entrant of the next group is an
                 // opponent; the remaining entrants in that group are partners.
@@ -486,77 +752,90 @@ namespace
                 const char *kind = tagMatch_ && !opposingTeamFirst
                                        ? (prevFemale ? "and_her_tag_partner" : "and_his_tag_partner")
                                        : (prevFemale ? "and_her_opponent" : "and_his_opponent");
-                if (int c = pick(kConnectors, kind, false); c >= 0)
+                // SYM table 5/9/17: the next team opens with "and the opponents" (SYM 0x1B4 = FINKEL 433)
+                // title match, the side that does not hold the belt: SYM "and the challenger(s)" (434 / 435)
+                const bool challenger = titleMatchBelt_ >= 0 && int(belt) - 1 != titleMatchBelt_ &&
+                                        (!tagMatch_ || opposingTeamFirst);
+                // third member of a six-man team: "and their tag team partner" does not exist anywhere; FINKEL_LINES
+                // and_their_partner (2K14, once Jordan OKs one) else LoW 1346 "And the tag team partner" (Jordan Nov 2)
+                const bool thirdMember = tagMatch_ && !opposingTeamFirst && entrants_.size() % teamSize_ == 2u;
+                if (thirdMember)
+                {
+                    const int c = pick(kConnectors, "and_their_partner", false);
+                    seq.push_back(c >= 0 ? c : 1346);
+                }
+                else if (challenger) // LoW Finkel "And introducing the challenger(s)"
+                    seq.push_back(tagMatch_ && teamSize_ > 1u ? 1345 : 1344);
+                else if (int c = tagMatch_ && opposingTeamFirst && teamSize_ > 1u ? pick(kConnectors, "and_the_opponents", false) : -1; c >= 0)
                     seq.push_back(c);
+                else if (int c2 = pick(kConnectors, kind, false); c2 >= 0)
+                    seq.push_back(c2);
             }
-            if (int c = pick(kConnectors, female ? "making_her" : "making_his", false); c >= 0) seq.push_back(c);
-            seq.insert(seq.end(), intro.begin(), intro.end());
-            // SvR's ring-announcer table has a separate category for a known two-person team:
-            // after both individual introductions, it plays the team's name clip.  Keep this
-            // lookup pair-based (order independent); an unknown pairing retains the normal
-            // partner wording instead of guessing a team name.
-            int teamPbpClip = -1;
-            int stablePbpClip = -1;
-            // A two-person clip is valid only when the entrance group is exactly two.
-            // Do not call the Dudley Boys/Hardy Boys name for a trio (for example,
-            // Dudleys + Spike or Hardy Boys + Lita); those require their own stable clip.
-            if (tagMatch_ && entrants_.size() + 1u == teamSize_)
+            // SYM: only the first entrant is "making his/her way to the ring"; every later entrant is just the
+            // connector + intro ("and the opponent, from ..., NAME"; table 1/3/5/28)
+            // first out (Jordan Nov 2): "Introducing first, making his way to the ring, from ..." (LoW 1415); in a title
+            // match the side without the belt: "Introducing the challenger(s)" (LoW 1416 / 1423)
+            if (entrants_.empty() && !royalRumble)
             {
-                std::vector<uint32_t> group;
-                for (uint32_t id : entrants_) group.push_back(id & kRosterMask);
-                group.push_back(rosterId & kRosterMask);
-                std::sort(group.begin(), group.end());
-                const uint32_t a = group.front();
-                const uint32_t b = group.size() > 1 ? group[1] : 0;
-                const uint32_t lo = a, hi = b;
-                int teamClip = -1;
-                // SvR retail PBPSVR clip 1358 is the verified recording:
-                // "Bubba Ray and D-Von, the Dudley Boys."
-                if (teamSize_ == 2u && lo == 0x0F && hi == 0x10) teamPbpClip = 1358;
-                // FINKEL.afs LoW section begins at 529. These are the verified LoW team-name rows.
-                if (teamSize_ == 2u && lo == 0x02 && hi == 0x2D) teamClip = 529 + 777; // D-Generation X
-                else if (teamSize_ == 2u && lo == 0x0C && hi == 0x0D) teamClip = 237; // the Hardy Boys (SYM)
-                // SVR PBPSVR has an Evolution call even though HCTP stores its members
-                // as separate teams. Match only exact members of the four-person stable.
-                const auto evolutionMember = [](uint32_t id) {
-                    return id == 0x02 || id == 0x1E || id == 0x3C || id == 0x3D;
-                };
-                if (std::all_of(group.begin(), group.end(), evolutionMember) &&
-                    std::adjacent_find(group.begin(), group.end()) == group.end())
-                {
-                    stablePbpClip = 1361; // "Evolution!"
-                    if (teamSize_ == 2u && lo == 0x1E && hi == 0x3C) stablePbpClip = 1494;
-                    else if (teamSize_ == 2u && lo == 0x02 && hi == 0x3C) stablePbpClip = 1496;
-                    else if (teamSize_ == 2u && lo == 0x02 && hi == 0x1E) stablePbpClip = 1497;
-                    std::fprintf(stderr, "[hctp-pbp] Evolution set size %zu -> PBPSVR clip %d%c",
-                                 group.size(), stablePbpClip, 10);
-                }
-                if (teamClip >= 0)
-                {
-                    seq.push_back(teamClip);
-                    std::fprintf(stderr, "[hctp-pbp] known team pair 0x%02X+0x%02X -> Finkel team clip %d%c",
-                                 lo, hi, teamClip, 10);
-                }
-                if (teamPbpClip >= 0)
-                {
-                    std::fprintf(stderr, "[hctp-pbp] known SVR team pair 0x%02X+0x%02X -> PBPSVR clip %d%c",
-                                 lo, hi, teamPbpClip, 10);
-                }
-                else if (teamClip < 0 && teamPbpClip < 0 && stablePbpClip < 0)
-                {
-                    std::fprintf(stderr, "[hctp-pbp] tag pair 0x%02X+0x%02X has no verified team-name clip%c",
-                                 lo, hi, 10);
-                }
+                const bool challengerFirst = titleMatchBelt_ >= 0 && int(belt) - 1 != titleMatchBelt_;
+                seq.push_back(challengerFirst ? (tagMatch_ && teamSize_ > 1u ? 1423 : 1416) : 1415);
             }
+            if (entrants_.empty())
+                if (int c = pick(kConnectors, female ? "making_her" : "making_his", false); c >= 0) seq.push_back(c);
+            seq.insert(seq.end(), intro.begin(), intro.end());
+            // tag champions coming out TOGETHER (one shared stable entrance, runner bit 24): "They are the WWE Tag Team
+            // Champions!" / "The World Tag Team Champions!" (team_title_b2/b3), once per match; separate entrances get
+            // "one half of" each instead (Jordan Nov 2)
+            if (!inGroup_ && withPartner && (belt == 3u || belt == 4u) && !(teamTitleSaid_ & (1u << belt)))
+                if (int c = pick(kConnectors, "team_title_b" + std::to_string(belt - 1u), false); c >= 0)
+                {
+                    seq.push_back(c);
+                    teamTitleSaid_ |= 1u << belt;
+                    std::fprintf(stderr, "[hctp-pbp] tag champions together (belt %u) -> Finkel team call %d%c", belt - 1u, c, 10);
+                }
+            // team names: entranceGroup only (wrestlers walking out together; Jordan Nov 2)
             entrants_.push_back(rosterId);
             std::fprintf(stderr, "[hctp-pbp] entrance roster 0x%02X -> %zu Finkel line(s)%c", rosterId & kRosterMask, seq.size(), 10);
             for (size_t i = 0; i < seq.size(); ++i)
                 queue_.push_back({uint16_t(seq[i]), i ? 0.25 : 1.0, 14u});
-            if (teamPbpClip >= 0)
-                queue_.push_back({uint16_t(teamPbpClip), 0.25, 13u});
-            if (stablePbpClip >= 0)
-                queue_.push_back({uint16_t(stablePbpClip), 0.25, 13u});
             cv_.notify_all();
+        }
+
+        // Season title match (runner: match setup byte 0x4922C5, written by CSeasonSystem::nvGameInit from the card's
+        // CheckTitleMatch belt; 0xFF = no title)
+        void setTitleMatch(uint32_t belt)
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            titleMatchBelt_ = belt < 9u ? int(belt) : -1;
+        }
+
+        // a wrestler's longest plain name clip ("the people's champion the rock"), -1 if none
+        int nameClip(uint32_t roster) const
+        {
+            int clip = -1;
+            size_t len = 0;
+            if (const auto it = finkel_.find(roster); it != finkel_.end())
+                for (const auto &l : it->second)
+                    if (l.kind == "name" && !isTitleLine(l.text) && l.text.rfind("this is", 0) != 0 && l.text.size() > len)
+                        clip = l.clip, len = l.text.size();
+            return clip;
+        }
+
+        // Royal Rumble entrant #3+ (runner: CGameSync::Draw pops the entry queue 0x527A90 -> 0x527AB8). No Finkel clip
+        // for "number three" and up exists (LoW / SYM / 2K14 scanned) -> the name alone.
+        void rumbleEntrant(uint32_t roster)
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            if (!loaded_)
+                return;
+            ++rumbleCount_;
+            const int nm = nameClip(roster & kRosterMask);
+            std::fprintf(stderr, "[hctp-pbp] rumble entrant #%u roster 0x%02X -> Finkel %d%c", rumbleCount_, roster & kRosterMask, nm, 10);
+            if (nm >= 0)
+            {
+                queue_.push_back({uint16_t(nm), 1.0, 14u});
+                cv_.notify_all();
+            }
         }
 
         void resetEntrances()
@@ -626,6 +905,7 @@ namespace
             loadLineOwners();
             dropMisfiledBanter();
             pairBanter();
+            loadMaleLines();
             loadFinkel();
             const char *teamEnv = std::getenv("HCTP_PBP_TEAM");
             raw_ = teamEnv && (teamEnv[0] == 'r' || teamEnv[0] == 'R');
@@ -776,6 +1056,12 @@ namespace
                                 if (const auto it = own.find({r.part, r.w[col]}); it != own.end())
                                     r.owner = it->second, ++n;
             std::cerr << "[hctp-pbp] owner-only move lines: " << n << " rows" << std::endl;
+            // two beta superstar rows are filed under the wrong HCTP id (notes/SVR_BETA_COMMENTARY_DEEP_DIVE_20261028.md):
+            // clip 218 is about RVD (0x04, filed 0x03), clip 394 about Ultimo Dragon (0x55, filed 0x53 Rhyno)
+            if (const int t = kColeTazz.wrestlerBanter; size_t(t) < tables_.size())
+                for (Row &r : tables_[t])
+                    if (r.part == 15 && (r.w[1] == 218 || r.w[1] == 394))
+                        r.w[0] = r.w[1] == 218 ? 0x04 : 0x55;
         }
 
         // BGM/PBP_MOVEMAP.csv (tools/map_moves.py): hctp_move, svr_move, always
@@ -983,13 +1269,17 @@ namespace
             if (table < 0 || size_t(table) >= tables_.size() || tables_[table].empty())
                 return;
             // no repeats within a match: pick among rows not heard yet (all heard: start over)
+            const bool women = womenMatch();
             std::vector<const Row *> fresh;
             for (const Row &r : tables_[table])
-                if (!heard_.count({r.part, r.w[1]}))
+                if (!heard_.count({r.part, r.w[1]}) && !(women && maleRow(r, 1)))
                     fresh.push_back(&r);
             if (fresh.empty())
                 for (const Row &r : tables_[table])
-                    fresh.push_back(&r);
+                    if (!(women && maleRow(r, 1)))
+                        fresh.push_back(&r);
+            if (fresh.empty())
+                return;
             const Row &row = *fresh[std::uniform_int_distribution<size_t>(0, fresh.size() - 1)(rng_)];
             heard_.insert({row.part, row.w[1]});
             pushSequence(row, row.w[1] == 0 && row.w[2] != kNone ? 2 : 1, gap);
@@ -1047,7 +1337,19 @@ namespace
                     // SvR (0x212f30, list 0x34c700): a topic is a superstar line or general banter 50/50; each wrestler
                     // in the match gets one superstar line (queued once at match setup, removed when used), then the
                     // topics are general banter; the next topic starts 30 s (0x708 frames) after this one started
-                    if (!withLines.empty() && std::uniform_int_distribution<int>(0, 1)(rng_) == 0)
+                    // all-women match (SvR 0x34c740): 8 superstar : 5 general : 6 women's banter
+                    // bra & panties (SvR PBPMatchBraPanRandomIndex): 8 superstar : 4 B&P : 5 general : 6 women's banter
+                    const bool women = womenMatch();
+                    const int roll = std::uniform_int_distribution<int>(0, braPanties_ ? 22 : women ? 18 : 1)(rng_);
+                    if (braPanties_ && roll >= 8 && roll < 12)
+                        enqueueRow(team().braPanties, 0.0);
+                    else if (braPanties_ && roll >= 17)
+                        enqueueRow(team().women, 0.0);
+                    else if (braPanties_ && roll >= 12)
+                        enqueueRow(team().banter, 0.0);
+                    else if (!braPanties_ && women && roll >= 13)
+                        enqueueRow(team().women, 0.0);
+                    else if (!withLines.empty() && (women ? roll < 8 : roll == 0))
                     {
                         const uint32_t id = withLines[std::uniform_int_distribution<size_t>(0, withLines.size() - 1)(rng_)];
                         spoken_.insert(id & kRosterMask);
@@ -1107,6 +1409,14 @@ namespace
         std::mt19937 rng_{std::random_device{}()};
         bool loaded_ = false, raw_ = false, inMatch_ = false, teamForced_ = false, playerHeld_ = false, tagMatch_ = false;
         uint32_t matchRule_ = 0, teamSize_ = 2;
+        bool braPanties_ = false;
+        uint32_t rumbleCount_ = 0; // Royal Rumble wrestlers announced this match
+        int titleMatchBelt_ = -1; // Season title match: belt at stake (0..8, CTitleHistoryData order), -1 = none
+        bool inGroup_ = false;    // entranceGroup: team call after the whole group
+        int introOverride_ = -1;  // entranceGroup: known team call replaces the leader's intro
+        uint32_t teamTitleSaid_ = 0; // belts whose team call played this show (bit = belt + 1)
+        std::set<std::pair<uint32_t, uint32_t>> maleLines_;
+        std::map<uint32_t, std::pair<uint32_t, Clock::time_point>> moveStarter_; // move -> first chara + when
         int openerClip_ = -1;
         int arena_ = 0, brand_ = -1;
         Clock::time_point lastBell_{}, matchStart_{}, nextBanter_{}, busyUntil_{}, lastActivity_{}, lastCalledAt_{}, nextReaction_{};
@@ -1127,6 +1437,29 @@ extern "C" void hctpCommentaryEvent(uint32_t event)
 {
     if (engineReady())
         Engine::get().event(event);
+}
+
+extern "C" void hctpCommentaryRumbleEntrant(uint32_t rosterId)
+{
+    if ((rosterId & kRosterMask) < 0x56u && engineReady())
+        Engine::get().rumbleEntrant(rosterId);
+}
+
+extern "C" void hctpCommentarySetTitleMatch(uint32_t belt)
+{
+    if (engineReady())
+        Engine::get().setTitleMatch(belt);
+}
+
+extern "C" void hctpCommentaryEntranceGroup(const uint32_t *rosterIds, uint32_t count)
+{
+    uint32_t ids[8];
+    uint32_t n = 0;
+    for (uint32_t k = 0; k < count && n < 8u; ++k)
+        if ((rosterIds[k] & kRosterMask) < 0x56u)
+            ids[n++] = rosterIds[k];
+    if (n && engineReady())
+        Engine::get().entranceGroup(ids, n);
 }
 
 extern "C" void hctpCommentaryEntrance(uint32_t rosterId)
@@ -1187,4 +1520,10 @@ extern "C" void hctpCommentaryArena(int stage)
 {
     if (engineReady())
         Engine::get().setArena(stage);
+}
+
+extern "C" void hctpCommentaryBellRule(uint32_t rule, uint32_t braPanties)
+{
+    if (engineReady())
+        Engine::get().setBellRule(rule, braPanties != 0u);
 }
