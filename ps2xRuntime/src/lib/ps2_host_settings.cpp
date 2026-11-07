@@ -342,14 +342,14 @@ namespace ps2_host_settings
             // (test runs): the runtime's own 8
             int scale = 16;
             reader.integer("graphics.scale", scale, 1, 16);
-            if (scale != 1 && scale != 2 && scale != 4 && scale != 8 && scale != 16)
+            if (scale != 1 && scale != 2 && scale != 4 && scale != 8 && scale != 5 && scale != 6 && scale != 16)
             {
-                std::cerr << "[settings] graphics.scale = " << scale << " is not 1, 2, 4, 8 or 16; 16 is used" << std::endl;
+                std::cerr << "[settings] graphics.scale = " << scale << " is not 1, 2, 4, 8, 5, 6 or 16; 16 is used" << std::endl;
                 scale = 16;
             }
-            fillSwitch("VENDETTA_SSAA", std::to_string(scale));
-            // HCTP's D3D11 renderer (the default): the launcher's 1/2/4/8 -> 1x/2x/3x/4x the PS2; 16 (the default) =
-            // automatic, from the window's size (1080p 3x, 1440p 4x, 4K 6x) as the host picks it
+            fillSwitch("VENDETTA_SSAA", std::to_string(scale == 5 || scale == 6 ? 8 : scale));
+            // HCTP's D3D11 renderer (the default): the launcher's 1/2/4/8 -> 1x/2x/3x/4x the PS2, 5/6 -> 5x/6x (added
+            // Nov 4 2026); 16 (the default) = automatic, from the window's size (1080p 3x, 1440p 4x, 4K 6x) as the host picks it
             {
                 bool showFps = false; // a player's default: no counter (the line missing: hctp_native.ini decides)
                 if (std::string text; reader.peek("display.show_fps", text))

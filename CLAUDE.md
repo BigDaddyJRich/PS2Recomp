@@ -5,6 +5,7 @@ THIS TREE (`F:\hctp-newbase-vulcan`, git worktree of `F:\hctp-newbase\PS2Recomp`
 IS THE ACTIVE BASE as of Oct 26 2026. Renderer = `ps2-native-gs` (Vulkan, GPL-3.0, third_party\ps2-native-gs).
 
 ## Read first (in this order)
+0. `F:\hctp-project\notes\THQ_MOVIE_HANDOFF_FOR_CLAUDE_20261026.md` - Jordan's current DirectX 11 THQ movie test and the safeguards that worked visibly. Preserve these while continuing other work.
 1. `F:\hctp-project\notes\CLAUDE_REVIEW_20261026.md` - tree map, decisions, Jordan's corrections.
 2. `F:\hctp-project\notes\CLAUDE_AUDIT_COPY_20261026.md` - what Codex's DX11 work really did (true vs false).
 3. Bottom of `F:\hctp-project\notes\PROGRESS_NOTES.md` (newest at the bottom; 630 KB - read only the tail).

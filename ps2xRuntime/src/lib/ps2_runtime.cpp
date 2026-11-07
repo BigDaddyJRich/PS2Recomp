@@ -2827,12 +2827,67 @@ T PS2Runtime::loadCsrExempt(Read read)
     return value;
 }
 
+namespace
+{
+    struct CsrFieldPin
+    {
+        uint32_t pc = 0;
+        bool pin = false;
+        bool field = false;
+        uint64_t seen[2] = {0, 0};
+    };
+    CsrFieldPin g_csrPins[4];
+    std::atomic<uint32_t> g_csrPinCount{0};
+}
+
+// GS CSR read at guest pc `pc` (Load32/Load64 of 0x12001000): FIELD (bit 13) is reported as `field` when `pin`, and
+// the raw FIELD values seen there are counted ([csrfield] line every 3600 reads). pin = false only counts. Up to 4
+// sites, registered at startup (declared extern by the game overrides; no header change).
+void ps2PinCsrField(uint32_t pc, bool pin, bool field) noexcept
+{
+    const uint32_t n = g_csrPinCount.load();
+    if (n < 4u)
+    {
+        g_csrPins[n] = CsrFieldPin{pc, pin, field, {0, 0}};
+        g_csrPinCount.store(n + 1u);
+    }
+}
+
+static uint64_t applyCsrPin(uint32_t pc, uint64_t value) noexcept
+{
+    const uint32_t n = g_csrPinCount.load(std::memory_order_relaxed);
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        CsrFieldPin &p = g_csrPins[i];
+        if (p.pc != pc)
+            continue;
+        const bool raw = (value & 0x2000u) != 0u;
+        ++p.seen[raw ? 1 : 0];
+        const uint64_t total = p.seen[0] + p.seen[1];
+        if (total % 3600u == 0u)
+            std::fprintf(stderr, "[csrfield] pc=0x%x reads=%llu field0=%llu field1=%llu pinned=%s\n", pc,
+                         static_cast<unsigned long long>(total), static_cast<unsigned long long>(p.seen[0]),
+                         static_cast<unsigned long long>(p.seen[1]), p.pin ? (p.field ? "1" : "0") : "no");
+        if (p.pin)
+            value = p.field ? (value | 0x2000u) : (value & ~static_cast<uint64_t>(0x2000u));
+        break;
+    }
+    return value;
+}
+
 uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
     try
     {
-        if (isGsCsrAddress(vaddr) && m_chain.async() && m_chain.csrReadExempt(ctx->pc))
-            return loadCsrExempt<uint32_t>([&]() { return m_memory.read32(vaddr); });
+        if (isGsCsrAddress(vaddr))
+        {
+            uint32_t value = (m_chain.async() && m_chain.csrReadExempt(ctx->pc))
+                                 ? loadCsrExempt<uint32_t>([&]() { return m_memory.read32(vaddr); })
+                                 : m_memory.read32(vaddr);
+            if (g_csrPinCount.load(std::memory_order_relaxed) != 0u && (vaddr & 7u) == 0u)
+                value = static_cast<uint32_t>(applyCsrPin(ctx->pc, value));
+            return value;
+        }
         return m_memory.read32(vaddr);
     }
     catch (const std::exception &)
@@ -2846,8 +2901,15 @@ uint64_t PS2Runtime::Load64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
     try
     {
-        if (isGsCsrAddress(vaddr) && m_chain.async() && m_chain.csrReadExempt(ctx->pc))
-            return loadCsrExempt<uint64_t>([&]() { return m_memory.read64(vaddr); });
+        if (isGsCsrAddress(vaddr))
+        {
+            uint64_t value = (m_chain.async() && m_chain.csrReadExempt(ctx->pc))
+                                 ? loadCsrExempt<uint64_t>([&]() { return m_memory.read64(vaddr); })
+                                 : m_memory.read64(vaddr);
+            if (g_csrPinCount.load(std::memory_order_relaxed) != 0u && (vaddr & 7u) == 0u)
+                value = applyCsrPin(ctx->pc, value);
+            return value;
+        }
         return m_memory.read64(vaddr);
     }
     catch (const std::exception &)
