@@ -98,6 +98,14 @@ bool hctpDepthMirrorRead(uint32_t zbp, uint32_t psm, uint32_t x0, uint32_t y0, u
                     std::memcpy(dst, &z16, 2);
                     dst += 2;
                 }
+                else if (psm == GS_PSM_Z24)
+                {
+                    // Nov 7: PSMZ24 host transfers are PACKED 3 bytes/pixel (like PSMCT24). CGmLensFlare::
+                    // CalcLuminusFromZbuffer 0x228bf0 reads 16 samples at +3 stride; 4-byte writes here garbled
+                    // every sample -> entrance flares drew through wrestlers (HCTP_FLARE_PROBE log 17:2x).
+                    std::memcpy(dst, &z, 3);
+                    dst += 3;
+                }
                 else
                 {
                     std::memcpy(dst, &z, 4);
