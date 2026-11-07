@@ -718,7 +718,19 @@ namespace
                 // [COMMFIX Nov 6] was 'f &&' = stable rows only, so no singles/partner holder was ever called (Jordan:
                 // Christian IC / Eddie US silent in Exhibition). Every non-stable entrant now; partners (table 28
                 // {12,17}) too: SvR calls each entrant's belt -> "and his partner, the <belt> champion, <full name>".
-                if (stake < 0 && !f && (held == 0 || held == 1 || held == 4 || held == 5) &&
+                // [COMMFIX Nov 6b] Jordan: ALL belts (tag, women's, cruiserweight, hardcore...), not SvR's 4. Tag belts
+                // (2/3, plural "Tag Team Champions" clips): once per entrance group, on the first holder only.
+                const bool tagBelt = held == 2 || held == 3;
+                bool tagFirst = true;
+                if (tagBelt)
+                    for (uint32_t o : g)
+                    {
+                        if ((o & kRosterMask) == (id & kRosterMask))
+                            break;
+                        if (int((o >> kBeltShift) & 0xFFu) - 1 == held)
+                            tagFirst = false;
+                    }
+                if (stake < 0 && !f && held >= 0 && held <= 8 && tagFirst && beltClip(11, held) > 0 &&
                     (std::find(t.begin(), t.end(), 15) != t.end() || std::find(t.begin(), t.end(), 17) != t.end()))
                 {
                     auto at = std::find_if(t.begin(), t.end(), [](int c) { return c >= 13; });
