@@ -2053,11 +2053,14 @@ namespace
                     da[c] = pa[c] - centre[c];
                     db[c] = pb[c] - centre[c];
                 }
-                // flags after the 4 CLIPs: [vf4 vs 23][vf13 vs 23][vf4 vs 24][vf13 vs 24]; FCAND 0x108 = bit 3 (-y of the
-                // last) | bit 8 (+y of the third)
+                // flags after the 4 CLIPs: [vf4 vs 23][vf13 vs 23][vf4 vs 24][vf13 vs 24]. Nov 10: the microcode (tools\
+                // vu1dis2.py, 0x2c88) is FCAND vi1, 0x042108 = bit 18 (+x corner A vs [481].w) | bit 13 (-x corner B vs
+                // [481].w) | bit 8 (+y corner A vs [482].w) | bit 3 (-y corner B vs [482].w). The old port had 0x108 (old
+                // vu1dis.py misread the 24-bit immediate) -> no x cull: sprites crossing behind the camera projected to
+                // huge x spans = the red horizontal streaks. FCAND reads flags -> no branch VI-delay (PCSX2 microVU).
                 const uint32_t flags = (clipBits(da, b23) << 18) | (clipBits(db, b23) << 12) | (clipBits(da, b24) << 6) | clipBits(db, b24);
                 int32_t xa[4], xb[4];
-                if (flags & 0x108u)
+                if (flags & 0x042108u)
                 {
                     const int32_t z[4] = {0, 0, 0, 16};
                     std::memcpy(xa, z, 16);
