@@ -18,6 +18,17 @@
 #include <vector>
 #include <xmmintrin.h>
 
+// Nov 11 PYRO DEPTH: the character path's view->clip matrix (VU1 [1020..1023] = vf26..vf29) as last seen, so host-drawn
+// particles (hctp_svr06_pyro.cpp) can write the SAME GS z as the wrestlers (FTOI4 of clip z / clip w).
+static float g_hctpCharPM[4][4];
+static volatile bool g_hctpCharPMOk = false;
+bool hctpGetCharProj(float out[4][4])
+{
+    if (!g_hctpCharPMOk) return false;
+    std::memcpy(out, g_hctpCharPM, sizeof(g_hctpCharPM));
+    return true;
+}
+
 namespace
 {
     constexpr uint64_t kP08Hash = 0xcaf9bd881ee1d7ccull; // FNV-1a of p08's first 512 code bytes at VU 0x2a00
@@ -258,6 +269,11 @@ namespace
         const int32_t cullMask = st.vi[8];
         const float *pm[4] = {q(data, 1020), q(data, 1021), q(data, 1022), q(data, 1023)}; // vf26..vf29
         const float nearOff = offZ + guard; // [1008].x: keep view z + [1008].x >= 0
+        if (g_variant == 0 || g_variant == 1)
+        {
+            for (int r = 0; r < 4; ++r) std::memcpy(g_hctpCharPM[r], pm[r], 16);
+            g_hctpCharPMOk = true;
+        }
         g_chunkClip = false;
         g_expected.resize(count);
         for (uint32_t k = 0; k < count; ++k)
@@ -329,6 +345,18 @@ namespace
             o.fog = P[3];
             for (int c = 0; c < 4; ++c)
                 o.xyz[c] = ftoi(P[c], 16.0f);
+            {
+                // Nov 11 PYRO DEPTH check (one-shot): does pm * V give the z the GS gets (P.z)?
+                static int s_pmDiag = 6;
+                static int s_pmSkip = 200000;
+                if (s_pmDiag > 0 && (g_variant == 0 || g_variant == 1) && --s_pmSkip < 0 && std::fabs(o.clip[3]) > 1e-6f)
+                {
+                    --s_pmDiag;
+                    s_pmSkip = 5000;
+                    std::fprintf(stderr, "[pyroz] var %d V %.3f %.3f %.3f %.3f P %.2f %.2f %.2f %.4f clip/w %.2f %.2f %.2f w %.4f\n", g_variant,
+                                 V[0], V[1], V[2], V[3], P[0], P[1], P[2], P[3], o.clip[0] / o.clip[3], o.clip[1] / o.clip[3], o.clip[2] / o.clip[3], o.clip[3]);
+                }
+            }
             // CLIP vs 1024 (x/y: needs the clipper) and vs 2047 (z-): any flag -> the chunk stays on the VU1
             const float cx = P[0] + offXY, cy = P[1] + offXY, cz = q(data, idx)[2] + offZ;
             o.flagged = g_variant != 5 && (std::fabs(cx) > band || std::fabs(cy) > band || cz < -guard);
