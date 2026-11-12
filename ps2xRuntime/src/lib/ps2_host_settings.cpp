@@ -484,9 +484,7 @@ namespace ps2_host_settings
             fillSwitch("HCTP_S1_SBRING", "0");
             fillSwitch("HCTP_GPU_CHARS_LITE", "1");
             fillSwitch("HCTP_ZREAD_NODRAIN", "1");
-            // Jordan's requested shine reduction, also used by the entrance test.
-            // Explicit HCTP_NO_GLOSS=0 restores the reflection-map paths.
-            fillSwitch("HCTP_NO_GLOSS", "1");
+            // Nov 11 cleanup: no HCTP_NO_GLOSS default (opt-in VU path, hctp_native_vu1.cpp); gloss = SYM data fix at import.
             fillSwitch("HCTP_NATIVE_P01", "1");
             fillSwitch("HCTP_NATIVE_S1", "15");
             fillSwitch("HCTP_S1_ANYHASH", "1");
