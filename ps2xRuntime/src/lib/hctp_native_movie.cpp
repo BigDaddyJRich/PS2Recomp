@@ -219,17 +219,23 @@ namespace
                 ++mv.audioQueued;
             }
         };
-        double loopBase = 0.0, lastPts = 0.0;
+        double loopBase = 0.0, lastPts = 0.0, lastOut = 0.0;
         const auto takePicture = [&](AVFrame *f) {
             const AVRational tb = fmt->streams[vIndex]->time_base;
             const int64_t ts = f->best_effort_timestamp;
             double pts = ts == AV_NOPTS_VALUE ? lastPts + 1.0 / 30.0 : ts * av_q2d(tb);
             if (fmt->start_time != AV_NOPTS_VALUE)
                 pts -= static_cast<double>(fmt->start_time) / AV_TIME_BASE;
+            // Nov 11 fast-tron fix: output times must keep rising. A loop restart (or an MPEG-1 SFD whose timestamps
+            // jump back after the byte seek) used to put pictures BEHIND the clock -> every picture 'late' -> dropped
+            // at decode speed (titantrons racing from the 2nd loop on; [nmovie] serial +7000 per 2 s).
+            if (loopBase + pts < lastOut - 0.5)
+                loopBase = lastOut + 1.0 / 30.0 - pts;
             lastPts = pts;
             Picture p;
             p.frame = av_frame_clone(f);
             p.pts = loopBase + pts;
+            lastOut = p.pts;
             std::unique_lock lock(mv.m);
             // never block the video while the audio (the clock) is starving: the audio of a later picture may still be
             // further on in the stream, and waiting here would stop the clock for good
@@ -273,7 +279,7 @@ namespace
                 }
                 if (!loop)
                     break;
-                loopBase = lastPts + 1.0 / 30.0;
+                loopBase = lastOut + 1.0 / 30.0; // was lastPts (stream time, no loopBase): 2nd loop restarted in the past
                 avformat_seek_file(fmt, -1, INT64_MIN, 0, INT64_MAX, AVSEEK_FLAG_BYTE);
                 avio_seek(fmt->pb, 0, SEEK_SET);
                 continue;
