@@ -100,6 +100,12 @@ namespace ps2recomp
                 config.gameCodeFunctions = toml::find<std::vector<std::string>>(general, "game_code");
             }
 
+            config.moduleName = toml::find_or<std::string>(general, "module", "");
+            if (general.contains("module_functions") && general.at("module_functions").is_array())
+            {
+                config.moduleFunctions = toml::find<std::vector<std::string>>(general, "module_functions");
+            }
+
             if (general.contains("skip") && general.at("skip").is_array())
             {
                 config.skipFunctions = toml::find<std::vector<std::string>>(general, "skip");

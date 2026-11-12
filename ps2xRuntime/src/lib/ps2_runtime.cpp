@@ -1664,37 +1664,66 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
 
 namespace
 {
-    bool generatedFunctionTableSlot(uint32_t address, uint32_t &slot)
+    // Active guest module on this thread (nullptr = the game's own generated table). See PS2GuestModuleScope.
+    thread_local const PS2GuestModuleTable *t_activeGuestModule = nullptr;
+
+    // Returns the table to use for `address` (the active module's, else the game's) and the slot in it.
+    PS2Runtime::RecompiledFunction *generatedFunctionTableSlot(uint32_t address, uint32_t &slot)
     {
+        if (const PS2GuestModuleTable *module = t_activeGuestModule)
+        {
+            if ((address & 3u) != 0u || module->slotCount == 0u || address < module->base || address >= module->end)
+            {
+                return nullptr;
+            }
+            slot = (address - module->base) >> 2;
+            return slot < module->slotCount ? module->table : nullptr;
+        }
+
         if ((address & 3u) != 0u || g_ps2RecompiledFunctionTableSlotCount == 0u)
         {
-            return false;
+            return nullptr;
         }
 
         if (address < g_ps2RecompiledFunctionTableBase || address >= g_ps2RecompiledFunctionTableEnd)
         {
-            return false;
+            return nullptr;
         }
 
         const uint32_t offset = address - g_ps2RecompiledFunctionTableBase;
         slot = offset >> 2;
-        return slot < g_ps2RecompiledFunctionTableSlotCount;
+        return slot < g_ps2RecompiledFunctionTableSlotCount ? g_ps2RecompiledFunctionTable : nullptr;
     }
+}
+
+const PS2GuestModuleTable *PS2Runtime::setActiveGuestModule(const PS2GuestModuleTable *module)
+{
+    const PS2GuestModuleTable *previous = t_activeGuestModule;
+    t_activeGuestModule = module;
+    return previous;
+}
+
+const PS2GuestModuleTable *PS2Runtime::activeGuestModule()
+{
+    return t_activeGuestModule;
 }
 
 bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
 {
     uint32_t slot = 0u;
-    if (!generatedFunctionTableSlot(address, slot))
+    RecompiledFunction *table = generatedFunctionTableSlot(address, slot);
+    if (!table)
     {
         std::cerr << "[function-table] cannot replace guest PC 0x" << std::hex << address
-                  << ": outside generated dense table [0x" << g_ps2RecompiledFunctionTableBase
-                  << ", 0x" << g_ps2RecompiledFunctionTableEnd << ")"
+                  << ": outside generated dense table [0x"
+                  << (t_activeGuestModule ? t_activeGuestModule->base : g_ps2RecompiledFunctionTableBase)
+                  << ", 0x" << (t_activeGuestModule ? t_activeGuestModule->end : g_ps2RecompiledFunctionTableEnd) << ")"
+                  << (t_activeGuestModule ? " module=" : "") << (t_activeGuestModule ? t_activeGuestModule->name : "")
                   << std::dec << std::endl;
         return false;
     }
 
-    g_ps2RecompiledFunctionTable[slot] = func;
+    table[slot] = func;
     return true;
 }
 
@@ -1706,7 +1735,8 @@ bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
 bool PS2Runtime::hasFunction(uint32_t address) const
 {
     uint32_t slot = 0u;
-    return generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr;
+    const RecompiledFunction *table = generatedFunctionTableSlot(address, slot);
+    return table && table[slot] != nullptr;
 }
 
 const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
@@ -1733,9 +1763,9 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
     pushDispatchPc(address);
 
     uint32_t slot = 0u;
-    if (generatedFunctionTableSlot(address, slot))
+    if (RecompiledFunction *table = generatedFunctionTableSlot(address, slot))
     {
-        RecompiledFunction fn = g_ps2RecompiledFunctionTable[slot];
+        RecompiledFunction fn = table[slot];
         if (fn != nullptr)
         {
             return fn;

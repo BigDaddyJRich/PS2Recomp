@@ -99,6 +99,21 @@ namespace ps2recomp
             return 1;
         }
 
+        void writeModuleOutputPreamble(std::ostream &output, const std::string &moduleName)
+        {
+            output << "#include <stdexcept>\n";
+            output << "#include \"ps2_runtime_macros.h\"\n";
+            output << "#include \"ps2_runtime.h\"\n";
+            output << "#include \"ps2_syscalls.h\"\n";
+            output << "#include \"ps2_stubs.h\"\n";
+            output << "#include \"" << moduleName << "_functions.h\"\n";
+            output << "#ifdef _DEBUG\n";
+            output << "#include \"ps2_log.h\"\n";
+            output << "#endif\n";
+            output << "\n";
+            output << "namespace " << moduleName << " {\n\n";
+        }
+
         void writeCombinedOutputPreamble(std::ostream &output)
         {
             output << "#include <stdexcept>\n";
@@ -931,6 +946,28 @@ namespace ps2recomp
                     }
                 }
             }
+            // Module mode: [general].module_functions = ["name", "0xADDR", "name@0xADDR"] keeps only these functions.
+            if (!m_config.moduleFunctions.empty())
+            {
+                std::unordered_set<std::string> keepNames;
+                std::unordered_set<uint32_t> keepStarts;
+                for (const auto &entry : m_config.moduleFunctions)
+                {
+                    const FunctionSelector selector = parseFunctionSelector(entry);
+                    if (selector.start.has_value())
+                        keepStarts.insert(*selector.start);
+                    else if (!selector.name.empty())
+                        keepNames.insert(selector.name);
+                }
+                const size_t before = m_functions.size();
+                m_functions.erase(std::remove_if(m_functions.begin(), m_functions.end(),
+                                                 [&](const Function &function)
+                                                 { return !keepStarts.contains(function.start) && !keepNames.contains(function.name); }),
+                                  m_functions.end());
+                std::ostringstream msg;
+                msg << "module_functions whitelist kept " << m_functions.size() << " of " << before << " functions";
+                m_reporter.info("module", msg.str());
+            }
             m_symbols = m_elfParser->extractSymbols();
             m_sections = m_elfParser->getSections();
             m_relocations = m_elfParser->getRelocations();
@@ -985,7 +1022,8 @@ namespace ps2recomp
                     m_reporter.info("elf", msg.str());
                 }
 
-                if (entry != 0)
+                // Module mode: no entry/bootstrap of its own; the host shim calls into the module.
+                if (entry != 0 && m_config.moduleName.empty())
                 {
                     m_bootstrapInfo.valid = true;
                     m_bootstrapInfo.entry = entry;
@@ -1039,6 +1077,7 @@ namespace ps2recomp
             m_codeGenerator->setBootstrapInfo(m_bootstrapInfo);
             m_codeGenerator->setConfiguredJumpTables(m_config.jumpTables);
             m_codeGenerator->setEmitInstructionComments(true);
+            m_codeGenerator->m_moduleName = m_config.moduleName;
 
             fs::create_directories(m_config.outputPath);
 
@@ -1388,16 +1427,21 @@ namespace ps2recomp
                 }
             };
 
-            if (m_config.singleFileOutput)
+            const bool moduleMode = !m_config.moduleName.empty();
+            if (m_config.singleFileOutput || moduleMode)
             {
-                fs::path outputPath = fs::path(m_config.outputPath) / "ps2_recompiled_functions.cpp";
+                fs::path outputPath = fs::path(m_config.outputPath) /
+                                      (moduleMode ? m_config.moduleName + "_module.cpp" : std::string("ps2_recompiled_functions.cpp"));
                 std::ofstream combinedOutput(outputPath);
                 if (!combinedOutput)
                 {
                     throw std::runtime_error("Failed to open combined output: " + outputPath.string());
                 }
 
-                writeCombinedOutputPreamble(combinedOutput);
+                if (moduleMode)
+                    writeModuleOutputPreamble(combinedOutput, m_config.moduleName);
+                else
+                    writeCombinedOutputPreamble(combinedOutput);
 
                 if (outputWorkerCount <= 1)
                 {
@@ -1588,6 +1632,10 @@ namespace ps2recomp
                     }
                 }
 
+                if (moduleMode)
+                {
+                    combinedOutput << "} // namespace " << m_config.moduleName << "\n";
+                }
                 combinedOutput.close();
                 if (!combinedOutput)
                 {
@@ -1787,7 +1835,9 @@ namespace ps2recomp
             std::string registerFunctions = m_codeGenerator->generateFunctionRegistration(m_functions, m_generatedStubs);
             m_generatedStubs.clear();
 
-            fs::path registerPath = fs::path(m_config.outputPath) / "register_functions.cpp";
+            fs::path registerPath = fs::path(m_config.outputPath) /
+                                    (m_config.moduleName.empty() ? std::string("register_functions.cpp")
+                                                                 : m_config.moduleName + "_function_table.cpp");
             if (!writeToFile(registerPath.string(), registerFunctions))
             {
                 throw std::runtime_error("Failed to write function registration file: " + registerPath.string());
@@ -1798,7 +1848,7 @@ namespace ps2recomp
                 m_reporter.progress(msg.str());
             }
 
-            if (!generateStubHeader())
+            if (m_config.moduleName.empty() && !generateStubHeader())
             {
                 throw std::runtime_error("Failed to generate stub header");
             }
@@ -1872,12 +1922,24 @@ namespace ps2recomp
         {
             std::stringstream ss;
 
-            ss << "#ifndef PS2_RECOMPILED_FUNCTIONS_H\n";
-            ss << "#define PS2_RECOMPILED_FUNCTIONS_H\n\n";
+            const std::string &moduleName = m_config.moduleName;
+            if (moduleName.empty())
+            {
+                ss << "#ifndef PS2_RECOMPILED_FUNCTIONS_H\n";
+                ss << "#define PS2_RECOMPILED_FUNCTIONS_H\n\n";
+            }
+            else
+            {
+                ss << "#pragma once\n\n";
+            }
 
             ss << "#include <cstdint>\n\n";
             ss << "struct R5900Context;\n";
             ss << "class PS2Runtime;\n\n";
+            if (!moduleName.empty())
+            {
+                ss << "namespace " << moduleName << " {\n";
+            }
 
             for (const auto &function : m_functions)
             {
@@ -1891,9 +1953,17 @@ namespace ps2recomp
                 ss << "void " << finalName << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);\n";
             }
 
-            ss << "\n#endif // PS2_RECOMPILED_FUNCTIONS_H\n";
+            if (moduleName.empty())
+            {
+                ss << "\n#endif // PS2_RECOMPILED_FUNCTIONS_H\n";
+            }
+            else
+            {
+                ss << "} // namespace " << moduleName << "\n";
+            }
 
-            fs::path headerPath = fs::path(m_config.outputPath) / "ps2_recompiled_functions.h";
+            fs::path headerPath = fs::path(m_config.outputPath) /
+                                  (moduleName.empty() ? std::string("ps2_recompiled_functions.h") : moduleName + "_functions.h");
             writeToFile(headerPath.string(), ss.str());
 
             {

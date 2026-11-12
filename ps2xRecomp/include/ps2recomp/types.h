@@ -191,6 +191,13 @@ namespace ps2recomp
         std::vector<std::string> entryPointHints;
         std::unordered_map<uint32_t, uint32_t> mmioByInstructionAddress;
         std::vector<JumpTable> jumpTables;
+        // Module mode (SvR04/SvR06/SYM engines run as extra guest modules next to the game): when `module` is set the
+        // output is wrapped in `namespace <module>`, written as <module>_module.cpp / <module>_functions.h /
+        // <module>_function_table.cpp, and the function table is the runtime's PS2GuestModuleTable g_<module>ModuleTable
+        // instead of the game's global table. Empty = normal game output (unchanged).
+        std::string moduleName;
+        // Optional whitelist ("name", "0xADDR" or "name@0xADDR"): only these functions are emitted. Empty = all.
+        std::vector<std::string> moduleFunctions;
     };
 
 } // namespace ps2recomp

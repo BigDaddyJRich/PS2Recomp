@@ -71,6 +71,8 @@ namespace ps2recomp
         bool m_emitInstructionComments = true;
         RecompilerReporter *m_reporter = nullptr;
         std::string m_currentFunctionName;
+        // Module mode (RecompilerConfig::moduleName): non-empty = emit a PS2GuestModuleTable instead of the game table.
+        std::string m_moduleName;
 
         std::string translateInstruction(const Instruction &inst);
         std::string translateInstruction(const Instruction &inst, const MemoryAccessHint &memoryHint);

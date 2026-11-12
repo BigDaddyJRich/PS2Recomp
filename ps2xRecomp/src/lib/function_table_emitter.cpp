@@ -146,6 +146,54 @@ namespace ps2recomp
         }
 
         std::stringstream ss;
+        if (!cg.m_moduleName.empty())
+        {
+            // Module mode: the table spans every executable section of the module ELF, so a host shim can also
+            // register replacements (registerFunction while the module is active) for functions it did not emit.
+            const std::string &mod = cg.m_moduleName;
+            uint32_t moduleBase = tableBase;
+            uint32_t moduleEnd = tableEnd;
+            for (const auto &section : cg.m_sections)
+            {
+                if (!section.isCode || section.size == 0u)
+                    continue;
+                if (moduleBase == moduleEnd)
+                {
+                    moduleBase = section.address & ~3u;
+                    moduleEnd = (section.address + section.size + 3u) & ~3u;
+                    continue;
+                }
+                moduleBase = std::min(moduleBase, section.address & ~3u);
+                moduleEnd = std::max(moduleEnd, (section.address + section.size + 3u) & ~3u);
+            }
+            const uint32_t moduleSlots = (moduleEnd - moduleBase) >> 2;
+
+            ss << "#include \"ps2_runtime.h\"\n";
+            ss << "#include \"ps2_stubs.h\"\n";
+            ss << "#include \"ps2_syscalls.h\"\n";
+            ss << "#include \"" << mod << "_functions.h\"\n\n";
+            ss << "namespace {\n";
+            ss << "PS2Runtime::RecompiledFunction g_" << mod << "FunctionSlots[" << std::dec
+               << (moduleSlots == 0u ? 1u : moduleSlots) << "u] = {};\n";
+            ss << "}\n\n";
+            ss << "PS2GuestModuleTable g_" << mod << "ModuleTable = {\"" << mod << "\", 0x" << std::hex << moduleBase
+               << "u, 0x" << moduleEnd << "u, " << std::dec << moduleSlots << "u, g_" << mod << "FunctionSlots};\n\n";
+            ss << "namespace {\n";
+            ss << "struct " << mod << "FunctionTableInitializer {\n";
+            ss << "    " << mod << "FunctionTableInitializer() {\n";
+            for (const auto &[address, name] : entries)
+            {
+                const uint32_t slot = (address - moduleBase) >> 2;
+                ss << "        g_" << mod << "FunctionSlots[" << std::dec << slot << "] = " << mod << "::" << name
+                   << "; // 0x" << std::hex << address << std::dec << "\n";
+            }
+            ss << "    }\n";
+            ss << "};\n";
+            ss << "static const " << mod << "FunctionTableInitializer g_" << mod << "FunctionTableInitializer;\n";
+            ss << "}\n";
+            return ss.str();
+        }
+
         ss << "#include \"ps2_runtime.h\"\n";
         ss << "#include <ps2_recompiled_functions.h>\n";
         ss << "#include \"ps2_stubs.h\"\n";
