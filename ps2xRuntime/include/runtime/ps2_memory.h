@@ -23,6 +23,11 @@
 
 class GS;
 
+// Nov 13 STEP 2 (NATIVE_PARTICLE_ENGINES note): guest-memory contexts per game. While a guest module (SvR04/SvR06/SYM
+// engine) runs on this thread with its own RAM, PS2Memory's RAM base (DMA chain walkers, VIF, Load/Store, getRDRAM) is that
+// module's buffer. Only the thread inside the scope sees it (audio/SIF/GS threads keep the game's RAM). nullptr = game RAM.
+extern thread_local uint8_t *t_ps2RamOverride;
+
 constexpr uint32_t PS2_RAM_SIZE = 32u * 1024u * 1024u; // 32MB: the EE's RAM as the game sees it (stack, heap, GetMemorySize)
 // The host array behind guest RAM. Bigger than the PS2's 32 MB so the runtime (or game-specific code) can place data
 // at guest addresses above 32 MB that the game's own code reads like any other RAM. Only the first PS2_RAM_SIZE bytes
@@ -304,11 +309,14 @@ public:
     bool isRamHostAddress(const void *host) const
     {
         const auto *p = static_cast<const uint8_t *>(host);
-        return m_rdram && p >= m_rdram && p < m_rdram + PS2_RAM_BACKING_SIZE;
+        const uint8_t *r = activeRam();
+        return r && p >= r && p < r + PS2_RAM_BACKING_SIZE;
     }
 
     // Memory access methods
-    uint8_t *getRDRAM() { return m_rdram; }
+    uint8_t *getRDRAM() { return activeRam(); }
+    uint8_t *activeRam() const { return t_ps2RamOverride ? t_ps2RamOverride : m_rdramHome; }
+    uint8_t *homeRam() const { return m_rdramHome; }
     uint8_t *getScratchpad() { return m_scratchpad; }
     uint8_t *getIOPRAM() { return iop_ram; }
     uint64_t dmaStartCount() const { return m_dmaStartCount.load(std::memory_order_relaxed); }
@@ -405,7 +413,7 @@ public:
     const uint8_t *getGSVRAM() const { return m_gsVRAM; }
     bool hasSeenGifCopy() const { return m_seenGifCopy; }
     // Main RAM (32MB)
-    uint8_t *m_rdram;
+    uint8_t *m_rdramHome; // the game's RAM (activeRam() = a guest module's RAM while t_ps2RamOverride is set)
 
     // Scratchpad memory (16KB)
     uint8_t *m_scratchpad;

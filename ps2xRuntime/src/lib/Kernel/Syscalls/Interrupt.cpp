@@ -67,6 +67,8 @@ namespace ps2_syscalls
 
     void dispatchDmacHandlersForCause(uint8_t *, PS2Runtime *runtime, uint32_t cause)
     {
+        if (t_ps2RamOverride) // STEP 2: DMA kicked by a guest module (SvR04 engine) is not the game's: its handlers stay out
+            return;
         runtime->eeScheduler().dispatchIrq(true, cause);
     }
 

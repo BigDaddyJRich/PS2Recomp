@@ -7,6 +7,7 @@
 #include "runtime/ps2_address.h"
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
+thread_local uint8_t *t_ps2RamOverride = nullptr; // STEP 2 guest-memory contexts (ps2_memory.h)
 #include <atomic>
 #include <cstring>
 #include <limits>
@@ -33,6 +34,7 @@ namespace ps2_stubs { void mpegIpuToDmaStart(uint8_t *rdram, uint32_t &chcr, uin
 #else
 #include <sys/mman.h>
 #endif
+#define m_rdram activeRam() // STEP 2: every RAM read here follows the active guest-memory context
 
 namespace
 {
@@ -542,7 +544,7 @@ static inline uint32_t gs_vram_offset(uint32_t basePage, uint32_t x, uint32_t y,
 }
 
 PS2Memory::PS2Memory()
-    : m_rdram(nullptr), m_scratchpad(nullptr), iop_ram(nullptr), m_seenGifCopy(false), m_gsVRAM(nullptr)
+    : m_rdramHome(nullptr), m_scratchpad(nullptr), iop_ram(nullptr), m_seenGifCopy(false), m_gsVRAM(nullptr)
 {
     ps2SetScratchpadHostPtr(nullptr);
 }
@@ -552,8 +554,8 @@ PS2Memory::~PS2Memory()
     if (m_rdram)
     {
         g_guestRamBase.store(nullptr, std::memory_order_release);
-        releaseGuestRam(m_rdram);
-        m_rdram = nullptr;
+        releaseGuestRam(m_rdramHome);
+        m_rdramHome = nullptr;
     }
 
     if (m_scratchpad)
@@ -603,7 +605,7 @@ bool PS2Memory::initialize()
     {
         if (m_rdram)
             g_guestRamBase.store(nullptr, std::memory_order_release);
-        releaseGuestRam(m_rdram);
+        releaseGuestRam(m_rdramHome);
         delete[] m_scratchpad;
         delete[] iop_ram;
         delete[] m_gsVRAM;
@@ -611,7 +613,7 @@ bool PS2Memory::initialize()
         delete[] m_vu0Data;
         delete[] m_vu1Code;
         delete[] m_vu1Data;
-        m_rdram = nullptr;
+        m_rdramHome = nullptr;
         m_scratchpad = nullptr;
         ps2SetScratchpadHostPtr(nullptr);
         iop_ram = nullptr;
@@ -643,7 +645,7 @@ bool PS2Memory::initialize()
     {
         // Allocate main RAM
         // Reserve the whole backing range; commit the PS2's 32 MB (zero-filled).
-        m_rdram = reserveGuestRam();
+        m_rdramHome = reserveGuestRam();
         if (!m_rdram || !commitGuestRam(m_rdram, 0u, PS2_RAM_COMMITTED_TOP))
             throw std::bad_alloc();
         g_guestRamBase.store(m_rdram, std::memory_order_release);

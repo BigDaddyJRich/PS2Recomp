@@ -11,6 +11,7 @@
 #include <chrono>
 #include <map>
 #include <string>
+#define m_rdram activeRam() // STEP 2 guest-memory contexts (ps2_memory.h)
 
 // HCTP diag (HCTP_VU1MAP=1): the VU1 program map for the native renderer. At every MSCAL: which program starts (start
 // pc + the first code words there, matched to tools\vu1_dump.py's listings offline), the VIF UNPACKs sent since the
