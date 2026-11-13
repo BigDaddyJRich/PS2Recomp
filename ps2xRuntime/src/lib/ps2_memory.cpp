@@ -27,6 +27,8 @@ namespace ps2_stubs { void mpegIpuToDmaStart(uint8_t *rdram, uint32_t &chcr, uin
 #endif
 #include <windows.h>
 #include <dbghelp.h>
+#include <tlhelp32.h>
+#include <thread>
 #pragma comment(lib, "dbghelp.lib")
 #else
 #include <sys/mman.h>
@@ -174,6 +176,67 @@ namespace
         VirtualProtect(base + kLowWatchBase, kLowWatchSize, PAGE_READWRITE, &old);
         t_lowWatchStepping = true;
         info->ContextRecord->EFlags |= 0x100u; // trap after the write, re-protect in the single-step branch
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    // ps2HwWatchArm (HCTP_RESWATCH diagnosis): DR0-DR3 write breakpoints. Data breakpoints trap AFTER the write, so the
+    // handler sees the new value; it logs the host stack (recompiled guest function names) of a bad write once per writer.
+    struct HwWatchSlot { uint32_t guest; uint32_t mode; uint32_t last; char tag[24]; };
+    HwWatchSlot g_hwWatch[4] = {};
+    std::atomic<int> g_hwWatchCount{0};
+    LONG CALLBACK hwWatchHandler(EXCEPTION_POINTERS *info)
+    {
+        const EXCEPTION_RECORD *rec = info ? info->ExceptionRecord : nullptr;
+        if (!rec || rec->ExceptionCode != EXCEPTION_SINGLE_STEP || !info->ContextRecord)
+            return EXCEPTION_CONTINUE_SEARCH;
+        const DWORD64 dr6 = info->ContextRecord->Dr6;
+        const int n = g_hwWatchCount.load(std::memory_order_acquire);
+        uint8_t *base = g_guestRamBase.load(std::memory_order_acquire);
+        if (!(dr6 & 0xFu) || n <= 0 || !base)
+            return EXCEPTION_CONTINUE_SEARCH;
+        for (int i = 0; i < n; ++i)
+        {
+            if (!(dr6 & (1ull << i)))
+                continue;
+            HwWatchSlot &w = g_hwWatch[i];
+            uint32_t v = 0;
+            std::memcpy(&v, base + w.guest, 4);
+            const uint32_t old = w.last;
+            w.last = v;
+            const bool bad = (w.mode == 0u) ? (v != old) : ((v & 7u) != 0u || (v & 0x0FFFFFFFu) >= PS2_RAM_COMMITTED_TOP);
+            if (!bad)
+                continue;
+            static std::mutex logMutex;
+            static std::set<std::pair<int, void *>> seen;
+            static int logs = 0;
+            std::lock_guard<std::mutex> lock(logMutex);
+            if (logs >= 40 || !seen.insert({i, rec->ExceptionAddress}).second)
+                continue;
+            ++logs;
+            HANDLE proc = GetCurrentProcess();
+            static bool symInit = (SymInitialize(proc, nullptr, TRUE), true);
+            (void)symInit;
+            alignas(SYMBOL_INFO) char symBuf[sizeof(SYMBOL_INFO) + 256] = {};
+            auto *sym = reinterpret_cast<SYMBOL_INFO *>(symBuf);
+            sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+            sym->MaxNameLen = 255;
+            void *frames[24] = {};
+            const USHORT fc = CaptureStackBackTrace(0, 24, frames, nullptr);
+            frames[0] = rec->ExceptionAddress;
+            char line[4096];
+            int len = std::snprintf(line, sizeof(line), "[reswatch] %s guest %08X %08X -> %08X thread %lu:", w.tag, w.guest, old, v,
+                                    static_cast<unsigned long>(GetCurrentThreadId()));
+            for (USHORT f = 0; f < fc && len < 3900; ++f)
+            {
+                DWORD64 disp = 0;
+                if (f >= 1 && f <= 3) continue; // handler + dispatcher frames
+                if (SymFromAddr(proc, reinterpret_cast<DWORD64>(frames[f]), &disp, sym))
+                    len += std::snprintf(line + len, sizeof(line) - len, " <- %s+0x%llx", sym->Name, static_cast<unsigned long long>(disp));
+            }
+            std::fprintf(stderr, "%s\n", line);
+            std::fflush(stderr);
+        }
+        info->ContextRecord->Dr6 = 0;
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
@@ -3147,4 +3210,66 @@ void PS2Memory::clearModifiedFlag(uint32_t address, uint32_t size)
             }
         }
     }
+}
+
+// HCTP_RESWATCH diagnosis (see ps2_memory.h). Debug registers are per thread: a helper thread suspends every other thread
+// of the process, sets DR0-DR3/DR7 (write, 4 bytes) and resumes it. Threads created later are not covered.
+void ps2HwWatchArm(const uint32_t *guestAddrs, const uint32_t *modes, const char *const *tags, int count)
+{
+#if defined(_WIN32)
+    uint8_t *base = g_guestRamBase.load(std::memory_order_acquire);
+    if (!base || count <= 0)
+        return;
+    count = std::min(count, 4);
+    static std::atomic<bool> s_handler{false};
+    if (!s_handler.exchange(true))
+        AddVectoredExceptionHandler(1, hwWatchHandler);
+    g_hwWatchCount.store(0, std::memory_order_release);
+    DWORD64 dr[4] = {};
+    DWORD64 dr7 = 0;
+    for (int i = 0; i < count; ++i)
+    {
+        HwWatchSlot &w = g_hwWatch[i];
+        w.guest = guestAddrs[i] & PS2_RAM_COMMITTED_MASK & ~3u;
+        w.mode = modes[i];
+        std::memcpy(&w.last, base + w.guest, 4);
+        std::snprintf(w.tag, sizeof(w.tag), "%s", tags[i] ? tags[i] : "?");
+        dr[i] = reinterpret_cast<DWORD64>(base + w.guest);
+        dr7 |= (1ull << (2 * i)) | (1ull << (16 + 4 * i)) | (3ull << (18 + 4 * i)); // local enable, RW=01 write, LEN=11 4 bytes
+    }
+    g_hwWatchCount.store(count, std::memory_order_release);
+    std::thread([dr, dr7] {
+        const DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap == INVALID_HANDLE_VALUE)
+            return;
+        THREADENTRY32 te = {};
+        te.dwSize = sizeof(te);
+        int armed = 0;
+        for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te))
+        {
+            if (te.th32OwnerProcessID != pid || te.th32ThreadID == self)
+                continue;
+            HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, te.th32ThreadID);
+            if (!t)
+                continue;
+            if (SuspendThread(t) != static_cast<DWORD>(-1))
+            {
+                CONTEXT c = {};
+                c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                if (GetThreadContext(t, &c))
+                {
+                    c.Dr0 = dr[0]; c.Dr1 = dr[1]; c.Dr2 = dr[2]; c.Dr3 = dr[3]; c.Dr6 = 0; c.Dr7 = dr7;
+                    if (SetThreadContext(t, &c)) ++armed;
+                }
+                ResumeThread(t);
+            }
+            CloseHandle(t);
+        }
+        CloseHandle(snap);
+        std::fprintf(stderr, "[reswatch] armed on %d threads (dr7 %llx)%c", armed, static_cast<unsigned long long>(dr7), 10);
+    }).join();
+#else
+    (void)guestAddrs; (void)modes; (void)tags; (void)count;
+#endif
 }

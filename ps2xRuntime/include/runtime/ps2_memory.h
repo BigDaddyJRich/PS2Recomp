@@ -36,8 +36,14 @@ constexpr uint32_t PS2_RAM_MASK = PS2_RAM_BACKING_SIZE - 1u;
 // 32 MB + a host-only window 0x02000000-0x03FFFFFF where HCTP's GameMem char pages live (hctp_overrides.cpp ymem re-cut).
 // Host code that bounds/masks guest pointers to RAM uses these instead of PS2_RAM_SIZE / 0x1FFFFFF. Every address
 // below the top is committed, so a masked garbage pointer still reads zeros instead of faulting.
-constexpr uint32_t PS2_RAM_COMMITTED_TOP = 0x04000000u;
+// Nov 13: top raised to 128 MB: 0x07000000-0x07C00080 = CRender packet buffers (hctp_overrides.cpp crenderPktNew, ymem page 15);
+// 0x04000000-0x06FFFFFF free (planned particle-engine windows).
+constexpr uint32_t PS2_RAM_COMMITTED_TOP = 0x08000000u;
 constexpr uint32_t PS2_RAM_COMMITTED_MASK = PS2_RAM_COMMITTED_TOP - 1u;
+// Diagnosis (Windows only, no-op elsewhere): hardware data-write breakpoints on up to 4 guest words, set on every thread
+// of the process. mode 0 = log the writer's host stack on any value change; mode 1 = log only when the new value is not
+// 8-aligned or above PS2_RAM_COMMITTED_TOP (packet pointers). Re-arming replaces the set. tag names each word in the log.
+void ps2HwWatchArm(const uint32_t *guestAddrs, const uint32_t *modes, const char *const *tags, int count);
 constexpr uint32_t PS2_RAM_BASE = 0x00000000;          // Physical base of RDRAM
 constexpr uint32_t PS2_SCRATCHPAD_BASE = 0x70000000;
 constexpr uint32_t PS2_SCRATCHPAD_ALIAS_BASE = 0xF0000000;
