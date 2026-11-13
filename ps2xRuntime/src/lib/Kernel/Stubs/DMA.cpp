@@ -50,7 +50,7 @@ namespace ps2_stubs
             uint32_t bytes = qwc * 16u;
 
             // MADR may itself point into the scratchpad (bit 31 set) or into main RAM.
-            uint32_t ramAddr = addrArg & 0x1FFFFFF0u;
+            uint32_t ramAddr = addrArg & (PS2_RAM_COMMITTED_MASK & ~0xFu); // Nov 12: char pages above 32 MB
             if ((addrArg & 0x80000000u) != 0u)
             {
                 const uint32_t lower = addrArg & 0x7FFFFFFFu;
@@ -72,11 +72,11 @@ namespace ps2_stubs
             }
             else
             {
-                if (ramAddr >= PS2_RAM_SIZE)
+                if (ramAddr >= PS2_RAM_COMMITTED_TOP)
                 {
                     return true;
                 }
-                bytes = std::min<uint32_t>(bytes, PS2_RAM_SIZE - ramAddr);
+                bytes = std::min<uint32_t>(bytes, PS2_RAM_COMMITTED_TOP - ramAddr);
                 if (channelBase == DMA_CH_FROM_SPR)
                     std::memcpy(rdram + ramAddr, spr + sadr, bytes);
                 else

@@ -581,7 +581,7 @@ bool PS2Memory::initialize()
         // Allocate main RAM
         // Reserve the whole backing range; commit the PS2's 32 MB (zero-filled).
         m_rdram = reserveGuestRam();
-        if (!m_rdram || !commitGuestRam(m_rdram, 0u, PS2_RAM_SIZE))
+        if (!m_rdram || !commitGuestRam(m_rdram, 0u, PS2_RAM_COMMITTED_TOP))
             throw std::bad_alloc();
         g_guestRamBase.store(m_rdram, std::memory_order_release);
 #if defined(_WIN32)

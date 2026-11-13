@@ -388,7 +388,7 @@ namespace ps2_syscalls
                 return true;
             }
             const uint32_t normalized = value & 0x1FFFFFFFu;
-            return normalized >= 0x10000u && normalized < PS2_RAM_SIZE;
+            return normalized >= 0x10000u && normalized < PS2_RAM_COMMITTED_TOP;
         };
         const auto looksLikeSize = [](uint32_t value)
         {
@@ -579,7 +579,7 @@ namespace ps2_syscalls
             server->rmode = ((mode & kSifRpcModeNowait) && endFunction == 0u) ? 0 : 1;
             server->rid = 0;
 
-            if (server->buf != 0u && (server->buf & 0x1FFFFFFFu) >= PS2_RAM_SIZE)
+            if (server->buf != 0u && (server->buf & 0x1FFFFFFFu) >= PS2_RAM_COMMITTED_TOP)
             {
                 // HCTP six-man (sceSkSsMIDI_Bind): server->buf = 0x0AB6B1B1 -> the copy faulted. Log who, skip copy.
                 static uint32_t badServerLogs = 0u;
@@ -668,7 +668,7 @@ namespace ps2_syscalls
                 {
                     resultPointer = guestDefaultResult;
                 }
-                else if ((resultPointer & 0x1FFFFFFFu) >= PS2_RAM_SIZE && (resultPointer & 0xF0000000u) != 0x70000000u)
+                else if ((resultPointer & 0x1FFFFFFFu) >= PS2_RAM_COMMITTED_TOP && (resultPointer & 0xF0000000u) != 0x70000000u)
                 {
                     // HCTP six-man: sceSkSsMIDI_Bind's sound-kit call came back with v0 = 0x0AB6B1B1 (not an address);
                     // copying the reply from there crashed (or, masked to 32 MB, overwrote game RAM: invisible

@@ -32,6 +32,12 @@ constexpr uint32_t PS2_RAM_SIZE = 32u * 1024u * 1024u; // 32MB: the EE's RAM as 
 // multiple of it, so masking folds them as before.
 constexpr uint32_t PS2_RAM_BACKING_SIZE = 256u * 1024u * 1024u;
 constexpr uint32_t PS2_RAM_MASK = PS2_RAM_BACKING_SIZE - 1u;
+// Nov 12 CHAR MEMORY EXPANSION (notes CHAR_MEMORY_EXPANSION_RESEARCH_20261112.md sec 3): committed at start = the PS2's
+// 32 MB + a host-only window 0x02000000-0x03FFFFFF where HCTP's GameMem char pages live (hctp_overrides.cpp ymem re-cut).
+// Host code that bounds/masks guest pointers to RAM uses these instead of PS2_RAM_SIZE / 0x1FFFFFF. Every address
+// below the top is committed, so a masked garbage pointer still reads zeros instead of faulting.
+constexpr uint32_t PS2_RAM_COMMITTED_TOP = 0x04000000u;
+constexpr uint32_t PS2_RAM_COMMITTED_MASK = PS2_RAM_COMMITTED_TOP - 1u;
 constexpr uint32_t PS2_RAM_BASE = 0x00000000;          // Physical base of RDRAM
 constexpr uint32_t PS2_SCRATCHPAD_BASE = 0x70000000;
 constexpr uint32_t PS2_SCRATCHPAD_ALIAS_BASE = 0xF0000000;

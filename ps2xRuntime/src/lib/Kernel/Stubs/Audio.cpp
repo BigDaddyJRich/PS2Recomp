@@ -187,7 +187,7 @@ namespace ps2_stubs
                     std::fprintf(stderr, "%s\n", line);
                 }
                 // HCTP six-man: sceSkSsMIDI_Bind sent a block at 0x0AB6B1B1 (outside RAM) -> the RPC copy faulted
-                if ((arg[1] & 0x1FFFFFFFu) >= PS2_RAM_SIZE || arg[2] > 0x10000u)
+                if ((arg[1] & 0x1FFFFFFFu) >= PS2_RAM_COMMITTED_TOP || arg[2] > 0x10000u)
                 {
                     static uint32_t badBlockLogs = 0u;
                     if (badBlockLogs < 16u)
