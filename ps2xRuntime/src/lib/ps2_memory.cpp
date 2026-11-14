@@ -2520,15 +2520,29 @@ void PS2Memory::processPendingTransfers()
 
 void PS2Memory::queueCompletedDmacCause(uint32_t cause)
 {
+    // STEP 3: a cause is tagged with the context that completed it (bit 31 = a guest module ran with t_ps2RamOverride set on
+    // this thread). Each context only consumes its own: before, the game's VIF1/GIF causes queued at a module Enter's
+    // processPendingTransfers were eaten by the module's first HW Store32 drain and then dropped (Interrupt.cpp
+    // dispatchDmacHandlersForCause skips handlers while the override is set) = the game's DMAC completion handler lost.
     std::lock_guard<std::mutex> lock(m_completedDmacMutex);
-    m_completedDmacCauses.push_back(cause);
+    m_completedDmacCauses.push_back(cause | (t_ps2RamOverride ? kDmacCauseModuleTag : 0u));
 }
 
 std::vector<uint32_t> PS2Memory::consumeCompletedDmacCauses()
 {
     std::lock_guard<std::mutex> lock(m_completedDmacMutex);
     std::vector<uint32_t> causes;
-    causes.swap(m_completedDmacCauses);
+    const bool module = t_ps2RamOverride != nullptr;
+    size_t keep = 0;
+    for (uint32_t c : m_completedDmacCauses)
+    {
+        if (((c & kDmacCauseModuleTag) != 0u) == module)
+            causes.push_back(c & ~kDmacCauseModuleTag);
+        else if (module)
+            m_completedDmacCauses[keep++] = c; // the game's: left for the game's next drain
+        // else: a module's cause seen by a game drain (module context already left) = dropped, as before
+    }
+    m_completedDmacCauses.resize(keep);
     return causes;
 }
 

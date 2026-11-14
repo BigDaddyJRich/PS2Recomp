@@ -597,6 +597,7 @@ namespace ps2_stubs
 
     void sceSifRebootIop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        std::fprintf(stderr, "[iop-reset] sceSifRebootIop pc 0x%x ra 0x%x%c", ctx->pc, getRegU32(ctx, 31), 10); // STEP 3 C probe
         PS2IopTransport::reset(runtime);
         setReturnS32(ctx, 1);
     }
@@ -626,6 +627,7 @@ namespace ps2_stubs
 
     void sceSifResetIop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        std::fprintf(stderr, "[iop-reset] sceSifResetIop pc 0x%x ra 0x%x%c", ctx->pc, getRegU32(ctx, 31), 10); // STEP 3 C probe
         PS2IopTransport::reset(runtime);
         setReturnS32(ctx, 1);
     }

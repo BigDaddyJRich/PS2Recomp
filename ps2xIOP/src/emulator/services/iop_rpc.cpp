@@ -25,6 +25,8 @@ namespace ps2x::iop::detail
 
     void IopRpcBridge::reset()
     {
+        std::fprintf(stderr, "[iop-srv] reset: clearing %zu servers (has 0x300=%d)\n", m_servers.size(),
+                     m_servers.count(0x300u) ? 1 : 0); // STEP 3 C probe
         m_servers.clear();
         m_cmdHandlers.clear();
         m_cmdBuffer = 0u;
@@ -343,6 +345,8 @@ namespace ps2x::iop::detail
             server.callback = m_memory.read32(stackPointer + 16u);
             server.callbackBuffer = m_memory.read32(stackPointer + 20u);
             server.queue = m_memory.read32(stackPointer + 24u);
+            std::fprintf(stderr, "[iop-srv] RegisterRpc sid 0x%x fn 0x%x sd 0x%x pc 0x%x ra 0x%x (replace=%d)\n", server.sid,
+                         server.function, server.serverData, cpu.pc, cpu.gpr[31], m_servers.count(server.sid) ? 1 : 0); // STEP 3 C probe
             m_servers[server.sid] = server;
             if (server.serverData != 0u)
             {
@@ -396,6 +400,8 @@ namespace ps2x::iop::detail
             {
                 if (server->second.serverData == serverData)
                 {
+                    std::fprintf(stderr, "[iop-srv] RemoveRpc sid 0x%x sd 0x%x pc 0x%x ra 0x%x\n", server->first, serverData, cpu.pc,
+                                 cpu.gpr[31]); // STEP 3 C probe
                     m_servers.erase(server);
                     break;
                 }
@@ -512,7 +518,11 @@ namespace ps2x::iop::detail
         {
             const uint32_t function = IopMemory::physicalAddress(server->second.function);
             if (function >= base && function < base + size)
+            {
+                std::fprintf(stderr, "[iop-srv] removeServersInRange 0x%x+0x%x: sid 0x%x fn 0x%x\n", base, size, server->first,
+                             server->second.function); // STEP 3 C probe
                 server = m_servers.erase(server);
+            }
             else
                 ++server;
         }

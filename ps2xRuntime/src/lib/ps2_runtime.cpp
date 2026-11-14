@@ -988,6 +988,9 @@ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
 
 void PS2Runtime::resetIop()
 {
+    // STEP 3 C probe: who resets the IOP (HCTP_SVR04_CTX=1 loses every IOP RPC server here)
+    std::fprintf(stderr, "[iop-reset] module=%p ramOverride=%d trace=%s%c", static_cast<const void *>(activeGuestModule()),
+                 t_ps2RamOverride ? 1 : 0, formatDispatchHistory().c_str(), 10);
     m_iopSubsystem->reset();
 }
 
@@ -1028,7 +1031,11 @@ bool PS2Runtime::isIopMemoryRange(uint32_t address, size_t size) const
 
 bool PS2Runtime::syncCoreSubsystems()
 {
-    uint8_t *const rdram = m_memory.getRDRAM();
+    // STEP 3: bind the game's own RAM, never a guest-module view. getRDRAM() = activeRam() is SvR04's RAM while
+    // t_ps2RamOverride is set (hctp_svr04_ctx Enter), so a module's sceGsExecLoadImage (GS.cpp readGsLoadImage path)
+    // saw "new RAM" here and re-ran the whole core init below incl. resetIop() = every IOP RPC server dropped (HCTP then
+    // spun in RpcClient::Bind 0x2e1ff0 on sid 0x300 forever), GS/VU re-init. Measured Nov 13 ([iop-reset] probe).
+    uint8_t *const rdram = m_memory.homeRam();
     uint8_t *const gsVram = m_memory.getGSVRAM();
     if (!rdram || !gsVram)
     {

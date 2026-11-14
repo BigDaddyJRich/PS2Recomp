@@ -387,7 +387,8 @@ public:
     void processVIF1Data(uint32_t srcPhysAddr, uint32_t sizeBytes);
     void processVIF1Data(const uint8_t *data, uint32_t sizeBytes);
     void processPendingTransfers();
-    std::vector<uint32_t> consumeCompletedDmacCauses();
+    std::vector<uint32_t> consumeCompletedDmacCauses(); // own context's causes only (bit-31 module tag, ps2_memory.cpp)
+    static constexpr uint32_t kDmacCauseModuleTag = 0x80000000u;
     // The chain worker (runtime/ps2_chain.h): DMA kicks hand it their VIF1 / GIF bytes; reads of what it owns wait
     // for it. Null = everything runs at once, as before.
     void setChainWorker(ChainWorker *chain) { m_chain = chain; }
