@@ -6,6 +6,7 @@
 #include <chrono>
 #include <iostream>
 #include <mutex>
+#include <string>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -16,6 +17,9 @@
 #endif
 #include <windows.h>
 #include <Xinput.h>
+#endif
+#if defined(PS2X_NATIVE_HOST)
+#include "host/win32_host.h"
 #endif
 
 namespace ps2_pad_rumble
@@ -76,9 +80,55 @@ namespace ps2_pad_rumble
 #endif
     }
 
+#if defined(PS2X_NATIVE_HOST)
+    namespace
+    {
+        // what each host controller was last sent (the game sets its motors every frame)
+        struct HostMotors
+        {
+            uint8_t small = 0, large = 0;
+            bool sent = false;
+        };
+        std::array<HostMotors, ps2host::kMaxPads> g_hostSent{};
+
+        void sendHost(int controller, uint8_t smallMotor, uint8_t largeMotor)
+        {
+            if (controller < 0 || controller >= ps2host::kMaxPads)
+                return;
+            HostMotors &m = g_hostSent[static_cast<size_t>(controller)];
+            if (m.sent && m.small == smallMotor && m.large == largeMotor)
+                return;
+            ps2host::setVibration(controller, smallMotor, largeMotor);
+            m = HostMotors{smallMotor, largeMotor, true};
+        }
+    }
+#endif
+
     void set(int port, int slot, bool smallMotor, uint8_t largeMotor)
     {
-#if defined(_WIN32)
+#if defined(PS2X_NATIVE_HOST)
+        // The native host knows each controller (XInput users 1-4, PlayStation 4 / 5 controllers over HID): the
+        // motors go to the controller behind the pad (ps2_pad_layout::hostController), whatever kind it is.
+        const int player = ps2_pad_layout::padIndex(port, slot);
+        const ps2_host_settings::Settings &settings = ps2_host_settings::get();
+        const bool allowed = player >= 0 && (player >= 4 || settings.vibration[player]);
+        const int controller = ps2_pad_layout::hostController(port, slot);
+        std::lock_guard<std::mutex> lock(g_mutex);
+        static bool s_reported[ps2_pad_layout::kPortCount][ps2_pad_layout::kSlotCount] = {};
+        if (port >= 0 && port < ps2_pad_layout::kPortCount && slot >= 0 && slot < ps2_pad_layout::kSlotCount &&
+            !s_reported[port][slot] && (smallMotor || largeMotor))
+        {
+            s_reported[port][slot] = true;
+            const char *name = controller >= 0 ? ps2host::padName(controller) : nullptr;
+            std::cerr << "[rumble] pad " << (port + 1) << static_cast<char>('A' + slot) << " (player " << (player + 1)
+                      << "): " << (name ? name : "no controller")
+                      << (controller >= 0 ? " -> controller " + std::to_string(controller + 1) : std::string())
+                      << (allowed ? "" : " (vibration off in the settings)") << std::endl;
+        }
+        if (controller < 0)
+            return;
+        sendHost(controller, allowed && smallMotor ? 0xFF : 0, allowed ? largeMotor : 0);
+#elif defined(_WIN32)
         const int player = ps2_pad_layout::padIndex(port, slot);
         const ps2_host_settings::Settings &settings = ps2_host_settings::get();
         const bool allowed = player >= 0 && (player >= 4 || settings.vibration[player]);
@@ -117,7 +167,12 @@ namespace ps2_pad_rumble
 
     void stopAll()
     {
-#if defined(_WIN32)
+#if defined(PS2X_NATIVE_HOST)
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for (int controller = 0; controller < ps2host::kMaxPads; ++controller)
+            if (g_hostSent[static_cast<size_t>(controller)].sent)
+                sendHost(controller, 0, 0);
+#elif defined(_WIN32)
         std::lock_guard<std::mutex> lock(g_mutex);
         for (int user = 0; user < static_cast<int>(XUSER_MAX_COUNT); ++user)
             if (g_sent[static_cast<size_t>(user)].sent)

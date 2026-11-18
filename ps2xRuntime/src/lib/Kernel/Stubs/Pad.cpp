@@ -550,8 +550,9 @@ namespace ps2_stubs
         (void)runtime;
         const int port = static_cast<int>(getRegU32(ctx, 4));
         const int slot = static_cast<int>(getRegU32(ctx, 5));
-        // slot A of a port is always there (as before); a multitap's slots B-D only with a controller in them
-        const bool plugged = slot == 0 || ps2_pad_layout::connected(port, slot);
+        // pad 1A is always there (the game needs a player 1); every other place (port 2, a multitap's slots) only
+        // with a controller / the keyboard in it. (Port 2 slot A used to be always plugged: a phantom player 2.)
+        const bool plugged = (port == 0 && slot == 0) || ps2_pad_layout::connected(port, slot);
         std::lock_guard<std::mutex> lock(g_padStateMutex);
         PadPortState *portState = lookupPadPortStateLocked(port, slot);
         int32_t state = kPadStateDisconnected;
@@ -761,7 +762,7 @@ namespace ps2_stubs
         }
 
         ps2TraceGuestRangeWrite(rdram, dataAddr, 32u, "scePadRead", ctx);
-        if ((slot != 0 && !ps2_pad_layout::connected(port, slot)) || !readPadPortData(port, slot, runtime, data, dataAddr))
+        if ((!(port == 0 && slot == 0) && !ps2_pad_layout::connected(port, slot)) || !readPadPortData(port, slot, runtime, data, dataAddr))
         {
             setReturnS32(ctx, 0);
             return;

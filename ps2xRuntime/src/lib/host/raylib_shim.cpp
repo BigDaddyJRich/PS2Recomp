@@ -206,7 +206,7 @@ bool IsKeyPressed(int key)
 }
 
 bool IsGamepadAvailable(int gamepad) { return ps2host::pad(gamepad).connected; }
-const char *GetGamepadName(int) { return "XInput"; }
+const char *GetGamepadName(int gamepad) { return ps2host::padName(gamepad); }
 
 bool IsGamepadButtonDown(int gamepad, int button)
 {

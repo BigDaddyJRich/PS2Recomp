@@ -1,6 +1,7 @@
 // Native Win32 host (window, Direct3D 11, XInput, XAudio2). Ported from WWE Crush Hour PC (KaikoClanworth1,
 // GPL-3.0, https://github.com/KaikoClanworth1/wwe-crush-hour-pc) for the HCTP native-renderer build.
 #include "host/win32_host.h"
+#include "host/win32_hid_pads.h"
 #include "runtime/ps2_host_settings.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -132,6 +133,7 @@ namespace ps2host
 
         std::mutex g_inputMutex;
         PadState g_pads[kMaxPads];
+        const char *g_hidNames[kMaxPads - kXInputPads] = {}; // static strings
         bool g_keys[256]{};
 
         LARGE_INTEGER g_qpcFreq{};
@@ -183,6 +185,24 @@ float4 ps_main(VsOut i) : SV_Target
             return w;
         }
 
+        // WM_KEYDOWN reports Shift / Ctrl / Alt without the side; the pads' bindings (KEY_LEFT_SHIFT = VK_LSHIFT ...)
+        // need it: Shift from the scan code, Ctrl / Alt from the extended-key bit. 0 = not one of them.
+        int sidedKey(WPARAM vk, LPARAM lp)
+        {
+            const bool extended = (lp & (1 << 24)) != 0;
+            switch (vk)
+            {
+            case VK_SHIFT:
+                return static_cast<int>(MapVirtualKeyW(static_cast<UINT>((lp >> 16) & 0xFF), MAPVK_VSC_TO_VK_EX));
+            case VK_CONTROL:
+                return extended ? VK_RCONTROL : VK_LCONTROL;
+            case VK_MENU:
+                return extended ? VK_RMENU : VK_LMENU;
+            default:
+                return 0;
+            }
+        }
+
         LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         {
             switch (msg)
@@ -200,6 +220,8 @@ float4 ps_main(VsOut i) : SV_Target
                 {
                     std::lock_guard lock(g_inputMutex);
                     g_keys[wp] = true;
+                    if (const int side = sidedKey(wp, lp))
+                        g_keys[side] = true;
                 }
                 if (wp == VK_F1 && !(lp & (1 << 30)))
                     g_showFps = !g_showFps;
@@ -232,6 +254,10 @@ float4 ps_main(VsOut i) : SV_Target
                 {
                     std::lock_guard lock(g_inputMutex);
                     g_keys[wp] = false;
+                    if (const int side = sidedKey(wp, lp))
+                        g_keys[side] = false;
+                    if (wp == VK_SHIFT && !(GetKeyState(VK_LSHIFT) & 0x8000) && !(GetKeyState(VK_RSHIFT) & 0x8000))
+                        g_keys[VK_LSHIFT] = g_keys[VK_RSHIFT] = false; // both up (Windows sends one key-up for two)
                 }
                 break;
             case WM_KILLFOCUS:
@@ -1042,6 +1068,7 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
             ShowWindow(g_hwnd, maximise ? SW_MAXIMIZE : SW_SHOW);
             UpdateWindow(g_hwnd);
         }
+        hidpads::start();
         g_ready = true;
         std::fprintf(stdout, "[host] D3D11 %ux%u ready, XAudio2 %s\n", sd.Width, sd.Height,
                      g_master ? "ready" : "unavailable");
@@ -1052,6 +1079,9 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
     {
         if (!g_ready)
             return;
+        for (int i = 0; i < kMaxPads; ++i)
+            setVibration(i, 0, 0);
+        hidpads::stop();
         if (g_master)
         {
             g_master->DestroyVoice();
@@ -1162,7 +1192,7 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
         // Hidden test runs (PS2X_BACKGROUND) and PS2X_NO_XINPUT=1 ignore real controllers: XInput is global, so a
         // pad the user plays something else with would otherwise drive the test too.
         static const bool s_noXinput = std::getenv("PS2X_BACKGROUND") != nullptr || std::getenv("PS2X_NO_XINPUT") != nullptr;
-        for (int i = 0; i < kMaxPads && !s_noXinput; ++i)
+        for (int i = 0; i < kXInputPads && !s_noXinput; ++i)
         {
             XINPUT_STATE xs{};
             if (XInputGetState(static_cast<DWORD>(i), &xs) != ERROR_SUCCESS)
@@ -1213,46 +1243,21 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
                 if (ap.anchorHit && anchorAt < 0.0)
                     continue;
                 const double rt = ap.anchorHit ? t - anchorAt : t;
-                if (ap.pad > 0)
-                    pads[ap.pad].connected = true; // a scripted pad 2..4 is plugged in from boot
+                pads[ap.pad].connected = true; // a scripted pad is plugged in from boot
                 if (rt >= ap.t && rt < ap.until)
                     pads[ap.pad].buttons |= ap.button;
             }
         }
+        // PlayStation 4 / 5 controllers (HID) after the XInput ones
+        const char *hidNames[hidpads::kHidPads] = {};
+        for (int i = 0; i < hidpads::kHidPads; ++i)
+            hidpads::read(i, pads[hidpads::kHidFirstIndex + i], hidNames[i]);
+        // The keyboard is not a controller here: ps2_pad.cpp reads it (keyDown) for the player settings.toml's
+        // [controls] keyboard names, with the [controls] key bindings. (It used to be merged into controller 0 and
+        // made controller 0 always present, which moved every real controller one player down.)
         std::lock_guard lock(g_inputMutex);
-        // Keyboard drives player 1 (merged with XInput pad 0).
-        PadState &k = pads[0];
-        auto key = [&](int vk, uint16_t pb)
-        { if (g_keys[vk]) { k.buttons |= pb; k.connected = true; } };
-        key(VK_UP, kBtnUp);
-        key(VK_DOWN, kBtnDown);
-        key(VK_LEFT, kBtnLeft);
-        key(VK_RIGHT, kBtnRight);
-        key('X', kBtnCross);
-        key(VK_SPACE, kBtnCross);
-        key('C', kBtnCircle);
-        key(VK_BACK, kBtnCircle);
-        key('Z', kBtnSquare);
-        key('V', kBtnTriangle);
-        key('Q', kBtnL1);
-        key('E', kBtnR1);
-        key('1', kBtnL2);
-        key('3', kBtnR2);
-        key(VK_RETURN, kBtnStart);
-        key(VK_RSHIFT, kBtnSelect);
-        key(VK_TAB, kBtnSelect);
-        float ax = 0, ay = 0;
-        if (g_keys['D']) ax += 1;
-        if (g_keys['A']) ax -= 1;
-        if (g_keys['S']) ay += 1;
-        if (g_keys['W']) ay -= 1;
-        if (ax != 0 || ay != 0)
-        {
-            k.lx = static_cast<uint8_t>(std::clamp((ax + 1.0f) * 127.5f, 0.0f, 255.0f));
-            k.ly = static_cast<uint8_t>(std::clamp((ay + 1.0f) * 127.5f, 0.0f, 255.0f));
-        }
-        // Keyboard player is always considered present so the game has a pad on port 0.
-        k.connected = true;
+        for (int i = 0; i < hidpads::kHidPads; ++i)
+            g_hidNames[i] = hidNames[i];
         // The mod menu (F2, BACK + RB, or the main menu's m plank) takes player 1's input while it is up.
         modmenu::filterInput(pads, kMaxPads, g_keys[VK_F2]);
         for (int i = 0; i < kMaxPads; ++i)
@@ -1265,6 +1270,18 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
             return {};
         std::lock_guard lock(g_inputMutex);
         return g_pads[index];
+    }
+
+    const char *padName(int index)
+    {
+        if (index < 0 || index >= kMaxPads)
+            return nullptr;
+        std::lock_guard lock(g_inputMutex);
+        if (!g_pads[index].connected)
+            return nullptr;
+        if (index < kXInputPads)
+            return "XInput Controller";
+        return g_hidNames[index - kXInputPads] ? g_hidNames[index - kXInputPads] : "PlayStation Controller";
     }
 
     int connectedPadCount()
@@ -1288,6 +1305,11 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
     {
         if (index < 0 || index >= kMaxPads)
             return;
+        if (index >= kXInputPads)
+        {
+            hidpads::setVibration(index - kXInputPads, smallMotor ? 0xFF : 0, largeMotor);
+            return;
+        }
         XINPUT_VIBRATION v{};
         v.wLeftMotorSpeed = static_cast<WORD>(largeMotor * 257);
         v.wRightMotorSpeed = static_cast<WORD>(smallMotor ? 0xFFFF : 0);

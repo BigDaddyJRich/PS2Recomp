@@ -52,6 +52,35 @@ namespace ps2_host_settings
         return smoothest ? smoothest : screenRate;
     }
 
+    // [controls] button bindings, one per PS2 control: key_<name> = "X, Space" (keyboard keys, comma separated, for
+    // the keyboard's player) and, for the 16 buttons, pad_<name> = "Cross" (which button of a controller presses it,
+    // named as on a PlayStation pad - Cross = Xbox A, Circle = B, Square = X, Triangle = Y; "None" = no button).
+    // ps2_pad.cpp turns the names into keys and buttons.
+    constexpr int kPadButtonBindings = 16;
+    constexpr int kBindings = 24;
+    inline const char *bindingName(int i)
+    {
+        static const char *const names[kBindings] = {
+            "up", "down", "left", "right", "cross", "circle", "square", "triangle", "l1", "r1", "l2", "r2", "l3", "r3",
+            "start", "select", "lstick_up", "lstick_down", "lstick_left", "lstick_right", "rstick_up", "rstick_down",
+            "rstick_left", "rstick_right"};
+        return (i >= 0 && i < kBindings) ? names[i] : "";
+    }
+    inline const char *defaultKeys(int i)
+    {
+        static const char *const keys[kBindings] = {
+            "Up", "Down", "Left", "Right", "X, Space", "C, Backspace", "Z", "V", "Q", "E", "1, LShift", "3, RShift", "F",
+            "G", "Enter", "Tab", "W", "S", "A", "D", "I", "K", "J", "L"};
+        return (i >= 0 && i < kBindings) ? keys[i] : "";
+    }
+    inline const char *defaultPadButton(int i)
+    {
+        static const char *const buttons[kPadButtonBindings] = {
+            "Up", "Down", "Left", "Right", "Cross", "Circle", "Square", "Triangle", "L1", "R1", "L2", "R2", "L3", "R3",
+            "Start", "Select"};
+        return (i >= 0 && i < kPadButtonBindings) ? buttons[i] : "";
+    }
+
     struct Settings
     {
         // [display]
@@ -69,6 +98,8 @@ namespace ps2_host_settings
         int multitapPort = 1;      // the port with a multitap (4 pads there): 0 = port 1, 1 = port 2, -1 = none.
                                    // Def Jam Vendetta wants it in port 2: with one in port 1 it stops reading pad 1A.
         bool vibration[4] = {true, true, true, true}; // per player (the Nth pad)
+        std::string keyBindings[kBindings] = {};          // key_<name>; empty = defaultKeys
+        std::string padBindings[kPadButtonBindings] = {}; // pad_<name>; empty = defaultPadButton
         // [graphics] renderer / scale / filter / sharpening and [sound] reverb set their VENDETTA_* switches
 
         std::filesystem::path file; // the file they came from (empty: the defaults)

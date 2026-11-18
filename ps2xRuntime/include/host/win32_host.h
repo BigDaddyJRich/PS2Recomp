@@ -13,7 +13,10 @@ struct IXAudio2MasteringVoice;
 
 namespace ps2host
 {
-    constexpr int kMaxPads = 4;
+    // The PC's controllers: 0-3 = XInput users 1-4, 4-7 = PlayStation controllers read over HID (DualShock 4 and
+    // DualSense, USB or Bluetooth). Room for every pad of a multitap setup (5) and more.
+    constexpr int kXInputPads = 4;
+    constexpr int kMaxPads = 8;
 
     struct HostConfig
     {
@@ -86,9 +89,11 @@ namespace ps2host
 
     // Input -------------------------------------------------------------
     void pollInput();
-    PadState pad(int index);        // XInput pad (index 0..3) merged with keyboard on pad 0
+    PadState pad(int index);        // controller index 0..kMaxPads-1 (the keyboard is read on its own: keyDown)
+    const char *padName(int index); // "XInput Controller", "DualShock 4", "DualSense" (null: none)
     int connectedPadCount();
-    bool keyDown(int virtualKey);
+    bool keyDown(int virtualKey);   // left / right Shift, Ctrl and Alt each have their own code (VK_LSHIFT ...)
+    // the controller's motors: XInput (left = large, right = small) or the Sony controller's output report
     void setVibration(int index, uint8_t smallMotor, uint8_t largeMotor);
 
     // Audio -------------------------------------------------------------

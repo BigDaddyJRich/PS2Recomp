@@ -16,8 +16,8 @@ public:
 // Which PC controller is which PS2 pad. Two ports, and on a port with a multitap (ps2_host_settings: the controls'
 // multitapPort) four slots, A-D. The PC's controllers fill the pads in a fixed order: the first goes in port 1, the
 // next ones in port 2 — slot A, then B, C, D when port 2 has the multitap (as a PS2 with a multitap in port 2 and a
-// pad in port 1). With the multitap in port 1 instead: 1A, 1B, 1C, 1D, then 2. The keyboard stands in for the first
-// pad while no controller is plugged in.
+// pad in port 1). With the multitap in port 1 instead: 1A, 1B, 1C, 1D, then 2. The keyboard plays as settings.toml's
+// [controls] keyboard player (with that player's controller), using the key_<button> bindings.
 namespace ps2_pad_layout
 {
     constexpr int kPortCount = 2;

@@ -243,7 +243,7 @@ if(PS2X_IS_VITA)
         pthread
     )
 elseif(PS2X_NATIVE_HOST)
-    target_link_libraries(ps2_host_backend INTERFACE d3d11 dxgi d3dcompiler xaudio2 xinput winmm)
+    target_link_libraries(ps2_host_backend INTERFACE d3d11 dxgi d3dcompiler xaudio2 xinput winmm setupapi hid)
 else()
     target_link_libraries(ps2_host_backend INTERFACE raylib)
 
@@ -528,7 +528,8 @@ if(RUNNER_HEAVY_SRC_FILES AND CMAKE_GENERATOR MATCHES "Ninja")
     if(MSVC)
         # /Ob0: inlining the runtime's helpers into a multi-MB function is what costs the memory (sub_00419D90, 5 MB:
         # /O2 /Ob1 12.5 GB, /O1 12.5 GB, /O2 /Ob0 0.53 GB); these are load-time functions (~0.5% in sampler runs)
-        target_compile_options(ps2EntryRunnerHeavy PRIVATE /FS ${PS2X_RUNNER_HEAVY_INLINE})
+        # /bigobj: a 14 MB module (sym_module.cpp, Nov 17) has more sections than the default COFF limit
+        target_compile_options(ps2EntryRunnerHeavy PRIVATE /FS /bigobj ${PS2X_RUNNER_HEAVY_INLINE})
     endif()
 elseif(RUNNER_HEAVY_SRC_FILES)
     set_source_files_properties(${RUNNER_HEAVY_SRC_FILES} PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
@@ -603,7 +604,7 @@ target_include_directories(ps2_runtime PUBLIC
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
 if(PS2X_NATIVE_HOST)
-    target_sources(ps2_runtime PRIVATE src/lib/host/win32_host.cpp src/lib/host/raylib_shim.cpp src/lib/gs/gs_d3d11_backend.cpp)
+    target_sources(ps2_runtime PRIVATE src/lib/host/win32_host.cpp src/lib/host/win32_hid_pads.cpp src/lib/host/raylib_shim.cpp src/lib/gs/gs_d3d11_backend.cpp)
     # private: the (huge) recompiled runner is not rebuilt when the host changes; only the game overrides use the
     # host API (the native ADX music's audio streams)
     target_compile_definitions(ps2_runtime PRIVATE PS2X_NATIVE_HOST=1 NOMINMAX WIN32_LEAN_AND_MEAN)

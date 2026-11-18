@@ -752,21 +752,21 @@ namespace ps2_stubs
                     }
                     else
                     {
-                        const std::filesystem::path queryHostPath = guestMcPathToHostPath(port, guestQuery);
-                        std::error_code queryEc;
-                        if (std::filesystem::exists(queryHostPath, queryEc) && !queryEc &&
-                            std::filesystem::is_directory(queryHostPath, queryEc))
+                        // Real mcman: a path without wildcards = parent dir + leaf name, and the result is the
+                        // leaf's OWN entry (a directory returns itself, not its contents). "/" has no leaf and
+                        // matches nothing (0). HCTP CMcGetDirList::Action 0x17e870 probes "/" first and treats
+                        // any hit as "save exists" -> an empty card must answer 0 here, not "." / "..".
+                        std::string rel = queryRel.generic_string();
+                        while (!rel.empty() && rel.back() == '/')
                         {
-                            parentRel = queryRel;
-                            pattern = "*";
+                            rel.pop_back();
                         }
-                        else
-                        {
-                            parentRel = queryRel.parent_path();
-                            pattern = queryRel.filename().string();
-                        }
+                        const std::filesystem::path leafRel(rel);
+                        parentRel = leafRel.parent_path();
+                        pattern = leafRel.filename().string();
                     }
 
+                    const bool matchNothing = pattern.empty() && !hasWildcard;
                     if (pattern.empty())
                     {
                         pattern = "*";
@@ -780,7 +780,11 @@ namespace ps2_stubs
                     hostDir = hostDir.lexically_normal();
 
                     std::error_code ec;
-                    if (std::filesystem::exists(hostDir, ec) && !ec &&
+                    if (matchNothing)
+                    {
+                        result = 0;
+                    }
+                    else if (std::filesystem::exists(hostDir, ec) && !ec &&
                         std::filesystem::is_directory(hostDir, ec))
                     {
                         const std::time_t now = std::time(nullptr);

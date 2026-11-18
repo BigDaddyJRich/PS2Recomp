@@ -62,11 +62,24 @@ namespace ps2_host_settings
             "\n"
             "[controls]\n"
             "multitap = true          # up to 4 players (a multitap in port 2, as on the PS2); false = 2 controllers\n"
-            "vibration_1 = true       # each player's controller vibrates (Xbox-style / XInput controllers)\n"
+            "vibration_1 = true       # each player's controller vibrates (Xbox / XInput, PlayStation 4 and 5 controllers)\n"
             "vibration_2 = true\n"
             "vibration_3 = true\n"
             "vibration_4 = true\n"
-            "keyboard = 0             # which player the keyboard plays as (with their controller): 1-4, 0 = nobody\n"
+            "keyboard = 1             # which player the keyboard plays as (with their controller): 1-4, 0 = nobody\n"
+            "# Buttons. key_<button> = the keyboard keys for it (comma separated; names such as A-Z, 0-9, Up, Space, Enter,\n"
+            "# LShift, RCtrl, Numpad0, F1, Comma). pad_<button> = the controller button that presses it, named as on a\n"
+            "# PlayStation pad (Cross = Xbox A, Circle = B, Square = X, Triangle = Y; \"None\" = nothing). Missing = default.\n"
+            "key_up = \"Up\"\nkey_down = \"Down\"\nkey_left = \"Left\"\nkey_right = \"Right\"\n"
+            "key_cross = \"X, Space\"\nkey_circle = \"C, Backspace\"\nkey_square = \"Z\"\nkey_triangle = \"V\"\n"
+            "key_l1 = \"Q\"\nkey_r1 = \"E\"\nkey_l2 = \"1, LShift\"\nkey_r2 = \"3, RShift\"\nkey_l3 = \"F\"\nkey_r3 = \"G\"\n"
+            "key_start = \"Enter\"\nkey_select = \"Tab\"\n"
+            "key_lstick_up = \"W\"\nkey_lstick_down = \"S\"\nkey_lstick_left = \"A\"\nkey_lstick_right = \"D\"\n"
+            "key_rstick_up = \"I\"\nkey_rstick_down = \"K\"\nkey_rstick_left = \"J\"\nkey_rstick_right = \"L\"\n"
+            "pad_up = \"Up\"\npad_down = \"Down\"\npad_left = \"Left\"\npad_right = \"Right\"\n"
+            "pad_cross = \"Cross\"\npad_circle = \"Circle\"\npad_square = \"Square\"\npad_triangle = \"Triangle\"\n"
+            "pad_l1 = \"L1\"\npad_r1 = \"R1\"\npad_l2 = \"L2\"\npad_r2 = \"R2\"\npad_l3 = \"L3\"\npad_r3 = \"R3\"\n"
+            "pad_start = \"Start\"\npad_select = \"Select\"\n"
             "\n"
             "[gameplay]\n"
             "unlock_all = false       # every wrestler, attire, arena and picture for every player, with or without a save.\n"
@@ -320,11 +333,18 @@ namespace ps2_host_settings
             s.multitapPort = multitap ? 1 : -1;
             for (int player = 0; player < 4; ++player)
                 reader.boolean("controls.vibration_" + std::to_string(player + 1), s.vibration[player]);
-            // which player the keyboard plays as (ps2_pad.cpp, VENDETTA_KEYBOARD): 1-4, 0 = nobody (the default, also
-            // when the line is missing; with no settings file at all the keyboard is player 1)
-            int keyboard = 0;
+            // which player the keyboard plays as (ps2_pad.cpp, VENDETTA_KEYBOARD): 1-4, 0 = nobody; player 1 when the
+            // line is missing (the host no longer merges the keyboard into controller 1)
+            int keyboard = 1;
             reader.integer("controls.keyboard", keyboard, 0, 4);
             fillSwitch("VENDETTA_KEYBOARD", std::to_string(keyboard));
+            // button bindings (ps2_pad.cpp): key_<name> / pad_<name>, the text as written
+            for (int i = 0; i < kBindings; ++i)
+            {
+                reader.take(std::string("controls.key_") + bindingName(i), s.keyBindings[i]);
+                if (i < kPadButtonBindings)
+                    reader.take(std::string("controls.pad_") + bindingName(i), s.padBindings[i]);
+            }
             // unlock everything (vendetta_unlocks.cpp, VENDETTA_UNLOCKALL): off by default, also when the line is missing
             bool unlockAll = false;
             reader.boolean("gameplay.unlock_all", unlockAll);
