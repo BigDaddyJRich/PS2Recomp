@@ -84,6 +84,7 @@ namespace ps2_host_settings
             "[gameplay]\n"
             "unlock_all = false       # every wrestler, attire, arena and picture for every player, with or without a save.\n"
             "                         # The save itself is not changed (false = what the save has unlocked)\n"
+            "matrix_replay = false    # L1 during a finisher = slow-motion matrix spin, L2 = instant replay (cut from HCTP)\n"
             "\n"
             "[updates]\n"
             "check_on_open = true     # check for a new version when the game or the settings program starts\n";
@@ -349,6 +350,12 @@ namespace ps2_host_settings
             bool unlockAll = false;
             reader.boolean("gameplay.unlock_all", unlockAll);
             fillSwitch("VENDETTA_UNLOCKALL", unlockAll ? "1" : "0");
+            // matrix spin (L1, hctp_matrix.cpp, HCTP_MATRIX) + instant replay (L2, hctp_overrides.cpp, HCTP_REPLAY): one
+            // launcher switch, off by default, also when the line is missing
+            bool matrixReplay = false;
+            reader.boolean("gameplay.matrix_replay", matrixReplay);
+            fillSwitch("HCTP_MATRIX", matrixReplay ? "1" : "0");
+            fillSwitch("HCTP_REPLAY", matrixReplay ? "1" : "0");
             // the update check when the game starts (ps2_host_update.cpp, VENDETTA_UPDATE_CHECK): the same switch as
             // the settings program's own check, on by default, also when the line is missing
             bool checkUpdates = true;
