@@ -334,6 +334,14 @@ namespace ps2_host_settings
             s.multitapPort = multitap ? 1 : -1;
             for (int player = 0; player < 4; ++player)
                 reader.boolean("controls.vibration_" + std::to_string(player + 1), s.vibration[player]);
+            // vibration_strength (0.3.7): 100 = the motor values the game sends (scePadSetActDirect), as on a PS2
+            reader.integer("controls.vibration_strength", s.vibrationStrength, 25, 200);
+            // playstation_direct (0.3.7, true when missing): PlayStation 4 / 5 controllers read straight over HID.
+            // false = leave them to Steam Input / DS4Windows (their virtual Xbox controller), never read twice.
+            bool playstationDirect = true;
+            reader.boolean("controls.playstation_direct", playstationDirect);
+            if (!playstationDirect)
+                fillSwitch("PS2X_NO_HIDPADS", "1");
             // which player the keyboard plays as (ps2_pad.cpp, VENDETTA_KEYBOARD): 1-4, 0 = nobody; player 1 when the
             // line is missing (the host no longer merges the keyboard into controller 1)
             int keyboard = 1;
@@ -397,7 +405,24 @@ namespace ps2_host_settings
                 std::ostringstream stops;
                 stops << 2.0 * (100 - sharpening) / 100.0;
                 fillSwitch("VENDETTA_SHARPEN", stops.str());
+                fillSwitch("PS2X_SHARPEN", std::to_string(sharpening)); // D3D11 host: the "sharp" scaling's amount
             }
+            // D3D11 PC picture options (0.3.7; all off when the lines are missing = the picture as before):
+            //   antialiasing = "off" | "fxaa" (win32_host.cpp PS2X_FXAA)
+            //   anisotropic = 0 | 2 | 4 | 8 | 16 (gs_d3d11_backend.cpp PS2X_ANISO, taps of the GS bilinear filter)
+            //   upscale_filter = "smooth" | "sharp" | "blocky" (win32_host.cpp PS2X_UPSCALE_FILTER)
+            if (const int aa = reader.choice("graphics.antialiasing", {"off", "fxaa"}); aa >= 0)
+                fillSwitch("PS2X_FXAA", aa == 1 ? "1" : "0");
+            int aniso = 0;
+            reader.integer("graphics.anisotropic", aniso, 0, 16);
+            if (aniso != 0 && aniso != 2 && aniso != 4 && aniso != 8 && aniso != 16)
+            {
+                std::cerr << "[settings] graphics.anisotropic = " << aniso << " is not 0, 2, 4, 8 or 16; off is used" << std::endl;
+                aniso = 0;
+            }
+            fillSwitch("PS2X_ANISO", std::to_string(aniso));
+            if (const int up = reader.choice("graphics.upscale_filter", {"smooth", "sharp", "blocky"}); up >= 0)
+                fillSwitch("PS2X_UPSCALE_FILTER", up == 0 ? "smooth" : (up == 1 ? "sharp" : "blocky"));
             // true (the default, also when the line is missing): the game's High Poly switch, VENDETTA_HIGHPOLY. No
             // settings file at all (test runs): off, as on the PS2.
             bool highPoly = true;
@@ -582,7 +607,8 @@ namespace ps2_host_settings
                   << (s.stretch ? std::string("stretched") : std::getenv("VENDETTA_WIDESCREEN") && *std::getenv("VENDETTA_WIDESCREEN") && std::string(std::getenv("VENDETTA_WIDESCREEN")) != "0" ? "widescreen " + std::string(std::getenv("VENDETTA_WIDESCREEN")) + " in matches" : std::string("4:3"))
                   << ", volume " << s.volume << "%"
                   << (s.multitapPort >= 0 ? ", multitap in port " + std::to_string(s.multitapPort + 1) : std::string(", no multitap"))
-                  << ", vibration " << s.vibration[0] << s.vibration[1] << s.vibration[2] << s.vibration[3] << std::endl;
+                  << ", vibration " << s.vibration[0] << s.vibration[1] << s.vibration[2] << s.vibration[3]
+                  << " at " << s.vibrationStrength << "%" << std::endl;
     }
 
     const Settings &get()

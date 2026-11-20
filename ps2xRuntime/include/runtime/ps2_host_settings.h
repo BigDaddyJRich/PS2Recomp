@@ -98,6 +98,7 @@ namespace ps2_host_settings
         int multitapPort = 1;      // the port with a multitap (4 pads there): 0 = port 1, 1 = port 2, -1 = none.
                                    // Def Jam Vendetta wants it in port 2: with one in port 1 it stops reading pad 1A.
         bool vibration[4] = {true, true, true, true}; // per player (the Nth pad)
+        int vibrationStrength = 100; // 25..200 %: the game's own motor values x this (100 = exactly the game's)
         std::string keyBindings[kBindings] = {};          // key_<name>; empty = defaultKeys
         std::string padBindings[kPadButtonBindings] = {}; // pad_<name>; empty = defaultPadButton
         // [graphics] renderer / scale / filter / sharpening and [sound] reverb set their VENDETTA_* switches

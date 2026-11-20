@@ -173,7 +173,89 @@ float4 ps_main(VsOut i) : SV_Target
     float4 c = tex.Sample(samp, i.uv);
     return float4(c.rgb, 1.0);
 }
+
+// PC picture options (settings.toml [graphics], read once at start; all off = the plain bilinear blit above):
+// post.xy = one texel of the source texture (uv), post.z = sharpening 0..1
+cbuffer Post : register(b1) { float4 post; };
+float3 src3(float2 uv) { return tex.SampleLevel(samp, uv, 0).rgb; }
+float lumaOf(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
+
+// FXAA (antialiasing = "fxaa"): the classic FXAA edge filter (Lottes, NVIDIA, 2009), run on the game's picture at
+// its own size before it is scaled to the window
+float4 ps_fxaa(VsOut i) : SV_Target
+{
+    const float2 px = post.xy;
+    float3 rgbNW = src3(i.uv + float2(-1.0, -1.0) * px), rgbNE = src3(i.uv + float2(1.0, -1.0) * px);
+    float3 rgbSW = src3(i.uv + float2(-1.0, 1.0) * px), rgbSE = src3(i.uv + float2(1.0, 1.0) * px);
+    float3 rgbM = src3(i.uv);
+    float lNW = lumaOf(rgbNW), lNE = lumaOf(rgbNE), lSW = lumaOf(rgbSW), lSE = lumaOf(rgbSE), lM = lumaOf(rgbM);
+    float lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));
+    float lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));
+    float2 dir = float2(-((lNW + lNE) - (lSW + lSE)), (lNW + lSW) - (lNE + lSE));
+    float dirReduce = max((lNW + lNE + lSW + lSE) * (0.25 / 8.0), 1.0 / 128.0);
+    float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
+    dir = clamp(dir * rcpDirMin, -8.0, 8.0) * px;
+    float3 rgbA = 0.5 * (src3(i.uv + dir * (1.0 / 3.0 - 0.5)) + src3(i.uv + dir * (2.0 / 3.0 - 0.5)));
+    float3 rgbB = rgbA * 0.5 + 0.25 * (src3(i.uv + dir * -0.5) + src3(i.uv + dir * 0.5));
+    float lB = lumaOf(rgbB);
+    return float4((lB < lMin || lB > lMax) ? rgbA : rgbB, 1.0);
+}
+
+// Sharp (upscale_filter = "sharp"): contrast-adaptive sharpening (the CAS idea, AMD FidelityFX, MIT) on the cross of
+// source texels around the pixel, then the bilinear scale to the window
+float4 ps_sharp(VsOut i) : SV_Target
+{
+    const float2 px = post.xy;
+    float3 b = src3(i.uv + float2(0.0, -px.y)), d = src3(i.uv + float2(-px.x, 0.0)), e = src3(i.uv);
+    float3 f = src3(i.uv + float2(px.x, 0.0)), h = src3(i.uv + float2(0.0, px.y));
+    float3 mn = min(e, min(min(b, d), min(f, h)));
+    float3 mx = max(e, max(max(b, d), max(f, h)));
+    float3 amp = sqrt(saturate(min(mn, 1.0 - mx) / max(mx, 1.0 / 255.0)));
+    float3 w = amp * (-1.0 / lerp(8.0, 5.0, saturate(post.z)));
+    return float4(saturate((b * w + d * w + f * w + h * w + e) / (1.0 + 4.0 * w)), 1.0);
+}
 )";
+
+        // PC picture options (ps2_host_settings.cpp fills the switches from settings.toml [graphics])
+        struct PostConfig
+        {
+            bool fxaa = false;     // PS2X_FXAA=1
+            int filter = 0;        // PS2X_UPSCALE_FILTER: 0 smooth (bilinear, the default), 1 sharp, 2 blocky
+            float sharpen = 0.5f;  // PS2X_SHARPEN 0-100
+        };
+        PostConfig g_post;
+        ComPtr<ID3D11PixelShader> g_fxaaPs, g_sharpPs;
+        ComPtr<ID3D11SamplerState> g_postPoint;
+        ComPtr<ID3D11Buffer> g_postCb;
+        ComPtr<ID3D11Texture2D> g_fxaaTex;
+        ComPtr<ID3D11RenderTargetView> g_fxaaRtv;
+        ComPtr<ID3D11ShaderResourceView> g_fxaaSrv;
+        uint32_t g_fxaaW = 0, g_fxaaH = 0;
+
+        bool textureSize(ID3D11ShaderResourceView *srv, uint32_t &w, uint32_t &h)
+        {
+            ComPtr<ID3D11Resource> res;
+            srv->GetResource(&res);
+            ComPtr<ID3D11Texture2D> tex;
+            if (!res || FAILED(res.As(&tex)))
+                return false;
+            D3D11_TEXTURE2D_DESC td{};
+            tex->GetDesc(&td);
+            w = td.Width;
+            h = td.Height;
+            return w > 0 && h > 0;
+        }
+
+        void setPostCb(float a, float b, float c, float d)
+        {
+            D3D11_MAPPED_SUBRESOURCE m{};
+            if (SUCCEEDED(g_ctx->Map(g_postCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
+            {
+                const float v[4] = {a, b, c, d};
+                std::memcpy(m.pData, v, sizeof(v));
+                g_ctx->Unmap(g_postCb.Get(), 0);
+            }
+        }
 
         std::wstring widen(const char *s)
         {
@@ -640,6 +722,77 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
             (void)srcW;
             (void)srcH;
 
+            // FXAA first, on the game's picture at its own size (the used part u1 x v1 of the texture)
+            uint32_t texW = 0, texH = 0;
+            const bool haveSize = srv && textureSize(srv, texW, texH);
+            if (g_fxaaPs && haveSize)
+            {
+                const uint32_t w = std::max(1u, static_cast<uint32_t>(texW * u1 + 0.5f));
+                const uint32_t h = std::max(1u, static_cast<uint32_t>(texH * v1 + 0.5f));
+                if (!g_fxaaTex || w != g_fxaaW || h != g_fxaaH)
+                {
+                    g_fxaaTex.Reset();
+                    g_fxaaRtv.Reset();
+                    g_fxaaSrv.Reset();
+                    D3D11_TEXTURE2D_DESC td{};
+                    td.Width = w;
+                    td.Height = h;
+                    td.MipLevels = 1;
+                    td.ArraySize = 1;
+                    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                    td.SampleDesc.Count = 1;
+                    td.Usage = D3D11_USAGE_DEFAULT;
+                    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+                    if (SUCCEEDED(g_device->CreateTexture2D(&td, nullptr, &g_fxaaTex)))
+                    {
+                        g_device->CreateRenderTargetView(g_fxaaTex.Get(), nullptr, &g_fxaaRtv);
+                        g_device->CreateShaderResourceView(g_fxaaTex.Get(), nullptr, &g_fxaaSrv);
+                    }
+                    g_fxaaW = w;
+                    g_fxaaH = h;
+                }
+                if (g_fxaaRtv && g_fxaaSrv)
+                {
+                    D3D11_VIEWPORT fvp{0.0f, 0.0f, static_cast<float>(w), static_cast<float>(h), 0.0f, 1.0f};
+                    g_ctx->RSSetViewports(1, &fvp);
+                    ID3D11RenderTargetView *frtv = g_fxaaRtv.Get();
+                    g_ctx->OMSetRenderTargets(1, &frtv, nullptr);
+                    g_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
+                    g_ctx->OMSetDepthStencilState(nullptr, 0);
+                    g_ctx->RSSetState(nullptr);
+                    D3D11_MAPPED_SUBRESOURCE fm{};
+                    if (SUCCEEDED(g_ctx->Map(g_blitCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &fm)))
+                    {
+                        const float rect[4] = {0.0f, 0.0f, u1, v1};
+                        std::memcpy(fm.pData, rect, sizeof(rect));
+                        g_ctx->Unmap(g_blitCb.Get(), 0);
+                    }
+                    setPostCb(1.0f / texW, 1.0f / texH, 0.0f, 0.0f);
+                    g_ctx->IASetInputLayout(nullptr);
+                    g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    g_ctx->VSSetShader(g_blitVs.Get(), nullptr, 0);
+                    g_ctx->GSSetShader(nullptr, nullptr, 0);
+                    g_ctx->PSSetShader(g_fxaaPs.Get(), nullptr, 0);
+                    ID3D11Buffer *cbs[2] = {g_blitCb.Get(), g_postCb.Get()};
+                    g_ctx->VSSetConstantBuffers(0, 1, cbs);
+                    g_ctx->PSSetConstantBuffers(0, 2, cbs);
+                    g_ctx->PSSetShaderResources(0, 1, &srv);
+                    ID3D11SamplerState *ls = g_linearSampler.Get();
+                    g_ctx->PSSetSamplers(0, 1, &ls);
+                    g_ctx->Draw(3, 0);
+                    ID3D11ShaderResourceView *none = nullptr;
+                    g_ctx->PSSetShaderResources(0, 1, &none);
+                    ID3D11RenderTargetView *noRtv = nullptr;
+                    g_ctx->OMSetRenderTargets(1, &noRtv, nullptr);
+                    // the scale to the window reads the FXAA picture: all of it
+                    srv = g_fxaaSrv.Get();
+                    u1 = 1.0f;
+                    v1 = 1.0f;
+                    texW = w;
+                    texH = h;
+                }
+            }
+
             const float clear[4] = {0, 0, 0, 1};
             g_ctx->ClearRenderTargetView(g_backRtv.Get(), clear);
             D3D11_VIEWPORT vp{(bw - vw) * 0.5f, (bh - vh) * 0.5f, vw, vh, 0.0f, 1.0f};
@@ -660,16 +813,26 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
             g_ctx->IASetInputLayout(nullptr);
             g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             g_ctx->VSSetShader(g_blitVs.Get(), nullptr, 0);
-            g_ctx->PSSetShader(g_blitPs.Get(), nullptr, 0);
+            // the scale to the window: smooth (bilinear, the default), sharp (CAS, then bilinear) or blocky (nearest)
+            const bool sharp = g_post.filter == 1 && g_sharpPs && haveSize;
+            g_ctx->PSSetShader(sharp ? g_sharpPs.Get() : g_blitPs.Get(), nullptr, 0);
             ID3D11Buffer *cb = g_blitCb.Get();
             g_ctx->VSSetConstantBuffers(0, 1, &cb);
+            if (sharp)
+            {
+                setPostCb(1.0f / texW, 1.0f / texH, g_post.sharpen, 0.0f);
+                ID3D11Buffer *cbs[2] = {g_blitCb.Get(), g_postCb.Get()};
+                g_ctx->PSSetConstantBuffers(0, 2, cbs);
+            }
             g_ctx->PSSetShaderResources(0, 1, &srv);
-            ID3D11SamplerState *s = g_linearSampler.Get();
+            ID3D11SamplerState *s = (g_post.filter == 2 && g_postPoint) ? g_postPoint.Get() : g_linearSampler.Get();
             g_ctx->PSSetSamplers(0, 1, &s);
             g_ctx->GSSetShader(nullptr, nullptr, 0);
             g_ctx->Draw(3, 0);
             ID3D11ShaderResourceView *nullSrv = nullptr;
             g_ctx->PSSetShaderResources(0, 1, &nullSrv);
+            if (sharp)
+                g_ctx->PSSetShader(g_blitPs.Get(), nullptr, 0); // the FPS box / mod menu draw with the plain blit
             updateAndDrawFps(bh);
             drawModMenu(bw, bh);
 
@@ -1044,6 +1207,32 @@ float4 ps_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { re
         cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
         g_device->CreateBuffer(&cbd, nullptr, &g_blitCb);
+
+        // PC picture options: FXAA, Sharp / Blocky scaling (a shader that fails to compile = that option off)
+        {
+            const char *fx = std::getenv("PS2X_FXAA");
+            g_post.fxaa = fx && *fx && *fx != '0';
+            if (const char *f = std::getenv("PS2X_UPSCALE_FILTER"); f && *f)
+            {
+                const std::string v = f;
+                g_post.filter = v == "sharp" ? 1 : (v == "blocky" ? 2 : 0);
+            }
+            if (const char *s = std::getenv("PS2X_SHARPEN"); s && *s)
+                g_post.sharpen = std::clamp(static_cast<float>(std::atof(s)) / 100.0f, 0.0f, 1.0f);
+            g_device->CreateBuffer(&cbd, nullptr, &g_postCb);
+            ComPtr<ID3DBlob> b;
+            if (g_post.fxaa && compileShader(kBlitShader, "ps_fxaa", "ps_5_0", b))
+                g_device->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_fxaaPs);
+            b.Reset();
+            if (g_post.filter == 1 && compileShader(kBlitShader, "ps_sharp", "ps_5_0", b))
+                g_device->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_sharpPs);
+            D3D11_SAMPLER_DESC ps = samp;
+            ps.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+            g_device->CreateSamplerState(&ps, &g_postPoint);
+            static const char *kFilters[] = {"smooth", "sharp", "blocky"};
+            std::fprintf(stderr, "[host] picture: antialiasing %s, scaling %s, sharpening %d%%%c",
+                         g_fxaaPs ? "FXAA" : "off", kFilters[g_post.filter], static_cast<int>(g_post.sharpen * 100.0f + 0.5f), 10);
+        }
 
         // XAudio2 (optional: a missing audio device must not stop the game).
         if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED)) || true)

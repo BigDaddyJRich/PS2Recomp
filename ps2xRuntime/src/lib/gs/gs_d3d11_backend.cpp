@@ -413,6 +413,43 @@ float4 fetchTexel(int2 ic)
     return gsTex.Load(int3(sc, 0));
 }
 
+// the GS bilinear filter at one texture-space point (4 texels, 4-bit weights)
+float4 bilinearGS(float2 texel)
+{
+    float2 b = texel - 0.5;
+    int2 i0 = (int2)floor(b);
+    float2 f = floor(frac(b) * 16.0) / 16.0; // GS: 4-bit filter weights
+    float4 t00 = fetchTexel(i0), t10 = fetchTexel(i0 + int2(1, 0));
+    float4 t01 = fetchTexel(i0 + int2(0, 1)), t11 = fetchTexel(i0 + int2(1, 1));
+    return lerp(lerp(t00, t10, f.x), lerp(t01, t11, f.x), f.y);
+}
+
+// Anisotropic filtering (settings.toml graphics.anisotropic, PS2X_ANISO; a PC option, off = the PS2's filter): the
+// PS2 has no anisotropic filter and this renderer filters textures in the shader (GS wrap modes, palettes, 4-bit
+// weights), so the hardware sampler setting would do nothing. Instead the GS bilinear filter is taken at up to
+// ANISO_TAPS points spread along the long axis of the pixel's footprint in the texture, and averaged.
+#ifndef ANISO_TAPS
+#define ANISO_TAPS 1
+#endif
+float4 filterGS(float2 texel, float2 dx, float2 dy)
+{
+#if ANISO_TAPS > 1
+    float lx = length(dx), ly = length(dy);
+    float2 major = lx > ly ? dx : dy;
+    float mj = max(lx, ly), mn = max(min(lx, ly), 1.0);
+    int taps = mj > 1.0 ? (int)clamp(ceil(mj / mn), 1.0, (float)ANISO_TAPS) : 1;
+    if (taps <= 1)
+        return bilinearGS(texel);
+    float4 acc = 0;
+    [unroll] for (int k = 0; k < ANISO_TAPS; ++k)
+        if (k < taps)
+            acc += bilinearGS(texel + major * ((k + 0.5) / taps - 0.5));
+    return acc / taps;
+#else
+    return bilinearGS(texel);
+#endif
+}
+
 bool alphaTest(float a, float atst, float aref)
 {
     if (atst == 0.0) return false;
@@ -429,11 +466,12 @@ PsOut ps_main(PsIn i)
 {
     float4 c = i.col;   // GS units 0..255, fog in w of tc? (fog packed in col? no: tc.w)
     float fog = i.tc.w;
+    // the texture coordinate and its screen derivatives outside any branch (anisotropic filtering needs them)
+    float2 texelAll = (p2.x != 0.0) ? i.tc.xy : (i.tc.xy / i.tc.z) * texDims.xy;
+    float2 texelDx = ddx(texelAll), texelDy = ddy(texelAll);
     if (p0.z != 0.0)
     {
-        float2 texel;
-        if (p2.x != 0.0) texel = i.tc.xy;
-        else texel = (i.tc.xy / i.tc.z) * texDims.xy;
+        float2 texel = texelAll;
         float4 t;
         if (p4.y != 0.0)
         {
@@ -443,14 +481,7 @@ PsOut ps_main(PsIn i)
             t = gsTex.SampleLevel(gsSamp, (texel + p3.zw) / texDims.zw, 0);
         }
         else if (p4.x != 0.0)
-        {
-            float2 b = texel - 0.5;
-            int2 i0 = (int2)floor(b);
-            float2 f = floor(frac(b) * 16.0) / 16.0; // GS: 4-bit filter weights
-            float4 t00 = fetchTexel(i0), t10 = fetchTexel(i0 + int2(1, 0));
-            float4 t01 = fetchTexel(i0 + int2(0, 1)), t11 = fetchTexel(i0 + int2(1, 1));
-            t = lerp(lerp(t00, t10, f.x), lerp(t01, t11, f.x), f.y);
-        }
+            t = filterGS(texel, texelDx, texelDy);
         else
             t = fetchTexel((int2)floor(texel));
         t.rgb *= 255.0;
@@ -1064,10 +1095,21 @@ struct GSD3D11Backend::Impl
         ctx = ps2host::context();
 
         const D3D_SHADER_MACRO *defines = nullptr;
+        // anisotropic filtering taps (settings.toml graphics.anisotropic -> PS2X_ANISO: 2, 4, 8 or 16; else off)
+        static const int s_anisoTaps = []
+        {
+            const char *e = std::getenv("PS2X_ANISO");
+            const int n = e ? std::atoi(e) : 0;
+            const int taps = (n == 2 || n == 4 || n == 8 || n == 16) ? n : 1;
+            std::fprintf(stderr, "[gs-d3d11] anisotropic filtering: %s%s%c", taps > 1 ? std::to_string(taps).c_str() : "off",
+                         taps > 1 ? "x" : "", 10);
+            return taps;
+        }();
+        const std::string gsSource = "#define ANISO_TAPS " + std::to_string(s_anisoTaps) + "\n" + kGsShader;
         auto compile = [&](const char *entry, const char *target, ComPtr<ID3DBlob> &out) -> bool
         {
             ComPtr<ID3DBlob> err;
-            if (FAILED(D3DCompile(kGsShader, std::strlen(kGsShader), "gs_d3d11", defines, nullptr, entry, target,
+            if (FAILED(D3DCompile(gsSource.c_str(), gsSource.size(), "gs_d3d11", defines, nullptr, entry, target,
                                   D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &out, &err)))
             {
                 std::fprintf(stderr, "[gs-d3d11] shader %s failed: %s\n", entry,

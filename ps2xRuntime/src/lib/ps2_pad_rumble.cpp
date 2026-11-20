@@ -2,6 +2,7 @@
 #include "runtime/ps2_pad.h"
 #include "runtime/ps2_host_settings.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <iostream>
@@ -127,7 +128,10 @@ namespace ps2_pad_rumble
         }
         if (controller < 0)
             return;
-        sendHost(controller, allowed && smallMotor ? 0xFF : 0, allowed ? largeMotor : 0);
+        // controls.vibration_strength: the game's large-motor value x strength (100 % = as the game sends it); the
+        // small motor is on/off on the PS2 (full when on)
+        const unsigned scaled = std::min(255u, (static_cast<unsigned>(largeMotor) * static_cast<unsigned>(settings.vibrationStrength) + 50u) / 100u);
+        sendHost(controller, allowed && smallMotor ? 0xFF : 0, allowed ? static_cast<uint8_t>(scaled) : 0);
 #elif defined(_WIN32)
         const int player = ps2_pad_layout::padIndex(port, slot);
         const ps2_host_settings::Settings &settings = ps2_host_settings::get();

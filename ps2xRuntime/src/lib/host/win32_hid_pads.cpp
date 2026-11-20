@@ -6,8 +6,9 @@
 //   DS5 USB 0x01: base 1 - sticks b..b+3, L2 b+4, R2 b+5, hat + face b+7, buttons b+8, PS / touchpad / mute b+9.
 //     DS5 BT full 0x31: the same from base 2.
 //   Rumble: DS4 USB 0x05 [1]=0x01 [4]=small [5]=large (32 bytes); DS4 BT 0x11 [1]=0xC0 [3]=0x01 [6]=small [7]=large,
-//     78 bytes, CRC32(0xA2 + bytes 0..73) at 74; DS5 USB 0x02 [1]=0x03 [3]=small [4]=large (48 bytes);
-//     DS5 BT 0x31 [1]=0x02 [2]=0x03 [4]=small [5]=large, 78 bytes, CRC at 74.
+//     78 bytes, CRC32(0xA2 + bytes 0..73) at 74; DS5 USB 0x02 + effects block (48 bytes); DS5 BT 0x31 0x02 +
+//     effects block, 78 bytes, CRC at 74 (effects block + firmware rule: sendMotors, from SDL 3.2 hidapi_ps5.c).
+//   Every output report is padded to the device's OutputReportByteLength (Windows HID WriteFile rule, as hidapi).
 // Each controller has a reader thread (overlapped reads on one handle, motor reports on a second handle); a
 // background thread looks for newly plugged controllers every 2 s.
 #include "host/win32_hid_pads.h"
@@ -25,6 +26,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstdlib>
 #include <cwctype>
 #include <condition_variable>
@@ -99,6 +101,9 @@ namespace ps2host::hidpads
             USHORT inLen = 64, outLen = 0, featureLen = 0;
             std::thread thread;
             std::atomic<bool> alive{true};
+
+            uint16_t firmware = 0; // DualSense firmware (feature report 0x20 bytes 44-45; 0 = unknown)
+            bool motorFailReported = false;
 
             std::mutex m; // guards state / motors
             PadState state{};
@@ -216,23 +221,22 @@ namespace ps2host::hidpads
             }
             else
             {
+                // DualSense effects block (SDL 3.2 hidapi_ps5.c DS5EffectsState_t): [0] enable bits 1, [1] enable
+                // bits 2, [2] right (high frequency = small) motor, [3] left (low frequency = large) motor,
+                // [38] enable bits 3. Firmware 2.24+: "improved rumble emulation" (bits 3 |= 0x04); the older
+                // "rumble emulation" bit (bits 1 |= 0x01) is weak there (GitHub #21 "very mild vibration").
+                // Older firmware: bits 1 |= 0x01. Both: bits 1 |= 0x02 (audio haptics off).
+                const size_t at = dev.bluetooth ? 2 : 1;
+                r.assign(dev.bluetooth ? 78 : 48, 0);
+                r[0] = dev.bluetooth ? 0x31 : 0x02;
                 if (dev.bluetooth)
-                {
-                    r.assign(78, 0);
-                    r[0] = 0x31;
-                    r[1] = 0x02;
-                    r[2] = 0x03; // compatible vibration + haptics select
-                    r[4] = smallMotor;
-                    r[5] = largeMotor;
-                }
-                else
-                {
-                    r.assign(std::max<size_t>(48, dev.outLen), 0);
-                    r[0] = 0x02;
-                    r[1] = 0x03;
-                    r[3] = smallMotor;
-                    r[4] = largeMotor;
-                }
+                    r[1] = 0x02; // SDL: magic value
+                const bool improved = dev.firmware >= 0x0224;
+                r[at + 0] = static_cast<uint8_t>(0x02 | (improved ? 0x00 : 0x01));
+                if (improved)
+                    r[at + 38] = 0x04;
+                r[at + 2] = smallMotor;
+                r[at + 3] = largeMotor;
             }
             if (dev.bluetooth)
             {
@@ -242,13 +246,24 @@ namespace ps2host::hidpads
                 r[76] = static_cast<uint8_t>(crc >> 16);
                 r[77] = static_cast<uint8_t>(crc >> 24);
             }
-            if (dev.outLen && r.size() > dev.outLen && !dev.bluetooth)
-                r.resize(dev.outLen);
+            // Windows HID WriteFile wants the device's full output report length (hidapi pads with zeros the same
+            // way); over Bluetooth that is longer than the 78-byte report, so the padding comes after the CRC.
+            if (dev.outLen > r.size())
+                r.resize(dev.outLen, 0);
             DWORD written = 0;
             if (WriteFile(dev.writeHandle, r.data(), static_cast<DWORD>(r.size()), &written, nullptr))
                 return true;
+            const DWORD writeError = GetLastError();
             // some drivers only take output reports through the control pipe
-            return HidD_SetOutputReport(dev.writeHandle, r.data(), static_cast<ULONG>(r.size())) != FALSE;
+            if (HidD_SetOutputReport(dev.writeHandle, r.data(), static_cast<ULONG>(r.size())) != FALSE)
+                return true;
+            if (!dev.motorFailReported)
+            {
+                dev.motorFailReported = true;
+                std::fprintf(stderr, "[pads] vibration report not taken (WriteFile error %lu, SetOutputReport error %lu, %zu bytes, output length %u)%c",
+                             writeError, GetLastError(), r.size(), static_cast<unsigned>(dev.outLen), 10);
+            }
+            return false;
         }
 
         void readerLoop(Device *dev)
@@ -319,11 +334,38 @@ namespace ps2host::hidpads
             slot.reset();
         }
 
+        // one line per controller path in the log (game.log.err) saying why it was not used, so a player's log
+        // answers "my PlayStation controller does nothing" (the scan retries every 2 s: each reason is printed once)
+        void reportSkip(const std::wstring &path, const char *why, DWORD error)
+        {
+            static std::mutex s_mutex;
+            static std::vector<std::wstring> s_reported;
+            std::lock_guard lock(s_mutex);
+            for (const std::wstring &seen : s_reported)
+                if (seen == path)
+                    return;
+            s_reported.push_back(path);
+            std::string narrow;
+            for (wchar_t c : path)
+                narrow.push_back(c < 0x80 ? static_cast<char>(c) : '?');
+            std::fprintf(stderr, "[pads] PlayStation device not used: %s (error %lu) %s%c", why, error, narrow.c_str(), 10);
+        }
+
+        bool readFeature(HANDLE handle, USHORT featureLen, uint8_t id, std::vector<uint8_t> &out)
+        {
+            out.assign(std::max<USHORT>(featureLen, 64), 0);
+            out[0] = id;
+            return HidD_GetFeature(handle, out.data(), static_cast<ULONG>(out.size())) != FALSE;
+        }
+
         std::unique_ptr<Device> tryOpen(const std::wstring &path)
         {
             HANDLE probe = CreateFileW(path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
             if (probe == INVALID_HANDLE_VALUE)
+            {
+                reportSkip(path, "could not be opened", GetLastError());
                 return nullptr;
+            }
             HIDD_ATTRIBUTES attr{};
             attr.Size = sizeof(attr);
             Model model = Model::None;
@@ -344,8 +386,25 @@ namespace ps2host::hidpads
             }
             CloseHandle(probe);
             // the gamepad collection (generic desktop / game pad)
+            // (a Sony id we don't know, or the controller's other collections, e.g. the DualSense's audio: no line)
             if (model == Model::None || caps.UsagePage != 0x01 || (caps.Usage != 0x05 && caps.Usage != 0x04))
                 return nullptr;
+            // Started from Steam with Steam Input on, Steam already gives the game this controller as a virtual Xbox
+            // controller (XInput) and lists the real one in SDL_GAMECONTROLLER_IGNORE_DEVICES ("0xVVVV/0xPPPP,...",
+            // the variable SDL reads for the same reason). Reading it here too made one controller two players.
+            if (const char *ignore = std::getenv("SDL_GAMECONTROLLER_IGNORE_DEVICES"); ignore && *ignore)
+            {
+                std::string list = ignore;
+                for (char &c : list)
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                char id[16];
+                std::snprintf(id, sizeof(id), "0x%04x/0x%04x", attr.VendorID, attr.ProductID);
+                if (list.find(id) != std::string::npos)
+                {
+                    reportSkip(path, "Steam Input has it (its virtual Xbox controller is used)", 0);
+                    return nullptr;
+                }
+            }
 
             auto dev = std::make_unique<Device>();
             dev->path = path;
@@ -360,20 +419,31 @@ namespace ps2host::hidpads
                                            nullptr, OPEN_EXISTING, 0, nullptr);
             if (dev->readHandle == INVALID_HANDLE_VALUE || dev->writeHandle == INVALID_HANDLE_VALUE)
             {
+                const DWORD error = GetLastError();
                 if (dev->readHandle != INVALID_HANDLE_VALUE)
                     CloseHandle(dev->readHandle);
                 if (dev->writeHandle != INVALID_HANDLE_VALUE)
                     CloseHandle(dev->writeHandle);
-                return nullptr; // held exclusively by another program (e.g. DS4Windows' hide mode)
+                // held exclusively by another program (DS4Windows / DualSenseX hide mode, HidHide): its virtual
+                // Xbox controller (XInput) still works
+                reportSkip(path, "held by another program (DS4Windows / DualSenseX / HidHide?)", error);
+                return nullptr;
             }
-            if (dev->bluetooth)
+            // Over Bluetooth both send a short "simple" report until a feature report is read; then the full report
+            // (0x11 / 0x31) with the analog triggers, and the motors' output report works. SDL 3.2: DS4 BT reads
+            // calibration 0x05 (0x02 on USB); DualSense reads calibration 0x05, serial 0x09 and firmware 0x20 (its
+            // bytes 44-45 = the firmware version, which picks the rumble bits in sendMotors).
+            std::vector<uint8_t> feature;
+            if (model == Model::DualShock4)
             {
-                // Over Bluetooth both send a short "simple" report until a calibration feature report is read; then
-                // the full report (0x11 / 0x31) with the analog triggers and the motors' output report.
-                // (DS4: feature 0x02, DualSense: feature 0x05)
-                std::vector<uint8_t> feature(std::max<USHORT>(dev->featureLen, 64), 0);
-                feature[0] = model == Model::DualShock4 ? 0x02 : 0x05;
-                HidD_GetFeature(dev->writeHandle, feature.data(), static_cast<ULONG>(feature.size()));
+                if (dev->bluetooth && !readFeature(dev->writeHandle, dev->featureLen, 0x05, feature))
+                    readFeature(dev->writeHandle, dev->featureLen, 0x02, feature);
+            }
+            else
+            {
+                readFeature(dev->writeHandle, dev->featureLen, 0x05, feature);
+                if (readFeature(dev->writeHandle, dev->featureLen, 0x20, feature) && feature.size() >= 46)
+                    dev->firmware = static_cast<uint16_t>(feature[44] | (feature[45] << 8));
             }
             HidD_SetNumInputBuffers(dev->readHandle, 8);
             return dev;
@@ -423,6 +493,12 @@ namespace ps2host::hidpads
                         closeDevice(slot);
             }
             const std::vector<std::wstring> paths = listSonyPaths();
+            static size_t s_lastCount = static_cast<size_t>(-1);
+            if (paths.size() != s_lastCount)
+            {
+                s_lastCount = paths.size();
+                std::fprintf(stderr, "[pads] Sony HID interfaces present: %zu%c", paths.size(), 10);
+            }
             for (const std::wstring &path : paths)
             {
                 {
@@ -446,9 +522,11 @@ namespace ps2host::hidpads
                 {
                     if (g_devices[static_cast<size_t>(i)])
                         continue;
-                    std::fprintf(stderr, "[pads] %s over %s -> controller %d%c",
+                    std::fprintf(stderr, "[pads] %s over %s -> controller %d (firmware %04x, reports in %u / out %u)%c",
                                  dev->model == Model::DualShock4 ? "DualShock 4" : "DualSense",
-                                 dev->bluetooth ? "Bluetooth" : "USB", kHidFirstIndex + i + 1, 10);
+                                 dev->bluetooth ? "Bluetooth" : "USB", kHidFirstIndex + i + 1,
+                                 static_cast<unsigned>(dev->firmware), static_cast<unsigned>(dev->inLen),
+                                 static_cast<unsigned>(dev->outLen), 10);
                     Device *raw = dev.get();
                     raw->thread = std::thread(readerLoop, raw);
                     g_devices[static_cast<size_t>(i)] = std::move(dev);
