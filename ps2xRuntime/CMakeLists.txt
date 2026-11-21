@@ -535,6 +535,20 @@ elseif(RUNNER_HEAVY_SRC_FILES)
     set_source_files_properties(${RUNNER_HEAVY_SRC_FILES} PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 endif()
 
+# 0.3.7 (8 GB PCs): runner sources bigger than this compile on their own instead of in a unity batch. A batch of 32
+# files could hold several 150-370 KB functions (HCTP unity_83: 2.4 MB of source) and needed 3.1 GB in ONE compile
+# (measured Nov 20, alone); the largest single file of this size needs ~0.5 GB. With 64 KB: 447 files alone, the
+# largest batch 771 KB of source.
+set(PS2X_RUNNER_UNITY_MAX_SOURCE_BYTES 65536 CACHE STRING "Runner sources bigger than this are never put in a unity batch")
+foreach(RUNNER_SRC_FILE IN LISTS RUNNER_SRC_FILES)
+    if(EXISTS "${RUNNER_SRC_FILE}")
+        file(SIZE "${RUNNER_SRC_FILE}" RUNNER_SRC_SIZE)
+        if(RUNNER_SRC_SIZE GREATER PS2X_RUNNER_UNITY_MAX_SOURCE_BYTES)
+            set_source_files_properties("${RUNNER_SRC_FILE}" PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+        endif()
+    endif()
+endforeach()
+
 if(PS2X_IS_ANDROID)
     add_library(ps2EntryRunner SHARED
         ${RUNNER_SRC_FILES}
